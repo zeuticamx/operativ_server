@@ -103,8 +103,17 @@ class ConversacionOut(BaseModel):
     last_message_at: datetime
     usuario_nombre: str | None
     usuario_handle: str | None
+    # Solo Instagram: Messenger y WhatsApp no exponen un @usuario.
+    usuario_username: str | None = None
     total_mensajes: int
     ultimo_mensaje: str | None
+    # Ventana de 24h de Meta (WhatsApp/Messenger/Instagram): fuera de ella
+    # solo se puede mandar plantillas (WhatsApp) o nada (Messenger/
+    # Instagram). Se cuenta desde el último mensaje del CLIENTE, no de
+    # cualquiera — uno del asistente no la reinicia. None si el cliente
+    # nunca escribió. Negativo si ya se cerró.
+    ultimo_mensaje_cliente_at: datetime | None = None
+    minutos_restantes_ventana: int | None = None
 
 
 class MensajeOut(BaseModel):
@@ -121,7 +130,17 @@ class ConversacionDetalleOut(BaseModel):
     started_at: datetime
     usuario_nombre: str | None
     usuario_handle: str | None
+    usuario_username: str | None = None
+    ultimo_mensaje_cliente_at: datetime | None = None
+    minutos_restantes_ventana: int | None = None
     mensajes: list[MensajeOut]
+
+
+class ContactoOut(BaseModel):
+    """Resultado de consultarle a Meta el perfil de un contacto."""
+    usuario_nombre: str | None
+    usuario_username: str | None
+    actualizado: bool
 
 
 class MetricasOut(BaseModel):

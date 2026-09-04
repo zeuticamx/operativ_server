@@ -119,6 +119,55 @@ async def listar_paginas(user_token: str) -> list[dict]:
     return data.get("data", [])
 
 
+# ============================================================
+# Perfil de un contacto
+# ============================================================
+async def perfil_contacto(
+    canal: str,
+    contacto_id: str,
+    page_token: str,
+) -> dict[str, str | None]:
+    """
+    Nombre (y @usuario en Instagram) de quien escribió, a partir del id
+    que llega en el webhook.
+
+    Los campos que se piden cambian según el canal, y pedir uno que el
+    canal no soporta hace fallar la petición entera:
+
+      instagram -> name, username   (Instagram Messaging User Profile)
+      facebook  -> first_name, last_name  (Messenger no expone username)
+
+    Solo funciona para contactos que ya le escribieron a la página: es el
+    permiso que da esa conversación lo que habilita la consulta.
+    """
+    if canal == "instagram":
+        fields = "name,username"
+    elif canal == "facebook":
+        fields = "first_name,last_name"
+    else:
+        raise MetaError(
+            code=None,
+            mensaje=f"El canal {canal} no tiene API de perfil de contacto",
+        )
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        data = await _get(
+            client,
+            f"/{contacto_id}",
+            {"access_token": page_token, "fields": fields},
+        )
+
+    if canal == "instagram":
+        nombre = (data.get("name") or "").strip() or None
+        usuario = (data.get("username") or "").strip() or None
+    else:
+        partes = [data.get("first_name"), data.get("last_name")]
+        nombre = " ".join(p.strip() for p in partes if p and p.strip()) or None
+        usuario = None
+
+    return {"nombre": nombre, "username": usuario}
+
+
 async def suscribir_app_a_pagina(page_id: str, page_token: str) -> None:
     """
     Sin esto, Meta no manda los webhooks de esa página aunque el

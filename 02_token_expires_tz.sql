@@ -25,9 +25,25 @@ DROP FUNCTION IF EXISTS get_meta_connection(UUID);
 
 -- 2. La columna. Los valores que hubiera se interpretan como UTC, que es
 --    lo que la app venía calculando (datetime.now(timezone.utc)).
-ALTER TABLE meta_connections
-    ALTER COLUMN token_expires_at TYPE TIMESTAMPTZ
-    USING token_expires_at AT TIME ZONE 'UTC';
+--
+--    El IF es lo que hace segura la re-ejecución: sobre una columna que YA
+--    es timestamptz, "AT TIME ZONE 'UTC'" devuelve un timestamp sin huso, y
+--    al reasignarlo Postgres lo reinterpreta en el huso de la sesión,
+--    corriendo las fechas. Sin esta guarda, correr el script dos veces
+--    desplazaría los vencimientos.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'meta_connections'
+          AND column_name = 'token_expires_at'
+          AND data_type = 'timestamp without time zone'
+    ) THEN
+        ALTER TABLE meta_connections
+            ALTER COLUMN token_expires_at TYPE TIMESTAMPTZ
+            USING token_expires_at AT TIME ZONE 'UTC';
+    END IF;
+END $$;
 
 -- 3. Funciones de nuevo, ya con TIMESTAMPTZ.
 CREATE OR REPLACE FUNCTION set_meta_connection(
