@@ -31,6 +31,11 @@ TABLAS = [
     ("portal_users", "portal"),
     ("meta_connections", "portal"),
     ("email_verifications", "portal"),
+    ("tenant_servicios", "portal"),
+    ("vendedores", "portal"),
+    ("tenant_vendedor_config", "portal"),
+    ("client_pipeline", "portal"),
+    ("pipeline_historial", "portal"),
 ]
 
 FUNCIONES = [
@@ -104,7 +109,8 @@ async def revisar(conn: asyncpg.Connection) -> None:
         print("Base correcta (están las tablas de n8n), falta el esquema del portal:")
         print("       " + ", ".join(falta_portal))
         print("       Aplicar: python aplicar_sql.py 01_portal.sql 02_token_expires_tz.sql \\")
-        print("                                      03_users_username.sql 04_verificacion_email.sql")
+        print("                                      03_users_username.sql 04_verificacion_email.sql \\")
+        print("                                      05_herramientas.sql 06_vendedores.sql")
     else:
         print("Todo presente: esquema de n8n y del portal en la misma base.")
 

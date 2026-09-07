@@ -24,6 +24,16 @@ class Settings:
     ACCESS_TOKEN_MINUTES: int = int(os.getenv("ACCESS_TOKEN_MINUTES", "60"))
     REFRESH_TOKEN_DAYS: int = int(os.getenv("REFRESH_TOKEN_DAYS", "30"))
 
+    # ---- Endpoint interno para n8n ----
+    # /api/eventos/* lo llama n8n, que no tiene sesión de portal y por lo
+    # tanto no puede mandar el JWT de portal_users. Se autentica con este
+    # secreto compartido en la cabecera X-Internal-Token.
+    #
+    # Vacío = el endpoint responde 503 y no atiende a nadie. Se prefiere
+    # fallar cerrado: un endpoint que crea leads y confirma qué tenant_id
+    # existe no puede quedar abierto por olvidar una variable.
+    N8N_INTERNAL_TOKEN: str = os.getenv("N8N_INTERNAL_TOKEN", "")
+
     # ---- Meta ----
     META_APP_ID: str = os.getenv("META_APP_ID", "")
     META_APP_SECRET: str = os.getenv("META_APP_SECRET", "")
@@ -90,6 +100,17 @@ class Settings:
             logging.getLogger("operativai.config").warning(
                 "SMTP sin configurar (falta SMTP_HOST o SMTP_FROM). Los códigos "
                 "de verificación se van a escribir en el log en vez de enviarse."
+            )
+
+        # Tampoco se exige: un tenant que solo usa el portal no necesita el
+        # endpoint de eventos. Pero si n8n va a llamarlo y esto falta, todas
+        # las llamadas se van a rechazar con 503 y conviene verlo al arrancar
+        # y no cuando se pierda el primer lead.
+        if not self.N8N_INTERNAL_TOKEN:
+            logging.getLogger("operativai.config").warning(
+                "N8N_INTERNAL_TOKEN sin configurar: /api/eventos/* va a "
+                "responder 503. Llénalo si n8n tiene que reportar mensajes "
+                "entrantes al módulo de vendedores."
             )
 
 

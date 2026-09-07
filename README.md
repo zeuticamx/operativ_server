@@ -9,8 +9,11 @@ Backend en FastAPI para el portal multitenant. Habla con la misma
 |---|---|
 | `users` | Clientes finales que escriben por WhatsApp/IG/FB |
 | `portal_users` | Dueños de negocio que entran al portal |
+| `vendedores` | Personal de venta del tenant (mini-CRM) |
 
-No son lo mismo. `users` ya existía del lado de n8n; `portal_users` es nuevo.
+No son lo mismo. `users` ya existía del lado de n8n; `portal_users` es
+nuevo. Un `vendedor` puede tener cuenta de portal (`portal_user_id`) o no
+tenerla y existir solo como destinatario de leads.
 
 ## Arranque
 
@@ -25,10 +28,26 @@ Genera el secreto de JWT:
 python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-Corre el SQL en `agente_db`:
+## Migraciones
+
+No hay Alembic: son archivos `NN_*.sql` numerados que se aplican en orden
+con `aplicar_sql.py`, que lee el **mismo** `DATABASE_URL` que la app (así lo
+que se aplica cae sí o sí en la base que n8n lee).
 
 ```bash
-psql $DATABASE_URL -f sql/01_portal.sql
+python aplicar_sql.py --revisar          # solo lectura: qué falta y en qué base
+python aplicar_sql.py 06_vendedores.sql  # aplicar
+```
+
+Cada archivo va en una transacción: si algo falla no queda a medio aplicar.
+Todo es `IF NOT EXISTS`, así que reaplicar no rompe nada.
+
+Desde cero:
+
+```bash
+python aplicar_sql.py 01_portal.sql 02_token_expires_tz.sql \
+                      03_users_username.sql 04_verificacion_email.sql \
+                      05_herramientas.sql 06_vendedores.sql
 ```
 
 Levanta:
@@ -38,6 +57,18 @@ uvicorn main:app --reload --port 8000
 ```
 
 Docs interactivas en `http://localhost:8000/docs`.
+
+## Tests
+
+```bash
+pip install -r requirements.txt
+pytest              # desde backend/
+pytest -v           # con el nombre de cada caso
+```
+
+No necesitan base de datos ni servidor: cubren la máquina de estados, las
+reglas de reparto y la lógica condicional del mensaje entrante, que son las
+partes que deciden algo. La SQL no se prueba acá.
 
 ## Prerequisito de la BD
 
@@ -122,6 +153,116 @@ GET    /api/conversaciones                Listado con filtros
 GET    /api/conversaciones/metricas
 GET    /api/conversaciones/{id}           Detalle con mensajes
 ```
+
+### Gestión de vendedores (mini-CRM)
+
+Módulo **opcional por tenant** e independiente del agente. Un negocio puede
+tener solo el agente, solo vendedores, o los dos. El interruptor está en
+`tenant_servicios`; todos los endpoints de abajo responden 409 si
+`gestion_vendedores_activo` está en false.
+
+```
+GET    /api/tenants/{id}/servicios          Flags de servicio
+PATCH  /api/tenants/{id}/servicios          Enciende/apaga módulos (gerencia)
+
+GET    /api/tenants/{id}/config-vendedores  Estrategia de reparto
+PATCH  /api/tenants/{id}/config-vendedores  carga | round_robin | manual (gerencia)
+
+POST   /api/vendedores                      Alta
+GET    /api/tenants/{id}/vendedores         Listado (?activo=true)
+PATCH  /api/vendedores/{id}                 Activar / desactivar / editar
+GET    /api/vendedores/{id}/clientes        Su cartera
+POST   /api/vendedores/{id}/reasignar-pendientes   Reparte sus leads abiertos
+
+POST   /api/clientes/{user_id}/asignar      Asignar o reasignar
+PATCH  /api/clientes/{user_id}/estado       Mover de etapa
+GET    /api/clientes/{user_id}/historial    Bitácora del lead
+
+GET    /api/tenants/{id}/pipeline           Vista de gerencia
+GET    /api/tenants/{id}/metricas           Conversión, tiempos, ranking
+```
+
+Con `tenant_id` en la URL se valida contra el JWT: si no es el tuyo da
+**404, no 403** — un 403 confirmaría que ese negocio existe.
+
+#### Embudo
+
+```
+nuevo ──> contactado ──> en_seguimiento ──> cotizado ──> negociacion ──> ganado
+  │            │                │              │              │
+  └────────────┴────────────────┴──────────────┴──────────────┴──> perdido
+                                                                      │
+                          (reapertura) contactado <────────────────────┘
+```
+
+`ganado` es terminal. `perdido` no: se reabre hacia `contactado`. Las
+transiciones viven en `pipeline_estados.py` y el `CHECK` de
+`client_pipeline.estado` lista los mismos estados — si se agrega uno hay
+que tocar los dos lados.
+
+Un `PATCH .../estado` inválido responde **409 con las transiciones
+posibles**, no con un mensaje genérico:
+
+```json
+{
+  "detail": {
+    "mensaje": "No se puede pasar de 'ganado' a 'contactado'",
+    "estado_actual": "ganado",
+    "transiciones_permitidas": [],
+    "es_terminal": true
+  }
+}
+```
+
+#### Reparto de leads
+
+La estrategia sale siempre de `tenant_vendedor_config`, nunca del código
+del endpoint:
+
+| Estrategia | Cómo elige |
+|---|---|
+| `carga` (default) | Menos leads abiertos. Empata → el que lleva más tiempo sin recibir → el más antiguo |
+| `round_robin` | El siguiente de la rueda, con el puntero en `ultimo_vendedor_asignado_id` |
+| `manual` | Devuelve `None` siempre: lo elige una persona |
+
+Sin vendedores activos **no es un error**: el lead se crea con
+`vendedor_id = NULL` y sale en el panel como pendiente de asignar.
+
+Desactivar a un vendedor **no** reparte su cartera: deja de recibir leads
+nuevos y nada más. Mover los que ya tiene es una llamada aparte y explícita
+a `POST /vendedores/{id}/reasignar-pendientes`, que solo toca los estados
+no cerrados — un `ganado` o un `perdido` son historia de quien los cerró y
+cambiarles el dueño falsearía el ranking.
+
+#### Integración con n8n
+
+```
+POST /api/eventos/mensaje-entrante     Cabecera: X-Internal-Token
+```
+
+n8n lo llama justo después de resolver el tenant. **No decide si el agente
+contesta**: gestiona el embudo y devuelve los flags, y el propio workflow
+elige con `agente_ia_activo` si sigue hacia el nodo del agente. La decisión
+vive en n8n para no partir el control del flujo en dos lugares. Los
+workflows existentes (`canal-entrada-universal`, `escalar-humano`,
+`ejecutar-herramienta-tenant`) no cambian.
+
+```
+                        ┌─ módulo apagado ──> responde los flags y sale
+mensaje entrante ──> ───┤
+                        └─ módulo activo ───> asegura el lead en el embudo
+                                              sin vendedor? ──> reparte
+                                              agente apagado? ──> avisa
+```
+
+Se autentica con secreto compartido y no con el JWT del portal porque n8n
+es una máquina y no tiene sesión de portal. **Sin `N8N_INTERNAL_TOKEN` el
+endpoint responde 503**: falla cerrado a propósito, para que olvidar la
+variable no deje abierto un endpoint que crea leads y que, probando UUIDs,
+diría cuáles existen.
+
+El aviso al vendedor (`notificaciones.py`) es un **stub**: registra en el
+log y devuelve False. Queda por enganchar al sub-workflow de envío.
 
 ## Flujo de conexión con Meta
 

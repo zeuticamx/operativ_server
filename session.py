@@ -8,7 +8,8 @@ que hay que traducir de ida y vuelta.
 """
 
 import json
-from typing import Any, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Optional
 
 import asyncpg
 
@@ -83,3 +84,29 @@ async def fetch_value(query: str, *args: Any) -> Any:
 async def execute(query: str, *args: Any) -> str:
     async with get_pool().acquire() as conn:
         return await conn.execute(query, *args)
+
+
+@asynccontextmanager
+async def conexion() -> AsyncIterator[asyncpg.Connection]:
+    """
+    Una conexión para varias consultas seguidas.
+
+    Los helpers de arriba toman y sueltan una conexión por consulta, así que
+    dos llamadas seguidas pueden caer en conexiones distintas del pool. Para
+    leer-y-decidir (por ejemplo elegir vendedor) hace falta que todo hable
+    con la misma.
+    """
+    async with get_pool().acquire() as conn:
+        yield conn
+
+
+@asynccontextmanager
+async def transaccion() -> AsyncIterator[asyncpg.Connection]:
+    """
+    Igual que `conexion`, pero todo lo de adentro se confirma o se descarta
+    junto. Para escrituras que tienen que verse como una sola: cambiar el
+    estado de un lead y anotarlo en la bitácora, por ejemplo.
+    """
+    async with get_pool().acquire() as conn:
+        async with conn.transaction():
+            yield conn

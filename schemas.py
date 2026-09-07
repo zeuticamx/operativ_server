@@ -1,6 +1,7 @@
 """Schemas de entrada y salida de la API."""
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Literal
 from uuid import UUID
 
@@ -211,3 +212,171 @@ class MetricasOut(BaseModel):
     mensajes_7d: int
     conversaciones_7d: int
     por_canal: dict[str, int]
+
+
+# ============================================================
+# SERVICIOS DEL TENANT
+# ============================================================
+class ServiciosOut(BaseModel):
+    tenant_id: UUID
+    agente_ia_activo: bool
+    gestion_vendedores_activo: bool
+
+
+class ServiciosIn(BaseModel):
+    """Parcial: lo que no venga se deja como está."""
+    agente_ia_activo: bool | None = None
+    gestion_vendedores_activo: bool | None = None
+
+
+# ============================================================
+# VENDEDORES
+# ============================================================
+class VendedorCrearIn(BaseModel):
+    nombre: str = Field(min_length=2, max_length=255)
+    telefono: str | None = Field(default=None, max_length=50)
+    # Opcional: enlaza al vendedor con una cuenta del portal para que pueda
+    # entrar a ver su cartera. Sin esto solo existe como destinatario de leads.
+    portal_user_id: UUID | None = None
+    # Solo lo usa un superadmin dando de alta en nombre de otro negocio. Un
+    # dueño normal lo deja vacío y se toma el tenant de su token.
+    tenant_id: UUID | None = None
+
+
+class VendedorActualizarIn(BaseModel):
+    nombre: str | None = Field(default=None, min_length=2, max_length=255)
+    telefono: str | None = Field(default=None, max_length=50)
+    activo: bool | None = None
+
+
+class VendedorOut(BaseModel):
+    id: UUID
+    tenant_id: UUID
+    portal_user_id: UUID | None
+    nombre: str
+    telefono: str | None
+    activo: bool
+    creado_en: datetime
+    # Leads en estados no cerrados. Es la carga que mira la asignación.
+    clientes_activos: int = 0
+
+
+class ReasignacionOut(BaseModel):
+    """Resultado de POST /vendedores/{id}/reasignar-pendientes."""
+    vendedor_id: UUID
+    estrategia: str
+    reasignados: int
+    # Leads que no se pudieron mover porque no quedaba ningún otro vendedor
+    # activo. Siguen con el vendedor original, no se quedan huérfanos.
+    sin_destino: int
+    destinos: dict[UUID, int] = Field(default_factory=dict)
+
+
+# ============================================================
+# PIPELINE
+# ============================================================
+class AsignarClienteIn(BaseModel):
+    # None = que decida la estrategia del tenant.
+    vendedor_id: UUID | None = None
+    nota: str | None = Field(default=None, max_length=1000)
+
+
+class CambiarEstadoIn(BaseModel):
+    estado: str = Field(min_length=1, max_length=50)
+    nota: str | None = Field(default=None, max_length=1000)
+    monto_estimado: Decimal | None = Field(default=None, ge=0, max_digits=12, decimal_places=2)
+    # Solo tiene sentido al pasar a 'perdido'. Al reabrir el lead se limpia.
+    motivo_perdida: str | None = Field(default=None, max_length=1000)
+
+
+class PipelineOut(BaseModel):
+    id: UUID
+    user_id: UUID
+    cliente_nombre: str | None
+    cliente_handle: str | None
+    vendedor_id: UUID | None
+    vendedor_nombre: str | None
+    estado: str
+    monto_estimado: Decimal | None
+    motivo_perdida: str | None
+    actualizado_en: datetime
+    # A dónde puede moverse desde acá. El frontend arma el selector con esto
+    # en vez de repetir la máquina de estados.
+    transiciones_posibles: list[str] = Field(default_factory=list)
+
+
+class HistorialOut(BaseModel):
+    estado_anterior: str | None
+    estado_nuevo: str
+    vendedor_id: UUID | None
+    vendedor_nombre: str | None
+    nota: str | None
+    creado_en: datetime
+
+
+# ============================================================
+# CONFIG DE ASIGNACIÓN
+# ============================================================
+class ConfigAsignacionOut(BaseModel):
+    tenant_id: UUID
+    estrategia_asignacion: Literal["carga", "round_robin", "manual"]
+    ultimo_vendedor_asignado_id: UUID | None
+
+
+class ConfigAsignacionIn(BaseModel):
+    estrategia_asignacion: Literal["carga", "round_robin", "manual"]
+
+
+# ============================================================
+# MÉTRICAS DEL EMBUDO
+# ============================================================
+class MetricaEtapaOut(BaseModel):
+    estado: str
+    total: int
+    # Sobre el total de leads del tenant.
+    porcentaje: float
+    # Cuánto tarda en promedio un lead en salir de esta etapa. None si
+    # todavía no hay ninguno que la haya atravesado entera.
+    horas_promedio: float | None
+
+
+class RankingVendedorOut(BaseModel):
+    vendedor_id: UUID
+    nombre: str
+    activo: bool
+    abiertos: int
+    ganados: int
+    perdidos: int
+    monto_ganado: Decimal
+    # ganados / (ganados + perdidos). None si no cerró nada todavía —
+    # distinto de 0.0, que sería "cerró y perdió todo".
+    tasa_cierre: float | None
+
+
+class MetricasPipelineOut(BaseModel):
+    total_clientes: int
+    etapas: list[MetricaEtapaOut]
+    tasa_conversion_global: float | None
+    ranking: list[RankingVendedorOut]
+
+
+# ============================================================
+# EVENTOS (los llama n8n, no el frontend)
+# ============================================================
+class MensajeEntranteIn(BaseModel):
+    tenant_id: UUID
+    user_id: UUID
+    # El mensaje crudo tal como lo tenga n8n. No se valida su forma: este
+    # endpoint no lo interpreta, solo lo pasa al aviso del vendedor.
+    mensaje: dict = Field(default_factory=dict)
+
+
+class MensajeEntranteOut(BaseModel):
+    # Los dos flags que n8n necesita para decidir en su propio workflow si
+    # sigue hacia el nodo del agente. La decisión vive allá, no acá.
+    gestion_vendedores_activo: bool
+    agente_ia_activo: bool
+    # Informativos, para depurar desde n8n.
+    pipeline_id: UUID | None = None
+    vendedor_id: UUID | None = None
+    asignado_ahora: bool = False
