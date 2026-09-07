@@ -7,3 +7,5 @@ PyJWT==2.10.1
 argon2-cffi==23.1.0
 httpx==0.28.1
 python-multipart==0.0.20
+google-api-python-client==2.155.0
+google-auth==2.37.0

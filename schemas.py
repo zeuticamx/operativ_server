@@ -17,6 +17,27 @@ class RegistroIn(BaseModel):
     nombre_negocio: str = Field(min_length=2, max_length=255)
 
 
+class VerificacionPendienteOut(BaseModel):
+    """
+    Respuesta de /registro y /reenviar-codigo. No trae tokens: la cuenta
+    todavía no existe. El frontend usa esto para pasar al paso del código.
+    """
+    email: EmailStr
+    expira_en_minutos: int
+    reenviar_en_segundos: int
+
+
+class VerificarCodigoIn(BaseModel):
+    email: EmailStr
+    # Exactamente 6 dígitos. Se valida acá para no gastar un argon2 por
+    # cada cadena cualquiera que llegue.
+    codigo: str = Field(pattern=r"^\d{6}$")
+
+
+class ReenviarCodigoIn(BaseModel):
+    email: EmailStr
+
+
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
@@ -90,6 +111,47 @@ class PaginaDisponible(BaseModel):
 
 class ActivarCanalesIn(BaseModel):
     page_ids: list[str] = Field(min_length=1)
+
+
+# ============================================================
+# HERRAMIENTAS
+# ============================================================
+class HerramientaInfoOut(BaseModel):
+    correo_servicio: str
+
+
+class HerramientaOut(BaseModel):
+    tool_key: str
+    tool_type: str
+    display_name: str
+    description: str
+    is_enabled: bool
+    last_verified_at: datetime | None
+    nombre_documento: str | None = None
+    url_original: str | None = None
+
+
+class ConectarGoogleSheetIn(BaseModel):
+    url: str = Field(min_length=10)
+    display_name: str = Field(min_length=2, max_length=255)
+    description: str = Field(
+        min_length=5,
+        max_length=1000,
+        description="Cuándo debe el agente consultar esta hoja (lo lee la IA para decidir).",
+    )
+    rango: str = Field(default="A:Z", max_length=100)
+
+
+class ConectarGoogleDocIn(BaseModel):
+    url: str = Field(min_length=10)
+    display_name: str = Field(min_length=2, max_length=255)
+    description: str = Field(min_length=5, max_length=1000)
+
+
+class ActualizarHerramientaIn(BaseModel):
+    display_name: str | None = Field(default=None, min_length=2, max_length=255)
+    description: str | None = Field(default=None, min_length=5, max_length=1000)
+    is_enabled: bool | None = None
 
 
 # ============================================================

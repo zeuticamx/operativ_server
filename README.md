@@ -54,11 +54,51 @@ Reconéctate después: el parámetro aplica en sesiones nuevas.
 
 ### Auth
 ```
-POST   /api/auth/registro    Crea negocio + config de agente + usuario dueño
+POST   /api/auth/registro          Paso 1: manda un código de 6 dígitos al correo
+POST   /api/auth/verificar         Paso 2: código ok → crea negocio + agente + dueño
+POST   /api/auth/reenviar-codigo   Código nuevo para un alta pendiente
 POST   /api/auth/login
 POST   /api/auth/refresh
 GET    /api/auth/yo
 ```
+
+## Alta con verificación de correo
+
+`/registro` no crea la cuenta: guarda el alta en `email_verifications` y
+manda un código al correo. Devuelve **202 y ningún token**. La cuenta nace
+recién en `/verificar`.
+
+```
+Frontend                         Backend                        Correo
+   |                                |                              |
+   |-- POST /auth/registro -------> |                              |
+   |                                |  guarda alta pendiente       |
+   |                                |-- código de 6 dígitos -----> |
+   |<-- 202 {expira_en_minutos} --- |                              |
+   |                                |                              |
+   |-- POST /auth/verificar ------> |                              |
+   |                                |  crea tenant + config + user |
+   |<-- 201 {access, refresh} ----- |                              |
+```
+
+Por qué una tabla aparte y no un `email_verified` en `portal_users`: si el
+alta sin confirmar ya ocupara una fila de `portal_users`, cualquiera podría
+registrar el correo de otro y dejarlo bloqueado por el `UNIQUE` de email sin
+haber probado nunca que le pertenece.
+
+Defensas del código:
+
+| Qué | Dónde se ajusta |
+|---|---|
+| Se guarda hasheado con argon2, no en claro | — |
+| Vence a los 10 minutos | `CODIGO_VIGENCIA_MINUTOS` |
+| 5 intentos fallidos y el alta se descarta | `CODIGO_MAX_INTENTOS` |
+| 60 s mínimo entre envíos | `CODIGO_REENVIO_SEGUNDOS` |
+
+**Sin SMTP configurado la app arranca igual y escribe los códigos en el
+log** en vez de enviarlos. Es cómodo en local, pero en producción significa
+que nadie recibe nada: llena `SMTP_HOST` y `SMTP_FROM`. El arranque avisa
+con un WARNING si faltan.
 
 ### Canales
 ```

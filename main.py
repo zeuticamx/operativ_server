@@ -14,6 +14,7 @@ import agente
 import auth
 import canales
 import conversaciones
+import herramientas
 from config import settings
 from session import close_pool, init_pool
 
@@ -44,6 +45,7 @@ app.include_router(auth.router, prefix="/api")
 app.include_router(canales.router, prefix="/api")
 app.include_router(agente.router, prefix="/api")
 app.include_router(conversaciones.router, prefix="/api")
+app.include_router(herramientas.router, prefix="/api")
 
 
 @app.get("/api/salud")

@@ -7,6 +7,7 @@ SECURITY DEFINER, y meter un ORM encima solo agregaría una capa
 que hay que traducir de ida y vuelta.
 """
 
+import json
 from typing import Any, Optional
 
 import asyncpg
@@ -14,6 +15,26 @@ import asyncpg
 from config import settings
 
 _pool: Optional[asyncpg.Pool] = None
+
+
+async def _configurar_conexion(conn: asyncpg.Connection) -> None:
+    """
+    Por defecto asyncpg trata json/jsonb como texto plano. Este códec
+    convierte automáticamente dict de Python <-> jsonb de Postgres,
+    para todo el pool.
+    """
+    await conn.set_type_codec(
+        "jsonb",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
+    await conn.set_type_codec(
+        "json",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
 
 
 async def init_pool() -> None:
@@ -24,6 +45,7 @@ async def init_pool() -> None:
             min_size=2,
             max_size=10,
             command_timeout=30,
+            init=_configurar_conexion,
         )
 
 
