@@ -17,10 +17,10 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends
 
-from asignacion import asignar_vendedor_automatico
+from services.asignacion import asignar_vendedor_automatico
 from deps import llamada_interna
-from notificaciones import notificar_vendedor_nuevo_lead
-from pipeline import asignar_vendedor, get_or_create_pipeline, get_tenant_servicios
+from services.notificaciones import notificar_vendedor_nuevo_lead
+from services.pipeline import asignar_vendedor, get_or_create_pipeline, get_tenant_servicios
 from schemas import MensajeEntranteIn, MensajeEntranteOut
 from session import transaccion
 

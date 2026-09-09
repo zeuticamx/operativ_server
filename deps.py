@@ -18,6 +18,12 @@ bearer = HTTPBearer(auto_error=False)
 # 'member' queda fuera a propósito: ve el pipeline, no apaga servicios.
 ROLES_GERENCIA = frozenset({"owner", "superadmin"})
 
+# Rol de la app de vendedores en campo. Es un valor más de
+# portal_users.role (owner / member / superadmin / vendedor), no un
+# sistema de permisos aparte: la columna es VARCHAR sin CHECK, así que
+# admitirlo no necesitó migración.
+ROL_VENDEDOR = "vendedor"
+
 
 @dataclass
 class UsuarioActual:
@@ -138,6 +144,70 @@ async def gerencia_actual(
             detail="Hace falta ser dueño o administrador del negocio",
         )
     return usuario
+
+
+@dataclass
+class VendedorActual:
+    """El vendedor detrás del portal_user que está llamando."""
+
+    id: UUID
+    tenant_id: UUID
+    nombre: str
+    portal_user_id: UUID
+    email: str
+
+
+async def vendedor_actual(
+    usuario: UsuarioActual = Depends(usuario_actual),
+) -> VendedorActual:
+    """
+    Resuelve el vendedor de la petición.
+
+    El JWT no lleva ni el rol ni el vendedor_id: solo la identidad (`sub`).
+    Todo lo demás se relee de la base en cada petición, igual que hace
+    `usuario_actual`. Así, si gerencia desactiva al vendedor o le quita el
+    rol, deja de pasar en la siguiente petición y no cuando expire el
+    token — que con ACCESS_TOKEN_MINUTES=60 podría ser una hora entera de
+    check-ins de alguien que ya no trabaja ahí.
+
+    403 y no 401 en los dos rechazos: el token es válido y la sesión sirve,
+    lo que falta es el permiso. Un 401 haría que el cliente intentara
+    refrescar en vano y terminara mandando al usuario al login.
+    """
+    if usuario.role != ROL_VENDEDOR:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Esta sección es solo para vendedores",
+        )
+
+    fila = await fetch_one(
+        """
+        SELECT id, tenant_id, nombre, activo
+        FROM vendedores
+        WHERE portal_user_id = $1
+        """,
+        usuario.id,
+    )
+
+    if fila is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tu cuenta tiene el rol de vendedor pero no está ligada a una ficha de vendedor",
+        )
+
+    if not fila["activo"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tu cuenta de vendedor está desactivada",
+        )
+
+    return VendedorActual(
+        id=fila["id"],
+        tenant_id=fila["tenant_id"],
+        nombre=fila["nombre"],
+        portal_user_id=usuario.id,
+        email=usuario.email,
+    )
 
 
 async def llamada_interna(

@@ -10,7 +10,7 @@ from uuid import UUID
 
 import pytest
 
-from asignacion import VendedorCandidato, elegir_por_carga, elegir_round_robin
+from services.asignacion import VendedorCandidato, elegir_por_carga, elegir_round_robin
 
 BASE = datetime(2026, 1, 1, tzinfo=timezone.utc)
 

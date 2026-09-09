@@ -10,13 +10,19 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-import agente
-import auth
-import canales
-import conversaciones
-import eventos
-import herramientas
-import vendedores
+from routers import (
+    agente,
+    auth,
+    canales,
+    clientes,
+    conversaciones,
+    eventos,
+    herramientas,
+    reportes,
+    tareas,
+    vendedores,
+    visitas,
+)
 from config import settings
 from session import close_pool, init_pool
 
@@ -49,11 +55,18 @@ app.include_router(agente.router, prefix="/api")
 app.include_router(conversaciones.router, prefix="/api")
 app.include_router(herramientas.router, prefix="/api")
 
-# Módulo de gestión de vendedores. Son tres routers y no uno porque las
-# rutas cuelgan de tres raíces distintas (/vendedores, /tenants, /clientes).
+# Módulo de gestión de vendedores (embudo de chat). Son tres routers y no
+# uno porque las rutas cuelgan de tres raíces distintas.
 app.include_router(vendedores.router_vendedores, prefix="/api")
 app.include_router(vendedores.router_tenants, prefix="/api")
-app.include_router(vendedores.router_clientes, prefix="/api")
+app.include_router(vendedores.router_pipeline, prefix="/api")
+
+# CRM de campo: cartera, visitas con geocerca, seguimientos y reportes.
+# Convive con el embudo de chat de arriba; comparten la tabla vendedores.
+app.include_router(clientes.router, prefix="/api")
+app.include_router(visitas.router, prefix="/api")
+app.include_router(tareas.router, prefix="/api")
+app.include_router(reportes.router, prefix="/api")
 
 # Lo llama n8n con X-Internal-Token, no el frontend.
 app.include_router(eventos.router, prefix="/api")

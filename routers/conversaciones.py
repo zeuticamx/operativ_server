@@ -13,7 +13,7 @@ from schemas import (
     MensajeOut,
     MetricasOut,
 )
-import meta
+from services import meta
 
 router = APIRouter(prefix="/conversaciones", tags=["conversaciones"])
 

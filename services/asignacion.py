@@ -22,7 +22,7 @@ from uuid import UUID
 
 import asyncpg
 
-from pipeline_estados import ESTADOS_CERRADOS
+from services.pipeline_estados import ESTADOS_CERRADOS
 from session import transaccion
 
 ESTRATEGIAS = ("carga", "round_robin", "manual")

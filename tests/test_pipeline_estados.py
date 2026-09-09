@@ -2,7 +2,7 @@
 
 import pytest
 
-from pipeline_estados import (
+from services.pipeline_estados import (
     ESTADOS,
     ESTADOS_CERRADOS,
     ESTADOS_TERMINALES,

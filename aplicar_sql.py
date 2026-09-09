@@ -7,7 +7,7 @@ que se aplique cae sí o sí en la base donde el backend escribe — que es
 justamente lo que hay que garantizar para que n8n lea lo mismo.
 
     python aplicar_sql.py --revisar
-    python aplicar_sql.py 01_portal.sql 02_token_expires_tz.sql
+    python aplicar_sql.py sql/01_portal.sql sql/02_token_expires_tz.sql
 """
 
 import asyncio
@@ -18,6 +18,11 @@ from urllib.parse import urlparse
 import asyncpg
 
 from config import settings
+
+# Las migraciones viven en sql/. Se acepta tanto "01_portal.sql" como
+# "sql/01_portal.sql" para no romper comandos que alguien tenga
+# copiados de antes de que se movieran a la carpeta.
+SQL_DIR = Path(__file__).parent / "sql"
 
 # Tablas y funciones que nos importan para saber si estamos en la base correcta.
 TABLAS = [
@@ -36,6 +41,9 @@ TABLAS = [
     ("tenant_vendedor_config", "portal"),
     ("client_pipeline", "portal"),
     ("pipeline_historial", "portal"),
+    ("clientes", "portal"),
+    ("visitas", "portal"),
+    ("tareas_seguimiento", "portal"),
 ]
 
 FUNCIONES = [
@@ -43,6 +51,7 @@ FUNCIONES = [
     ("set_channel_credentials", "n8n"),
     ("set_meta_connection", "portal"),
     ("get_meta_connection", "portal"),
+    ("distancia_metros", "portal"),
 ]
 
 
@@ -108,16 +117,24 @@ async def revisar(conn: asyncpg.Connection) -> None:
     elif falta_portal:
         print("Base correcta (están las tablas de n8n), falta el esquema del portal:")
         print("       " + ", ".join(falta_portal))
-        print("       Aplicar: python aplicar_sql.py 01_portal.sql 02_token_expires_tz.sql \\")
-        print("                                      03_users_username.sql 04_verificacion_email.sql \\")
-        print("                                      05_herramientas.sql 06_vendedores.sql")
+        print("       Aplicar: python aplicar_sql.py sql/01_portal.sql sql/02_token_expires_tz.sql \\")
+        print("                                      sql/03_users_username.sql sql/04_verificacion_email.sql \\")
+        print("                                      sql/05_herramientas.sql sql/06_vendedores.sql \\")
+        print("                                      sql/07_crm_campo.sql")
     else:
         print("Todo presente: esquema de n8n y del portal en la misma base.")
 
 
+def resolver_ruta(nombre: str) -> Path:
+    directa = Path(__file__).parent / nombre
+    if directa.is_file():
+        return directa
+    return SQL_DIR / nombre
+
+
 async def aplicar(conn: asyncpg.Connection, archivos: list[str]) -> None:
     for nombre in archivos:
-        ruta = Path(__file__).parent / nombre
+        ruta = resolver_ruta(nombre)
         if not ruta.is_file():
             raise SystemExit(f"No existe el archivo: {ruta}")
 

@@ -10,7 +10,7 @@ import jwt
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from config import settings
-from correo import ErrorEnvioCorreo, enviar_codigo_verificacion
+from services.correo import ErrorEnvioCorreo, enviar_codigo_verificacion
 from deps import UsuarioActual, usuario_actual
 from security import (
     crear_access_token,

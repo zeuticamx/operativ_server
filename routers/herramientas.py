@@ -18,7 +18,7 @@ from schemas import (
     HerramientaInfoOut,
     HerramientaOut,
 )
-import google_tools
+from services import google_tools
 
 router = APIRouter(prefix="/herramientas", tags=["herramientas"])
 

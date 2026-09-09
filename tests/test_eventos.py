@@ -11,8 +11,8 @@ from uuid import UUID, uuid4
 
 import pytest
 
-import eventos
-from pipeline import Pipeline, Servicios
+from routers import eventos
+from services.pipeline import Pipeline, Servicios
 
 TENANT = uuid4()
 CLIENTE = uuid4()

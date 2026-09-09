@@ -22,7 +22,7 @@ from schemas import (
     ConectarMetaIn,
     PaginaDisponible,
 )
-import meta
+from services import meta
 
 router = APIRouter(prefix="/canales", tags=["canales"])
 

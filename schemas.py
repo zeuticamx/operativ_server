@@ -361,6 +361,243 @@ class MetricasPipelineOut(BaseModel):
 
 
 # ============================================================
+# CRM DE CAMPO — CLIENTES
+# ============================================================
+# Marcas de tiempo en español (creado_en / actualizado_en / completado_en),
+# igual que las tablas. No hay `created_at` en ningún lado de este módulo.
+
+EstadoCliente = Literal["prospecto", "activo", "inactivo", "perdido"]
+PrioridadCliente = Literal["alta", "media", "baja"]
+
+# Rangos geográficos. Se acotan acá para que una coordenada imposible sea
+# un 422 de validación y no llegue nunca al cálculo de distancia.
+_LAT = Field(ge=-90, le=90)
+_LON = Field(ge=-180, le=180)
+
+
+class ClienteCrearIn(BaseModel):
+    nombre_negocio: str = Field(min_length=2, max_length=255)
+    latitud: float = _LAT
+    longitud: float = _LON
+    # Sin vendedor, el cliente queda en la cartera del negocio hasta que
+    # gerencia decida a quién le toca.
+    vendedor_id: UUID | None = None
+    contacto_nombre: str | None = Field(default=None, max_length=255)
+    telefono: str | None = Field(default=None, max_length=50)
+    direccion: str | None = Field(default=None, max_length=500)
+    radio_tolerancia_metros: int = Field(default=120, gt=0, le=5000)
+    estado: EstadoCliente = "prospecto"
+    prioridad: PrioridadCliente = "media"
+    notas: str | None = Field(default=None, max_length=5000)
+
+
+class ClienteActualizarIn(BaseModel):
+    """PUT con semántica parcial: lo que no venga se deja como está."""
+
+    nombre_negocio: str | None = Field(default=None, min_length=2, max_length=255)
+    latitud: float | None = Field(default=None, ge=-90, le=90)
+    longitud: float | None = Field(default=None, ge=-180, le=180)
+    vendedor_id: UUID | None = None
+    contacto_nombre: str | None = Field(default=None, max_length=255)
+    telefono: str | None = Field(default=None, max_length=50)
+    direccion: str | None = Field(default=None, max_length=500)
+    radio_tolerancia_metros: int | None = Field(default=None, gt=0, le=5000)
+    estado: EstadoCliente | None = None
+    prioridad: PrioridadCliente | None = None
+    notas: str | None = Field(default=None, max_length=5000)
+
+
+class ClienteOut(BaseModel):
+    id: UUID
+    tenant_id: UUID
+    vendedor_id: UUID | None
+    vendedor_nombre: str | None = None
+    nombre_negocio: str
+    contacto_nombre: str | None
+    telefono: str | None
+    direccion: str | None
+    latitud: float
+    longitud: float
+    radio_tolerancia_metros: int
+    estado: str
+    prioridad: str
+    notas: str | None
+    creado_en: datetime
+    actualizado_en: datetime
+
+
+# ============================================================
+# CRM DE CAMPO — VISITAS
+# ============================================================
+class CheckinIn(BaseModel):
+    """
+    Un check-in. El vendedor y el tenant NO vienen acá: salen del JWT.
+    """
+
+    cliente_id: UUID
+    latitud: float = _LAT
+    longitud: float = _LON
+    # Precisión que reportó el GPS. Se guarda como dato, no decide nada.
+    accuracy_metros: float | None = Field(default=None, ge=0, le=100_000)
+    foto_url: str | None = Field(default=None, max_length=1000)
+    comentario: str | None = Field(default=None, max_length=2000)
+    timestamp_dispositivo: datetime | None = None
+    # Lo genera la app. Opcional en línea; obligatorio al sincronizar
+    # (ver CheckinSyncIn), que es donde hace de llave de idempotencia.
+    cliente_uuid_offline: UUID | None = None
+
+
+class CheckinSyncIn(CheckinIn):
+    """Un check-in dentro de un lote de sincronización."""
+
+    # Sin esto no hay forma de saber si el elemento ya se procesó, y
+    # reintentar el lote duplicaría visitas.
+    cliente_uuid_offline: UUID
+
+
+class SyncIn(BaseModel):
+    # Tope por lote: un POST gigantesco de una app que estuvo semanas sin
+    # señal se corta acá en vez de morir por timeout a media transacción.
+    visitas: list[CheckinSyncIn] = Field(min_length=1, max_length=200)
+
+
+class VisitaOut(BaseModel):
+    id: UUID
+    tenant_id: UUID
+    vendedor_id: UUID
+    vendedor_nombre: str | None = None
+    cliente_id: UUID
+    cliente_nombre_negocio: str | None = None
+    latitud: float
+    longitud: float
+    accuracy_metros: float | None
+    distancia_calculada_metros: float
+    dentro_de_geocerca: bool
+    foto_url: str | None
+    comentario: str | None
+    timestamp_dispositivo: datetime | None
+    timestamp_servidor: datetime
+    cliente_uuid_offline: UUID | None
+    creado_en: datetime
+
+
+class CheckinOut(BaseModel):
+    """
+    Respuesta del check-in: la visita más el veredicto de la geocerca.
+
+    Un check-in fuera de la geocerca se guarda igual y responde 201: no es
+    un error del cliente, es un hecho que gerencia necesita ver. Lo que
+    cambia es `dentro_de_geocerca`.
+    """
+
+    visita: VisitaOut
+    dentro_de_geocerca: bool
+    distancia_metros: float
+    radio_metros: int
+    # Cuánto se pasó del radio. 0 si quedó dentro.
+    exceso_metros: float
+    mensaje: str
+    # True si esta visita ya existía y se devolvió la guardada (solo puede
+    # pasar cuando se reenvía un cliente_uuid_offline ya procesado).
+    duplicada: bool = False
+
+
+class SyncResultado(BaseModel):
+    cliente_uuid_offline: UUID
+    # null cuando el elemento se rechazó (`error` explica por qué).
+    visita_id: UUID | None = None
+    aceptada: bool
+    # True si ya se había procesado antes: no se creó nada nuevo.
+    duplicada: bool = False
+    dentro_de_geocerca: bool | None = None
+    distancia_metros: float | None = None
+    error: str | None = None
+
+
+class SyncOut(BaseModel):
+    """
+    Resumen del lote. Nunca es 4xx aunque haya elementos rechazados: el
+    resultado va por elemento para que la app sepa cuáles borrar de su
+    cola local y cuáles conservar.
+    """
+
+    recibidas: int
+    creadas: int
+    duplicadas: int
+    rechazadas: int
+    resultados: list[SyncResultado]
+
+
+# ============================================================
+# CRM DE CAMPO — TAREAS DE SEGUIMIENTO
+# ============================================================
+EstadoTarea = Literal["pendiente", "completada", "vencida"]
+
+
+class TareaCrearIn(BaseModel):
+    cliente_id: UUID
+    titulo: str = Field(min_length=2, max_length=255)
+    fecha_programada: datetime
+    descripcion: str | None = Field(default=None, max_length=5000)
+    # Solo gerencia puede mandarlo para asignar la tarea a otro. Un
+    # vendedor lo deja vacío y la tarea es suya.
+    vendedor_id: UUID | None = None
+
+
+class TareaActualizarIn(BaseModel):
+    titulo: str | None = Field(default=None, min_length=2, max_length=255)
+    descripcion: str | None = Field(default=None, max_length=5000)
+    fecha_programada: datetime | None = None
+    # 'completada' no se pone por acá: usa POST /tareas/{id}/completar, que
+    # es lo que sella completado_en de forma coherente.
+    estado: Literal["pendiente", "vencida"] | None = None
+    vendedor_id: UUID | None = None
+
+
+class TareaOut(BaseModel):
+    id: UUID
+    tenant_id: UUID
+    vendedor_id: UUID
+    vendedor_nombre: str | None = None
+    cliente_id: UUID
+    cliente_nombre_negocio: str | None = None
+    titulo: str
+    descripcion: str | None
+    fecha_programada: datetime
+    estado: str
+    completado_en: datetime | None
+    creado_en: datetime
+
+
+# ============================================================
+# CRM DE CAMPO — REPORTES
+# ============================================================
+class ActividadVendedorOut(BaseModel):
+    vendedor_id: UUID
+    nombre: str
+    activo: bool
+    visitas: int
+    # Las que cayeron dentro del radio del cliente.
+    visitas_validadas: int
+    visitas_fuera_geocerca: int
+    # Clientes distintos visitados, no visitas totales.
+    clientes_visitados: int
+    tareas_completadas: int
+    tareas_pendientes: int
+    # visitas_validadas / visitas, 0-100. None si no hubo visitas —
+    # distinto de 0.0, que sería "fue a todas y ninguna contó".
+    porcentaje_validadas: float | None
+
+
+class ReporteActividadOut(BaseModel):
+    desde: datetime
+    hasta: datetime
+    total_visitas: int
+    total_tareas_completadas: int
+    vendedores: list[ActividadVendedorOut]
+
+
+# ============================================================
 # EVENTOS (los llama n8n, no el frontend)
 # ============================================================
 class MensajeEntranteIn(BaseModel):

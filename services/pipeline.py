@@ -15,7 +15,7 @@ from uuid import UUID
 
 import asyncpg
 
-from pipeline_estados import ESTADO_INICIAL
+from services.pipeline_estados import ESTADO_INICIAL
 from session import conexion
 
 # Columnas del embudo que devuelven todas las funciones de acá, para no

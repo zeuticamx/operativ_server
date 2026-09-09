@@ -16,8 +16,8 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-import pipeline_estados
-from asignacion import asignar_vendedor_automatico, leer_config
+from services import pipeline_estados
+from services.asignacion import asignar_vendedor_automatico, leer_config
 from deps import (
     UsuarioActual,
     gerencia_actual,
@@ -26,13 +26,13 @@ from deps import (
     usuario_actual,
     verificar_acceso_tenant,
 )
-from pipeline import (
+from services.pipeline import (
     asignar_vendedor,
     get_or_create_pipeline,
     get_tenant_servicios,
     set_tenant_servicios,
 )
-from pipeline_estados import ESTADOS_CERRADOS
+from services.pipeline_estados import ESTADOS_CERRADOS
 from schemas import (
     AsignarClienteIn,
     CambiarEstadoIn,
@@ -54,7 +54,14 @@ from session import conexion, fetch_all, fetch_one, transaccion
 
 router_vendedores = APIRouter(prefix="/vendedores", tags=["vendedores"])
 router_tenants = APIRouter(prefix="/tenants", tags=["vendedores"])
-router_clientes = APIRouter(prefix="/clientes", tags=["vendedores"])
+
+# /pipeline y no /clientes: el CRM de campo (clientes.py) ya usa
+# /api/clientes para los negocios físicos que se visitan, y ahí el
+# identificador es un `clientes.id`. Acá el identificador es un `users.id`
+# —un contacto que escribió por WhatsApp o Instagram— y son cosas
+# distintas. Compartir el sustantivo hacía que pasar el UUID equivocado
+# diera un 404 sin ninguna pista de por qué.
+router_pipeline = APIRouter(prefix="/pipeline", tags=["vendedores"])
 
 
 # ============================================================
@@ -253,7 +260,11 @@ async def crear_vendedor(
 
 @router_tenants.get("/{tenant_id}/vendedores", response_model=list[VendedorOut])
 async def listar_vendedores(
-    tenant_id: UUID = Depends(modulo_en_ruta),
+    # Sin exigir el módulo: leer el equipo es inofensivo y lo necesitan los
+    # DOS módulos que cuelgan de `vendedores` — el embudo de chat (que sí
+    # depende del flag) y el CRM de campo (que no). Gatearlo dejaba la
+    # pantalla de cartera sin poder llenar su filtro de vendedor.
+    tenant_id: UUID = Depends(tenant_en_ruta),
     activo: bool | None = Query(None),
 ):
     filas = await fetch_all(
@@ -317,8 +328,8 @@ async def actualizar_vendedor(
     return VendedorOut(**dict(fila))
 
 
-@router_vendedores.get("/{vendedor_id}/clientes", response_model=list[PipelineOut])
-async def clientes_de_vendedor(
+@router_vendedores.get("/{vendedor_id}/pipeline", response_model=list[PipelineOut])
+async def pipeline_de_vendedor(
     vendedor_id: UUID,
     tenant_id: UUID = Depends(modulo_actual),
     estado: str | None = Query(None),
@@ -423,7 +434,7 @@ async def reasignar_pendientes(
 # ============================================================
 # CLIENTES EN EL EMBUDO
 # ============================================================
-@router_clientes.post("/{user_id}/asignar", response_model=PipelineOut)
+@router_pipeline.post("/{user_id}/asignar", response_model=PipelineOut)
 async def asignar_cliente(
     user_id: UUID,
     datos: AsignarClienteIn,
@@ -480,7 +491,7 @@ async def asignar_cliente(
     return _a_pipeline_out(fila)
 
 
-@router_clientes.patch("/{user_id}/estado", response_model=PipelineOut)
+@router_pipeline.patch("/{user_id}/estado", response_model=PipelineOut)
 async def cambiar_estado(
     user_id: UUID,
     datos: CambiarEstadoIn,
@@ -581,7 +592,7 @@ async def cambiar_estado(
     return _a_pipeline_out(completa)
 
 
-@router_clientes.get("/{user_id}/historial", response_model=list[HistorialOut])
+@router_pipeline.get("/{user_id}/historial", response_model=list[HistorialOut])
 async def historial_cliente(
     user_id: UUID,
     tenant_id: UUID = Depends(modulo_actual),

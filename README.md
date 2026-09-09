@@ -28,15 +28,29 @@ Genera el secreto de JWT:
 python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
+## Estructura
+
+```
+sql/          migraciones NN_*.sql, en orden
+services/     lógica de negocio sin HTTP (asignación, CRM, correo, geocerca,
+              Google, Meta, avisos, pipeline). La importan los routers.
+routers/      un APIRouter por recurso; lo único que sabe de FastAPI aparte
+              de deps.py
+config.py, deps.py, security.py, session.py, schemas.py, main.py
+              infraestructura transversal: la usan tanto routers/ como
+              services/, así que se queda en la raíz y no en ninguna
+              de las dos carpetas de arriba.
+```
+
 ## Migraciones
 
-No hay Alembic: son archivos `NN_*.sql` numerados que se aplican en orden
-con `aplicar_sql.py`, que lee el **mismo** `DATABASE_URL` que la app (así lo
-que se aplica cae sí o sí en la base que n8n lee).
+No hay Alembic: son archivos `NN_*.sql` numerados en `sql/` que se aplican
+en orden con `aplicar_sql.py`, que lee el **mismo** `DATABASE_URL` que la
+app (así lo que se aplica cae sí o sí en la base que n8n lee).
 
 ```bash
-python aplicar_sql.py --revisar          # solo lectura: qué falta y en qué base
-python aplicar_sql.py 06_vendedores.sql  # aplicar
+python aplicar_sql.py --revisar              # solo lectura: qué falta y en qué base
+python aplicar_sql.py sql/06_vendedores.sql  # aplicar (el nombre suelto también funciona)
 ```
 
 Cada archivo va en una transacción: si algo falla no queda a medio aplicar.
@@ -45,9 +59,10 @@ Todo es `IF NOT EXISTS`, así que reaplicar no rompe nada.
 Desde cero:
 
 ```bash
-python aplicar_sql.py 01_portal.sql 02_token_expires_tz.sql \
-                      03_users_username.sql 04_verificacion_email.sql \
-                      05_herramientas.sql 06_vendedores.sql
+python aplicar_sql.py sql/01_portal.sql sql/02_token_expires_tz.sql \
+                      sql/03_users_username.sql sql/04_verificacion_email.sql \
+                      sql/05_herramientas.sql sql/06_vendedores.sql \
+                      sql/07_crm_campo.sql
 ```
 
 Levanta:
@@ -169,14 +184,14 @@ GET    /api/tenants/{id}/config-vendedores  Estrategia de reparto
 PATCH  /api/tenants/{id}/config-vendedores  carga | round_robin | manual (gerencia)
 
 POST   /api/vendedores                      Alta
-GET    /api/tenants/{id}/vendedores         Listado (?activo=true)
+GET    /api/tenants/{id}/vendedores         Listado (?activo=true) — sin exigir el flag
 PATCH  /api/vendedores/{id}                 Activar / desactivar / editar
-GET    /api/vendedores/{id}/clientes        Su cartera
+GET    /api/vendedores/{id}/pipeline        Su embudo
 POST   /api/vendedores/{id}/reasignar-pendientes   Reparte sus leads abiertos
 
-POST   /api/clientes/{user_id}/asignar      Asignar o reasignar
-PATCH  /api/clientes/{user_id}/estado       Mover de etapa
-GET    /api/clientes/{user_id}/historial    Bitácora del lead
+POST   /api/pipeline/{user_id}/asignar      Asignar o reasignar
+PATCH  /api/pipeline/{user_id}/estado       Mover de etapa
+GET    /api/pipeline/{user_id}/historial    Bitácora del lead
 
 GET    /api/tenants/{id}/pipeline           Vista de gerencia
 GET    /api/tenants/{id}/metricas           Conversión, tiempos, ranking
@@ -263,6 +278,117 @@ diría cuáles existen.
 
 El aviso al vendedor (`notificaciones.py`) es un **stub**: registra en el
 log y devuelve False. Queda por enganchar al sub-workflow de envío.
+
+### CRM de campo (clientes, visitas, tareas)
+
+Segundo módulo sobre el mismo equipo de `vendedores`, para venta en calle.
+**No es lo mismo que el embudo de arriba** y por eso no comparten URL:
+
+| | Qué es un "cliente" | Dónde vive |
+|---|---|---|
+| Embudo de chat | Un contacto que escribió por WhatsApp/IG (`users`) | `/api/pipeline/...` |
+| CRM de campo | Un negocio físico que se visita (`clientes`) | `/api/clientes/...` |
+
+```
+GET    /api/clientes                    Cartera (estado, prioridad, buscar)
+GET    /api/clientes/{id}
+POST   /api/clientes                    Alta            (gerencia)
+PUT    /api/clientes/{id}               Edición parcial (gerencia)
+POST   /api/clientes/{id}/desasignar    Quitar vendedor (gerencia)
+
+POST   /api/visitas/checkin             Check-in con geocerca
+POST   /api/visitas/sync                Cola offline, idempotente
+GET    /api/visitas                     Historial filtrable
+GET    /api/visitas/{id}
+
+GET    /api/tareas                      Agenda
+POST   /api/tareas
+PUT    /api/tareas/{id}
+POST   /api/tareas/{id}/completar       Sella completado_en
+POST   /api/tareas/{id}/reabrir
+DELETE /api/tareas/{id}
+
+GET    /api/reportes/actividad          Visitas y tareas por vendedor (gerencia)
+```
+
+#### Rol `vendedor`
+
+`portal_users.role` es `VARCHAR(50)` **sin CHECK**, así que `'vendedor'`
+entró como un valor más junto a owner/member/superadmin — sin migración y
+sin sistema de permisos paralelo.
+
+El JWT **no cambió**: sigue llevando solo `sub`. Ni el rol ni el
+`vendedor_id` viajan en el token. `deps.vendedor_actual` relee de BD en
+cada petición, igual que ya hacía `usuario_actual`, y rechaza con 403 si
+la ficha no existe o si `vendedores.activo = false`. Desactivar a alguien
+surte efecto en la siguiente petición y no cuando expire su token — que
+con `ACCESS_TOKEN_MINUTES=60` sería hasta una hora de check-ins de quien
+ya no trabaja ahí.
+
+#### Alcance por rol
+
+`crm.acceso_crm` resuelve quién llama y qué puede ver:
+
+| Rol | Ve | Escribe |
+|---|---|---|
+| `vendedor` | Solo su cartera y sus visitas/tareas | Check-ins y sus tareas |
+| `owner` / `superadmin` | Todo el tenant | Alta y edición de clientes, reportes |
+| `member` | Todo el tenant | Nada |
+
+Un `vendedor_id` en el query string se **ignora** cuando quien llama es un
+vendedor: el filtro se fuerza a su propio id, así que el parámetro no
+sirve para asomarse a la cartera de un compañero.
+
+Dos errores distintos a propósito:
+
+- **404** el cliente no existe, o es de otro tenant. Iguales para que
+  probar UUIDs no revele qué negocios existen en otras cuentas.
+- **403** existe en este mismo tenant pero es de otro vendedor. Acá sí se
+  puede decir la verdad: es gente de la misma empresa, y un 404 mandaría
+  al vendedor a reportar como perdido un cliente que solo no es suyo.
+
+#### Geocerca
+
+El veredicto lo calcula el servidor con las coordenadas guardadas del
+cliente (`geo.evaluar_geocerca`); `dentro_de_geocerca` **no existe en el
+esquema de entrada**, así que el teléfono no puede mandarlo.
+
+La distancia y el veredicto se **persisten**. Si después mueven el pin del
+cliente o cambian su radio, las visitas ya registradas conservan el
+resultado que tuvieron: un reporte de productividad no puede cambiar
+retroactivamente.
+
+Un check-in fuera de la geocerca **se guarda y responde 201**. No es un
+error del cliente, es un hecho que gerencia necesita ver; lo que cambia es
+`dentro_de_geocerca` y el mensaje dice cuántos metros se pasó.
+
+La misma fórmula existe dos veces —`geo.py` para el check-in (probable sin
+BD) y la función SQL `distancia_metros` para reportes y consultas ad-hoc—.
+Ambas usan 6 371 000 m de radio terrestre y hay una comprobación que las
+compara punto por punto para que no se separen.
+
+#### Sincronización offline
+
+`POST /visitas/sync` es idempotente por `cliente_uuid_offline`, que genera
+la app antes de salir a la calle. Reenviar el mismo lote no crea visitas
+nuevas: devuelve las que ya estaban con `duplicada: true` y su `visita_id`
+real, para que la app sepa qué borrar de su cola.
+
+La idempotencia tiene dos capas, porque los duplicados llegan de dos
+sitios:
+
+1. **Dentro del lote** — una cola local puede traer el mismo elemento dos
+   veces si la app reintentó y guardó de más. Lo resuelve `dedupe_lote`.
+2. **Contra la base** — el índice único parcial sobre
+   `cliente_uuid_offline`. El `ON CONFLICT ... WHERE cliente_uuid_offline
+   IS NOT NULL` lleva el mismo predicado del índice a propósito: sin él
+   Postgres no lo reconoce como árbitro del conflicto.
+
+Responde **200 aunque haya elementos rechazados**, con el resultado por
+elemento. Un 4xx global obligaría a la app a descartar el lote entero por
+un solo check-in malo. Y cada elemento va en su propia transacción: un
+cliente borrado mientras el teléfono estaba sin señal no puede costar el
+resto de la cola.
 
 ## Flujo de conexión con Meta
 
