@@ -16,6 +16,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from realtime import broadcast_alerta
 from services import pipeline_estados
 from services.asignacion import asignar_vendedor_automatico, leer_config
 from deps import (
@@ -38,7 +39,9 @@ from schemas import (
     CambiarEstadoIn,
     ConfigAsignacionIn,
     ConfigAsignacionOut,
+    CrearClienteIn,
     HistorialOut,
+    HistorialVendedorOut,
     MetricaEtapaOut,
     MetricasPipelineOut,
     PipelineOut,
@@ -62,6 +65,9 @@ router_tenants = APIRouter(prefix="/tenants", tags=["vendedores"])
 # distintas. Compartir el sustantivo hacía que pasar el UUID equivocado
 # diera un 404 sin ninguna pista de por qué.
 router_pipeline = APIRouter(prefix="/pipeline", tags=["vendedores"])
+
+# Crear nuevos clientes en el embudo (ruta separada para claridad).
+router_clientes = APIRouter(prefix="/clientes", tags=["vendedores"])
 
 
 # ============================================================
@@ -355,6 +361,42 @@ async def pipeline_de_vendedor(
     return [_a_pipeline_out(f) for f in filas]
 
 
+@router_vendedores.get("/{vendedor_id}/historial", response_model=list[HistorialVendedorOut])
+async def historial_de_vendedor(
+    vendedor_id: UUID,
+    tenant_id: UUID = Depends(modulo_actual),
+    limite: int = Query(50, ge=1, le=200),
+):
+    """
+    Bitácora completa del vendedor: cada cambio de estado o asignación que
+    le tocó, sin importar el cliente. Usa `pipeline_historial.vendedor_id`
+    y no el `vendedor_id` actual de `client_pipeline`, así que un lead que
+    ya se reasignó a otra persona sigue apareciendo con lo que pasó
+    mientras fue de este vendedor.
+    """
+    await _vendedor_del_tenant(vendedor_id, tenant_id)
+
+    filas = await fetch_all(
+        f"""
+        SELECT
+            p.user_id,
+            {_NOMBRE_CLIENTE} AS cliente_nombre,
+            {_HANDLE_CLIENTE} AS cliente_handle,
+            h.estado_anterior, h.estado_nuevo, h.nota, h.creado_en
+        FROM pipeline_historial h
+        JOIN client_pipeline p ON p.id = h.client_pipeline_id
+        JOIN users u ON u.id = p.user_id
+        WHERE p.tenant_id = $1 AND h.vendedor_id = $2
+        ORDER BY h.creado_en DESC
+        LIMIT $3
+        """,
+        tenant_id,
+        vendedor_id,
+        limite,
+    )
+    return [HistorialVendedorOut(**dict(f)) for f in filas]
+
+
 @router_vendedores.post("/{vendedor_id}/reasignar-pendientes", response_model=ReasignacionOut)
 async def reasignar_pendientes(
     vendedor_id: UUID,
@@ -379,20 +421,25 @@ async def reasignar_pendientes(
     reasignados = 0
     sin_destino = 0
     destinos: dict[UUID, int] = {}
+    movimientos: list[dict] = []
 
     async with transaccion() as conn:
         config = await leer_config(conn, tenant_id)
 
-        # FOR UPDATE: nadie puede cambiarle el estado a estos leads mientras
+        # FOR UPDATE OF p y no FOR UPDATE a secas: el join a users es solo
+        # para el nombre de la alerta, no hace falta bloquear esas filas
+        # también. Nadie puede cambiarle el estado a estos leads mientras
         # se los reparte, o uno podría cerrarse y terminar reasignado igual.
         pendientes = await conn.fetch(
-            """
-            SELECT id FROM client_pipeline
-            WHERE tenant_id = $1
-              AND vendedor_id = $2
-              AND estado <> ALL($3::text[])
-            ORDER BY actualizado_en
-            FOR UPDATE
+            f"""
+            SELECT p.id, p.user_id, {_NOMBRE_CLIENTE} AS cliente_nombre
+            FROM client_pipeline p
+            JOIN users u ON u.id = p.user_id
+            WHERE p.tenant_id = $1
+              AND p.vendedor_id = $2
+              AND p.estado <> ALL($3::text[])
+            ORDER BY p.actualizado_en
+            FOR UPDATE OF p
             """,
             tenant_id,
             vendedor_id,
@@ -421,6 +468,40 @@ async def reasignar_pendientes(
             )
             reasignados += 1
             destinos[destino] = destinos.get(destino, 0) + 1
+            movimientos.append(
+                {
+                    "cliente_id": fila["user_id"],
+                    "cliente_nombre": fila["cliente_nombre"],
+                    "vendedor_nuevo_id": destino,
+                }
+            )
+
+    # Fuera de la transacción, igual que en crear_cliente/cambiar_estado.
+    # Una alerta por cliente y no un resumen: es lo que se pidió, pero ojo
+    # si algún día esto reparte carteras de cientos de leads — eso serían
+    # cientos de toasts encadenados en el panel de gerencia.
+    if movimientos:
+        nombres_destino = {
+            f["id"]: f["nombre"]
+            for f in await fetch_all(
+                "SELECT id, nombre FROM vendedores WHERE id = ANY($1::uuid[])",
+                list({m["vendedor_nuevo_id"] for m in movimientos}),
+            )
+        }
+        for m in movimientos:
+            nombre_destino = nombres_destino.get(m["vendedor_nuevo_id"], "otro vendedor")
+            await broadcast_alerta(
+                tenant_id,
+                tipo="cambio_etapa",
+                titulo="🔄 Cliente reasignado",
+                mensaje=f"{m['cliente_nombre'] or 'Un cliente'} fue reasignado a {nombre_destino}",
+                datos={
+                    "cliente_id": str(m["cliente_id"]),
+                    "vendedor_anterior_id": str(vendedor_id),
+                    "vendedor_nuevo_id": str(m["vendedor_nuevo_id"]),
+                    "vendedor_nuevo_nombre": nombre_destino,
+                },
+            )
 
     return ReasignacionOut(
         vendedor_id=vendedor_id,
@@ -589,7 +670,31 @@ async def cambiar_estado(
             actual["id"],
         )
 
-    return _a_pipeline_out(completa)
+    resultado = _a_pipeline_out(completa)
+
+    # "cierre" y no "cambio_etapa" al llegar a un estado terminal: son tipos
+    # distintos en schemas.TipoAlerta y el centro de notificaciones ya les
+    # da un color propio (ver TIPO_CLASES en centro-notificaciones.tsx).
+    tipo_alerta = "cierre" if pipeline_estados.es_terminal(datos.estado) else "cambio_etapa"
+    emoji = "🏆" if datos.estado == "ganado" else "📍"
+
+    await broadcast_alerta(
+        tenant_id,
+        tipo=tipo_alerta,
+        titulo=f"{emoji} Cliente movido",
+        mensaje=f"{resultado.cliente_nombre} pasó de {estado_anterior} a {datos.estado}",
+        datos={
+            "cliente_id": str(user_id),
+            "cliente_nombre": resultado.cliente_nombre,
+            "estado_anterior": estado_anterior,
+            "estado_nuevo": datos.estado,
+            "vendedor_id": str(resultado.vendedor_id) if resultado.vendedor_id else None,
+            "vendedor_nombre": resultado.vendedor_nombre,
+            "nota": datos.nota,
+        },
+    )
+
+    return resultado
 
 
 @router_pipeline.get("/{user_id}/historial", response_model=list[HistorialOut])
@@ -756,3 +861,102 @@ async def metricas_pipeline(tenant_id: UUID = Depends(modulo_en_ruta)):
         ),
         ranking=ranking,
     )
+
+
+# ============================================================
+# CREAR CLIENTE MANUALMENTE EN EL EMBUDO
+# ============================================================
+@router_clientes.post("", response_model=PipelineOut, status_code=201)
+async def crear_cliente(
+    datos: CrearClienteIn,
+    usuario: UsuarioActual = Depends(usuario_actual),
+):
+    """
+    Crea un nuevo cliente en el embudo con asignación automática según
+    la estrategia del tenant. Genera un user_id, lo mete en users, y
+    luego lo asigna al embudo.
+    """
+    tenant_id = datos.tenant_id
+    verificar_acceso_tenant(usuario, tenant_id)
+    await _exigir_modulo(tenant_id)
+
+    async with transaccion() as conn:
+        # Crear el usuario (contacto)
+        user_id = None
+        fila_usuario = await conn.fetchrow(
+            """
+            INSERT INTO users (tenant_id, display_name)
+            VALUES ($1, $2)
+            RETURNING id
+            """,
+            tenant_id,
+            datos.nombre,
+        )
+        if fila_usuario:
+            user_id = fila_usuario["id"]
+
+        if user_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="No se pudo crear el usuario en la base de datos",
+            )
+
+        # Crear el pipeline (embudo) en estado 'nuevo'
+        pipeline_fila = await conn.fetchrow(
+            """
+            INSERT INTO client_pipeline (tenant_id, user_id, estado, monto_estimado)
+            VALUES ($1, $2, 'nuevo', $3)
+            RETURNING id
+            """,
+            tenant_id,
+            user_id,
+            datos.monto_estimado,
+        )
+
+        if pipeline_fila is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="No se pudo crear el cliente en el embudo",
+            )
+
+        pipeline_id = pipeline_fila["id"]
+
+        # Asignar vendedor automáticamente según la estrategia
+        vendedor_id = await asignar_vendedor_automatico(tenant_id, conn=conn)
+        nota = f"Creación manual por {usuario.email}"
+        if datos.nota:
+            nota += f" — {datos.nota}"
+
+        await asignar_vendedor(pipeline_id, vendedor_id, conn, nota=nota)
+
+        # Seleccionar el resultado final
+        fila = await conn.fetchrow(
+            f"{_SELECT_PIPELINE} WHERE p.id = $1",
+            pipeline_id,
+        )
+
+    resultado = _a_pipeline_out(fila)
+
+    # Fuera de la transacción: crear_alerta hace su propia escritura y
+    # sio.emit es una llamada de red, ninguna de las dos debería demorar un
+    # commit (mismo criterio que eventos.on_mensaje_entrante).
+    await broadcast_alerta(
+        tenant_id,
+        tipo="nuevo_lead",
+        titulo="🎉 Nuevo cliente",
+        mensaje=(
+            f"{resultado.cliente_nombre} llegó al embudo — asignado a {resultado.vendedor_nombre}"
+            if resultado.vendedor_nombre
+            else f"{resultado.cliente_nombre} llegó al embudo, sin vendedor disponible"
+        ),
+        datos={
+            "cliente_id": str(user_id),
+            "cliente_nombre": resultado.cliente_nombre,
+            "vendedor_id": str(vendedor_id) if vendedor_id else None,
+            "vendedor_nombre": resultado.vendedor_nombre,
+            "monto": str(resultado.monto_estimado) if resultado.monto_estimado is not None else None,
+            "canal": datos.canal,
+        },
+    )
+
+    return resultado

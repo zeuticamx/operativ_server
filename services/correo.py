@@ -131,3 +131,102 @@ async def enviar_codigo_verificacion(
         texto=_TEXTO.format(**datos),
         html=_HTML.format(**datos),
     )
+
+
+# ============================================================
+# Alerta crítica (envío inmediato, una alerta = un correo)
+# ============================================================
+_TEXTO_ALERTA = """{titulo}
+
+{mensaje}
+
+Ver en OperativAI: {url_panel}
+"""
+
+_HTML_ALERTA = """\
+<div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1c1c1c">
+  <p style="margin:0 0 16px;font-size:18px;font-weight:600">{titulo}</p>
+  <p style="margin:0 0 24px;font-size:14px;color:#333">{mensaje}</p>
+  <p style="margin:0">
+    <a href="{url_panel}" style="font-size:13px;color:#3b82f6;text-decoration:none">
+      Ver en OperativAI →
+    </a>
+  </p>
+</div>"""
+
+
+def _url_panel() -> str:
+    """
+    Primer origen configurado en FRONTEND_ORIGINS: es el dominio real del
+    panel en producción (localhost en dev), no un valor hardcodeado aparte
+    que se puede desincronizar de settings.FRONTEND_ORIGINS.
+    """
+    if settings.FRONTEND_ORIGINS:
+        return f"{settings.FRONTEND_ORIGINS[0]}/vendedores"
+    return "/vendedores"
+
+
+async def enviar_alerta_critica(destino: str, titulo: str, mensaje: str) -> None:
+    datos = {"titulo": titulo, "mensaje": mensaje, "url_panel": _url_panel()}
+    await enviar_correo(
+        destino,
+        asunto=f"⚠️ {titulo} - OperativAI",
+        texto=_TEXTO_ALERTA.format(**datos),
+        html=_HTML_ALERTA.format(**datos),
+    )
+
+
+# ============================================================
+# Resumen diario de alertas sin leer
+# ============================================================
+_TEXTO_RESUMEN_ITEM = "  - {titulo}"
+
+_HTML_RESUMEN_ITEM = """\
+        <li style="margin:0 0 8px;font-size:14px;color:#333">{titulo}</li>"""
+
+
+async def enviar_resumen_alertas(
+    destino: str, nombre_negocio: str, alertas: list[dict]
+) -> None:
+    """
+    Un correo por tenant con todas las alertas que siguen sin marcarse
+    leídas. `alertas` ya viene ordenada y recortada por quien llama
+    (jobs.alertas_background): acá solo arma el correo.
+    """
+    total = len(alertas)
+    url_panel = _url_panel()
+
+    texto_items = "\n".join(
+        _TEXTO_RESUMEN_ITEM.format(titulo=a["titulo"]) for a in alertas
+    )
+    html_items = "\n".join(
+        _HTML_RESUMEN_ITEM.format(titulo=a["titulo"]) for a in alertas
+    )
+
+    plural = "alertas" if total != 1 else "alerta"
+    texto = (
+        f"{nombre_negocio} tiene {total} {plural} sin leer en OperativAI:\n\n"
+        f"{texto_items}\n\n"
+        f"Ver todas: {url_panel}\n"
+    )
+    html = f"""\
+<div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1c1c1c">
+  <p style="margin:0 0 16px;font-size:16px">
+    <strong>{nombre_negocio}</strong> tiene <strong>{total}</strong> {plural} sin leer en OperativAI:
+  </p>
+  <ul style="margin:0 0 24px;padding-left:20px">
+{html_items}
+  </ul>
+  <p style="margin:0">
+    <a href="{url_panel}" style="font-size:13px;color:#3b82f6;text-decoration:none">
+      Ver todas →
+    </a>
+  </p>
+</div>"""
+
+    await enviar_correo(
+        destino,
+        asunto=f"Resumen diario: {total} {plural} sin leer - OperativAI",
+        texto=texto,
+        html=html,
+    )

@@ -63,6 +63,21 @@ class Settings:
     # ametralladora de correos contra una casilla ajena.
     CODIGO_REENVIO_SEGUNDOS: int = int(os.getenv("CODIGO_REENVIO_SEGUNDOS", "60"))
 
+    # ---- Alertas de background ----
+    # Cuánto tiempo sin actualizarse hace que un lead cuente como "sin
+    # actividad", y cada cuánto se revisa. Correrlo seguido no insiste con
+    # el mismo lead: el propio job no repite una alerta antes de 24h.
+    ALERTA_SIN_ACTIVIDAD_DIAS: int = int(os.getenv("ALERTA_SIN_ACTIVIDAD_DIAS", "7"))
+    ALERTA_SIN_ACTIVIDAD_INTERVALO_HORAS: int = int(
+        os.getenv("ALERTA_SIN_ACTIVIDAD_INTERVALO_HORAS", "1")
+    )
+
+    # Hora (0-23, UTC) del resumen diario de alertas sin leer por correo.
+    # En UTC y no por tenant a propósito: no hay huso horario guardado por
+    # negocio todavía, y una hora fija es mejor que ninguna hasta que haga
+    # falta ese nivel de detalle.
+    RESUMEN_ALERTAS_HORA_UTC: int = int(os.getenv("RESUMEN_ALERTAS_HORA_UTC", "21"))
+
     # ---- CORS ----
     FRONTEND_ORIGINS: list[str] = [
         o.strip()

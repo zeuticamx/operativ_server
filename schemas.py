@@ -289,6 +289,15 @@ class CambiarEstadoIn(BaseModel):
     motivo_perdida: str | None = Field(default=None, max_length=1000)
 
 
+class CrearClienteIn(BaseModel):
+    tenant_id: UUID
+    nombre: str = Field(min_length=1, max_length=255)
+    handle: str | None = Field(default=None, max_length=255)
+    canal: str = Field(default="otro", max_length=50)
+    monto_estimado: Decimal | None = Field(default=None, ge=0, max_digits=12, decimal_places=2)
+    nota: str | None = Field(default=None, max_length=1000)
+
+
 class PipelineOut(BaseModel):
     id: UUID
     user_id: UUID
@@ -314,6 +323,23 @@ class HistorialOut(BaseModel):
     creado_en: datetime
 
 
+class HistorialVendedorOut(BaseModel):
+    """Un movimiento de la bitácora del vendedor, con el cliente al que le pasó.
+
+    A diferencia de `HistorialOut` (línea de tiempo de UN cliente), esto
+    junta la bitácora de TODOS los clientes que ha tenido un vendedor, así
+    que necesita decir de quién es cada fila.
+    """
+
+    user_id: UUID
+    cliente_nombre: str | None
+    cliente_handle: str | None
+    estado_anterior: str | None
+    estado_nuevo: str
+    nota: str | None
+    creado_en: datetime
+
+
 # ============================================================
 # CONFIG DE ASIGNACIÓN
 # ============================================================
@@ -325,6 +351,64 @@ class ConfigAsignacionOut(BaseModel):
 
 class ConfigAsignacionIn(BaseModel):
     estrategia_asignacion: Literal["carga", "round_robin", "manual"]
+
+
+# ============================================================
+# CONFIGURACIÓN DE ETAPAS DEL EMBUDO
+# ============================================================
+# Panel del dueño: NO es el motor que valida el embudo real (eso sigue
+# siendo services/pipeline_estados.py). Ver comentario en
+# sql/08_pipeline_config.sql.
+class PipelineEtapaCrearIn(BaseModel):
+    tenant_id: UUID
+    nombre: str = Field(min_length=1, max_length=50)
+    color: str = Field(default="#3987E5", pattern=r"^#[0-9A-Fa-f]{6}$")
+    descripcion: str | None = Field(default=None, max_length=500)
+    orden: int = 0
+
+
+class PipelineEtapaActualizarIn(BaseModel):
+    nombre: str | None = Field(default=None, min_length=1, max_length=50)
+    color: str | None = Field(default=None, pattern=r"^#[0-9A-Fa-f]{6}$")
+    descripcion: str | None = Field(default=None, max_length=500)
+    orden: int | None = None
+
+
+class PipelineEtapaOut(BaseModel):
+    id: UUID
+    tenant_id: UUID
+    nombre: str
+    color: str
+    descripcion: str | None
+    orden: int
+    creado_en: datetime
+    # Leads del embudo real (client_pipeline) cuyo `estado` coincide con
+    # este nombre y no está cerrado. Es de solo lectura: avisa antes de
+    # borrar una etapa que corresponde a una etapa real en uso, aunque
+    # esta tabla no sea la que controla esa etapa real.
+    leads_activos: int = 0
+
+
+class PipelineTransicionIn(BaseModel):
+    tenant_id: UUID
+    etapa_origen_id: UUID
+    etapa_destino_id: UUID
+    permitida: bool = True
+
+
+class PipelineTransicionOut(BaseModel):
+    id: UUID
+    tenant_id: UUID
+    etapa_origen_id: UUID
+    etapa_origen_nombre: str
+    etapa_destino_id: UUID
+    etapa_destino_nombre: str
+    permitida: bool
+
+
+class PipelineConfigOut(BaseModel):
+    etapas: list[PipelineEtapaOut]
+    transiciones: list[PipelineTransicionOut]
 
 
 # ============================================================
@@ -617,3 +701,28 @@ class MensajeEntranteOut(BaseModel):
     pipeline_id: UUID | None = None
     vendedor_id: UUID | None = None
     asignado_ahora: bool = False
+
+from enum import Enum
+from uuid import UUID
+from datetime import datetime
+from typing import Optional, Dict, Any
+
+class TipoAlerta(str, Enum):
+    nuevo_lead = "nuevo_lead"
+    cambio_etapa = "cambio_etapa"
+    sin_actividad = "sin_actividad"
+    cuota_excedida = "cuota_excedida"
+    cierre = "cierre"
+
+class AlertaOut(BaseModel):
+    id: UUID
+    tenant_id: UUID
+    tipo: TipoAlerta
+    titulo: str
+    mensaje: str
+    datos: Optional[Dict[str, Any]] = None
+    leido: bool
+    creado_en: datetime
+    
+    class Config:
+        from_attributes = True
