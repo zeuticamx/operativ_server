@@ -19,6 +19,8 @@ from apscheduler.triggers.cron import CronTrigger
 
 from config import settings
 from deps import ROLES_GERENCIA
+from jobs.pagos_background import job_pausar_suscripciones_vencidas
+from jobs.pagos_background import JOB_ID as JOB_ID_PAGOS
 from realtime import broadcast_alerta
 from services.correo import ErrorEnvioCorreo, enviar_resumen_alertas
 from services.pipeline_estados import ESTADOS_CERRADOS
@@ -206,12 +208,25 @@ def iniciar_scheduler() -> AsyncIOScheduler:
         max_instances=1,
         coalesce=True,
     )
+    # No es un job "de alertas", pero es el único scheduler que corre en el
+    # proceso: se registra acá en vez de abrir un AsyncIOScheduler aparte
+    # solo para una tarea.
+    scheduler.add_job(
+        job_pausar_suscripciones_vencidas,
+        "interval",
+        hours=settings.SUSCRIPCION_REVISION_INTERVALO_HORAS,
+        id=JOB_ID_PAGOS,
+        name="Pausar suscripciones vencidas",
+        max_instances=1,
+        coalesce=True,
+    )
     scheduler.start()
     log.info(
         "Scheduler de alertas iniciado: sin_actividad cada %sh (umbral %s días), "
-        "resumen diario a las %s:00 UTC",
+        "resumen diario a las %s:00 UTC, suscripciones vencidas cada %sh",
         settings.ALERTA_SIN_ACTIVIDAD_INTERVALO_HORAS,
         settings.ALERTA_SIN_ACTIVIDAD_DIAS,
         settings.RESUMEN_ALERTAS_HORA_UTC,
+        settings.SUSCRIPCION_REVISION_INTERVALO_HORAS,
     )
     return scheduler

@@ -24,12 +24,14 @@ from routers import (
     conversaciones,
     eventos,
     herramientas,
+    pagos,
     pipeline_config,
     reportes,
     tareas,
     vendedores,
     visitas,
 )
+
 from config import settings
 from jobs.alertas_background import iniciar_scheduler
 from session import close_pool, init_pool
@@ -44,7 +46,6 @@ async def lifespan(app: FastAPI):
     yield
     scheduler.shutdown()
     await close_pool()
-
 
 app = FastAPI(
     title="OperativAI API",
@@ -75,6 +76,10 @@ app.include_router(vendedores.router_clientes, prefix="/api")
 app.include_router(pipeline_config.router, prefix="/api")
 app.include_router(alertas.router, prefix="/api")
 
+# Cobros (Mercado Pago). El webhook queda en /api/pagos/webhook y es el
+# único endpoint del módulo sin JWT: se autentica por la firma HMAC.
+app.include_router(pagos.router, prefix="/api")
+
 # CRM de campo: cartera, visitas con geocerca, seguimientos y reportes.
 # Convive con el embudo de chat de arriba; comparten la tabla vendedores.
 app.include_router(clientes.router, prefix="/api")
@@ -89,7 +94,6 @@ app.include_router(eventos.router, prefix="/api")
 @app.get("/api/salud")
 async def salud():
     return {"ok": True}
-
 
 # El WebSocket de alertas vive en su propia capa ASGI, montada encima de
 # FastAPI: /socket.io/* lo atiende python-socketio, todo lo demás sigue

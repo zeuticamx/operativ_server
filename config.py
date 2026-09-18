@@ -3,13 +3,11 @@
 import logging
 import os
 from functools import lru_cache
-
 from dotenv import load_dotenv
 
 # uvicorn no carga .env por su cuenta; sin esto, arrancar con
 # `uvicorn main:app` nunca ve las variables aunque el archivo exista.
 load_dotenv()
-
 
 class Settings:
     # ---- Base de datos ----
@@ -78,6 +76,37 @@ class Settings:
     # falta ese nivel de detalle.
     RESUMEN_ALERTAS_HORA_UTC: int = int(os.getenv("RESUMEN_ALERTAS_HORA_UTC", "21"))
 
+    # Cada cuánto se revisan suscripciones vencidas para pausarlas (ver
+    # jobs/pagos_background.py). El ciclo es de 30 días; revisarlo cada hora
+    # es barato (un solo UPDATE) y deja como mucho una hora de margen entre
+    # que vence y que el bloqueo de acceso_pagos.py surte efecto.
+    SUSCRIPCION_REVISION_INTERVALO_HORAS: int = int(
+        os.getenv("SUSCRIPCION_REVISION_INTERVALO_HORAS", "1")
+    )
+
+    # ---- Mercado Pago ----
+    MERCADOPAGO_ACCESS_TOKEN: str = os.getenv("MERCADOPAGO_ACCESS_TOKEN", "")
+    # Pública a propósito: es la que el navegador usa si algún día se monta
+    # el Brick de checkout en vez de redirigir al init_point.
+    MERCADOPAGO_PUBLIC_KEY: str = os.getenv("MERCADOPAGO_PUBLIC_KEY", "")
+    # Secreto de firma del webhook (panel de MP > Webhooks > "Clave secreta").
+    # No es el access token: sirve solo para validar el HMAC de x-signature.
+    #
+    # Vacío = /api/pagos/webhook responde 503 y no procesa nada. Mismo
+    # criterio de fallar cerrado que N8N_INTERNAL_TOKEN: un webhook de
+    # cobros sin validar es alguien regalándose créditos.
+    MERCADOPAGO_WEBHOOK_SECRET: str = os.getenv("MERCADOPAGO_WEBHOOK_SECRET", "")
+    # Moneda de los cobros. El portal formatea montos en MXN (ver
+    # lib/formato.ts), así que el default acompaña.
+    MERCADOPAGO_CURRENCY: str = os.getenv("MERCADOPAGO_CURRENCY", "MXN")
+    # A dónde vuelve el comprador al terminar el checkout. Sin esto, las
+    # back_urls apuntarían a localhost en producción.
+    BASE_URL_FRONTEND: str = os.getenv("BASE_URL_FRONTEND", "http://localhost:3000").rstrip("/")
+    # URL pública del backend, para la notification_url del webhook. En
+    # local no sirve localhost: Mercado Pago tiene que poder alcanzarla
+    # (ngrok o similar).
+    BASE_URL_BACKEND: str = os.getenv("BASE_URL_BACKEND", "http://localhost:8000").rstrip("/")
+
     # ---- CORS ----
     FRONTEND_ORIGINS: list[str] = [
         o.strip()
@@ -93,6 +122,11 @@ class Settings:
     def smtp_configurado(self) -> bool:
         """Sin host ni remitente no hay a dónde ni de parte de quién mandar."""
         return bool(self.SMTP_HOST and self.SMTP_FROM)
+
+    @property
+    def mercadopago_configurado(self) -> bool:
+        """Sin access token no se puede crear una preferencia ni consultar un pago."""
+        return bool(self.MERCADOPAGO_ACCESS_TOKEN)
 
     def validate(self) -> None:
         """Falla temprano si falta algo crítico, en vez de a media petición."""
@@ -126,6 +160,21 @@ class Settings:
                 "N8N_INTERNAL_TOKEN sin configurar: /api/eventos/* va a "
                 "responder 503. Llénalo si n8n tiene que reportar mensajes "
                 "entrantes al módulo de vendedores."
+            )
+
+        # Tampoco se exige: un despliegue sin cobros arranca igual. Pero se
+        # avisa por separado, porque faltar el token y faltar el secreto del
+        # webhook rompen cosas distintas (crear el pago vs. acreditarlo).
+        if not self.mercadopago_configurado:
+            logging.getLogger("operativai.config").warning(
+                "MERCADOPAGO_ACCESS_TOKEN sin configurar: /api/pagos/crear-pago "
+                "va a responder 503."
+            )
+        elif not self.MERCADOPAGO_WEBHOOK_SECRET:
+            logging.getLogger("operativai.config").warning(
+                "MERCADOPAGO_WEBHOOK_SECRET sin configurar: se pueden crear "
+                "pagos pero /api/pagos/webhook los va a rechazar, así que "
+                "ningún cobro se acreditará."
             )
 
 

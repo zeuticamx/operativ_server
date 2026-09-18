@@ -11,6 +11,7 @@ Se apoya en tres piezas separadas a propósito:
     pipeline.py          leer y escribir el embudo
 """
 
+from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import UUID
 
@@ -18,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from realtime import broadcast_alerta
 from services import pipeline_estados
+from services.acceso_pagos import acceso_pagos
 from services.asignacion import asignar_vendedor_automatico, leer_config
 from deps import (
     UsuarioActual,
@@ -39,6 +41,8 @@ from schemas import (
     CambiarEstadoIn,
     ConfigAsignacionIn,
     ConfigAsignacionOut,
+    ConversionEtapaOut,
+    ConversionPipelineOut,
     CrearClienteIn,
     HistorialOut,
     HistorialVendedorOut,
@@ -49,6 +53,8 @@ from schemas import (
     ReasignacionOut,
     ServiciosIn,
     ServiciosOut,
+    TendenciaMesOut,
+    TendenciaPipelineOut,
     VendedorActualizarIn,
     VendedorCrearIn,
     VendedorOut,
@@ -106,10 +112,16 @@ def _a_pipeline_out(fila) -> PipelineOut:
 
 async def _exigir_modulo(tenant_id: UUID) -> UUID:
     """
-    409 si el negocio no tiene el módulo encendido.
+    409 si el negocio no tiene el módulo encendido; 402 si lo tiene
+    encendido pero no puede pagarlo.
 
-    Se comprueba en cada endpoint y no una sola vez al entrar: el flag se
-    puede apagar mientras alguien tiene el panel abierto.
+    Se comprueban las dos cosas en cada endpoint y no una sola vez al
+    entrar: el flag se puede apagar (o la suscripción vencer) mientras
+    alguien tiene el panel abierto.
+
+    Ojo con el orden: el 409 va primero porque es la decisión del propio
+    dueño (el módulo está apagado a propósito) y no depende de pagos; el
+    402 es "está prendido, pero no se puede seguir usando gratis".
     """
     servicios = await get_tenant_servicios(tenant_id)
     if not servicios.gestion_vendedores_activo:
@@ -120,6 +132,18 @@ async def _exigir_modulo(tenant_id: UUID) -> UUID:
                 "negocio. Actívalo en /tenants/{tenant_id}/servicios."
             ),
         )
+
+    acceso = await acceso_pagos(tenant_id)
+    if not acceso.permitido:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=(
+                "La suscripción venció y no quedan créditos disponibles. "
+                "Renueva el plan o compra créditos en /pagos/crear-pago para "
+                "seguir usando el CRM de vendedores."
+            ),
+        )
+
     return tenant_id
 
 
@@ -751,21 +775,39 @@ async def pipeline_completo(
 
 
 @router_tenants.get("/{tenant_id}/metricas", response_model=MetricasPipelineOut)
-async def metricas_pipeline(tenant_id: UUID = Depends(modulo_en_ruta)):
+async def metricas_pipeline(
+    tenant_id: UUID = Depends(modulo_en_ruta),
+    desde: datetime | None = Query(
+        None, description="Inclusivo. Filtra por fecha de alta en el embudo, no por actualizado_en"
+    ),
+    hasta: datetime | None = Query(None, description="Exclusivo. Ver `desde`"),
+):
     """
     Agregados del embudo: cuántos hay en cada etapa, cuánto tarda cada una
     y quién cierra más.
+
+    Sin `desde`/`hasta` es la foto de siempre: todo el pipeline del tenant.
+    Con rango, cuenta solo los leads dados de alta en esa ventana — la
+    fecha de alta es el primer renglón de su bitácora (estado_anterior IS
+    NULL, ver get_or_create_pipeline), no `actualizado_en`: esa cambia con
+    cualquier movimiento y no serviría para "qué entró en este período".
     """
     cerrados = list(ESTADOS_CERRADOS)
 
     por_estado = await fetch_all(
         """
-        SELECT estado, COUNT(*) AS total
-        FROM client_pipeline
-        WHERE tenant_id = $1
-        GROUP BY estado
+        SELECT p.estado, COUNT(*) AS total
+        FROM client_pipeline p
+        JOIN pipeline_historial h
+          ON h.client_pipeline_id = p.id AND h.estado_anterior IS NULL
+        WHERE p.tenant_id = $1
+          AND ($2::timestamptz IS NULL OR h.creado_en >= $2)
+          AND ($3::timestamptz IS NULL OR h.creado_en <  $3)
+        GROUP BY p.estado
         """,
         tenant_id,
+        desde,
+        hasta,
     )
     conteos = {f["estado"]: f["total"] for f in por_estado}
     total = sum(conteos.values())
@@ -774,15 +816,24 @@ async def metricas_pipeline(tenant_id: UUID = Depends(modulo_en_ruta)):
     # sale hacia la siguiente. Se leen solo los cambios de estado reales
     # (estado_anterior <> estado_nuevo); las anotaciones de asignación
     # comparten tabla pero no mueven al lead de columna, y contarlas
-    # partiría cada etapa en tramos falsos.
+    # partiría cada etapa en tramos falsos. Restringido a los mismos leads
+    # del rango que `por_estado`, para que ambas cuenten la misma cohorte.
     tiempos = await fetch_all(
         """
-        WITH cambios AS (
-            SELECT h.client_pipeline_id, h.estado_nuevo AS estado, h.creado_en
+        WITH leads_rango AS (
+            SELECT h.client_pipeline_id
             FROM pipeline_historial h
             JOIN client_pipeline p ON p.id = h.client_pipeline_id
             WHERE p.tenant_id = $1
-              AND h.estado_anterior IS DISTINCT FROM h.estado_nuevo
+              AND h.estado_anterior IS NULL
+              AND ($2::timestamptz IS NULL OR h.creado_en >= $2)
+              AND ($3::timestamptz IS NULL OR h.creado_en <  $3)
+        ),
+        cambios AS (
+            SELECT h.client_pipeline_id, h.estado_nuevo AS estado, h.creado_en
+            FROM pipeline_historial h
+            JOIN leads_rango lr ON lr.client_pipeline_id = h.client_pipeline_id
+            WHERE h.estado_anterior IS DISTINCT FROM h.estado_nuevo
         ),
         tramos AS (
             SELECT
@@ -798,6 +849,8 @@ async def metricas_pipeline(tenant_id: UUID = Depends(modulo_en_ruta)):
         GROUP BY estado
         """,
         tenant_id,
+        desde,
+        hasta,
     )
     horas = {f["estado"]: float(f["horas"]) for f in tiempos if f["horas"] is not None}
 
@@ -820,6 +873,15 @@ async def metricas_pipeline(tenant_id: UUID = Depends(modulo_en_ruta)):
 
     filas_ranking = await fetch_all(
         """
+        WITH leads_rango AS (
+            SELECT h.client_pipeline_id
+            FROM pipeline_historial h
+            JOIN client_pipeline p ON p.id = h.client_pipeline_id
+            WHERE p.tenant_id = $1
+              AND h.estado_anterior IS NULL
+              AND ($3::timestamptz IS NULL OR h.creado_en >= $3)
+              AND ($4::timestamptz IS NULL OR h.creado_en <  $4)
+        )
         SELECT
             v.id AS vendedor_id, v.nombre, v.activo,
             COUNT(p.id) FILTER (WHERE p.estado <> ALL($2::text[])) AS abiertos,
@@ -828,13 +890,17 @@ async def metricas_pipeline(tenant_id: UUID = Depends(modulo_en_ruta)):
             COALESCE(SUM(p.monto_estimado) FILTER (WHERE p.estado = 'ganado'), 0)
                 AS monto_ganado
         FROM vendedores v
-        LEFT JOIN client_pipeline p ON p.vendedor_id = v.id
+        LEFT JOIN client_pipeline p
+               ON p.vendedor_id = v.id
+              AND p.id IN (SELECT client_pipeline_id FROM leads_rango)
         WHERE v.tenant_id = $1
         GROUP BY v.id, v.nombre, v.activo
         ORDER BY ganados DESC, monto_ganado DESC, v.nombre
         """,
         tenant_id,
         cerrados,
+        desde,
+        hasta,
     )
 
     ranking = []
@@ -860,6 +926,147 @@ async def metricas_pipeline(tenant_id: UUID = Depends(modulo_en_ruta)):
             round(100.0 * ganados / cerrados_total, 2) if cerrados_total else None
         ),
         ranking=ranking,
+    )
+
+
+def _restar_meses(fecha: datetime, meses: int) -> datetime:
+    """Primer día del mes que queda `meses` atrás de `fecha`, a medianoche."""
+    indice = fecha.month - 1 - meses
+    anio = fecha.year + indice // 12
+    mes = indice % 12 + 1
+    return fecha.replace(
+        year=anio, month=mes, day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+
+
+@router_tenants.get("/{tenant_id}/metricas/tendencia", response_model=TendenciaPipelineOut)
+async def tendencia_pipeline(
+    tenant_id: UUID = Depends(modulo_en_ruta),
+    meses: int = Query(12, ge=1, le=24, description="Cuántos meses hacia atrás, incluido el actual"),
+):
+    """
+    Serie mensual: leads dados de alta, ganados y perdidos por mes.
+
+    "Dado de alta" y "ganado/perdido" salen los dos de `pipeline_historial`
+    (alta = primer renglón; cierre = transición a ese estado), agrupados por
+    mes en Python-side boundaries para no depender de la zona horaria del
+    servidor de Postgres.
+    """
+    ahora = datetime.now(timezone.utc)
+    inicio = _restar_meses(ahora, meses - 1)
+
+    altas = await fetch_all(
+        """
+        SELECT date_trunc('month', h.creado_en) AS periodo,
+               COUNT(DISTINCT h.client_pipeline_id) AS nuevos
+        FROM pipeline_historial h
+        JOIN client_pipeline p ON p.id = h.client_pipeline_id
+        WHERE p.tenant_id = $1
+          AND h.estado_anterior IS NULL
+          AND h.creado_en >= $2
+        GROUP BY 1
+        """,
+        tenant_id,
+        inicio,
+    )
+    cierres = await fetch_all(
+        """
+        SELECT date_trunc('month', h.creado_en) AS periodo,
+               COUNT(*) FILTER (WHERE h.estado_nuevo = 'ganado')  AS ganados,
+               COUNT(*) FILTER (WHERE h.estado_nuevo = 'perdido') AS perdidos,
+               COALESCE(SUM(p.monto_estimado) FILTER (WHERE h.estado_nuevo = 'ganado'), 0)
+                   AS monto_ganado
+        FROM pipeline_historial h
+        JOIN client_pipeline p ON p.id = h.client_pipeline_id
+        WHERE p.tenant_id = $1
+          AND h.estado_anterior IS DISTINCT FROM h.estado_nuevo
+          AND h.estado_nuevo IN ('ganado', 'perdido')
+          AND h.creado_en >= $2
+        GROUP BY 1
+        """,
+        tenant_id,
+        inicio,
+    )
+
+    altas_por_mes = {f["periodo"]: f["nuevos"] for f in altas}
+    cierres_por_mes = {f["periodo"]: f for f in cierres}
+
+    resultado: list[TendenciaMesOut] = []
+    for i in range(meses):
+        mes_inicio = _restar_meses(ahora, meses - 1 - i)
+        c = cierres_por_mes.get(mes_inicio)
+        resultado.append(
+            TendenciaMesOut(
+                periodo=mes_inicio.strftime("%Y-%m"),
+                nuevos=altas_por_mes.get(mes_inicio, 0),
+                ganados=c["ganados"] if c else 0,
+                perdidos=c["perdidos"] if c else 0,
+                monto_ganado=Decimal(c["monto_ganado"]) if c else Decimal(0),
+            )
+        )
+
+    return TendenciaPipelineOut(meses=resultado)
+
+
+# Mismo recorte que exportar-embudo-pdf.tsx: 'perdido' es una salida del
+# embudo, no una etapa secuencial más, así que no forma parte del waterfall.
+_ETAPAS_WATERFALL = tuple(e for e in pipeline_estados.ESTADOS if e != "perdido")
+
+
+@router_tenants.get("/{tenant_id}/metricas/conversion", response_model=ConversionPipelineOut)
+async def conversion_pipeline(
+    tenant_id: UUID = Depends(modulo_en_ruta),
+    desde: datetime | None = Query(None, description="Inclusivo. Filtra por fecha de alta en el embudo"),
+    hasta: datetime | None = Query(None, description="Exclusivo. Ver `desde`"),
+):
+    """
+    Waterfall de conversión: de los leads dados de alta en el rango,
+    cuántos llegaron a pisar cada etapa alguna vez (no cuántos están ahí
+    ahora — eso ya lo da /metricas). 'nuevo' es siempre el 100%: todo lead
+    pasa por ahí al entrar.
+    """
+    filas = await fetch_all(
+        """
+        WITH leads_rango AS (
+            SELECT h.client_pipeline_id
+            FROM pipeline_historial h
+            JOIN client_pipeline p ON p.id = h.client_pipeline_id
+            WHERE p.tenant_id = $1
+              AND h.estado_anterior IS NULL
+              AND ($2::timestamptz IS NULL OR h.creado_en >= $2)
+              AND ($3::timestamptz IS NULL OR h.creado_en <  $3)
+        )
+        SELECT h.estado_nuevo AS estado, COUNT(DISTINCT h.client_pipeline_id) AS total
+        FROM pipeline_historial h
+        JOIN leads_rango lr ON lr.client_pipeline_id = h.client_pipeline_id
+        WHERE h.estado_anterior IS DISTINCT FROM h.estado_nuevo
+        GROUP BY h.estado_nuevo
+        """,
+        tenant_id,
+        desde,
+        hasta,
+    )
+    alcanzados = {f["estado"]: f["total"] for f in filas}
+    total_leads = alcanzados.get("nuevo", 0)
+
+    etapas = [
+        ConversionEtapaOut(
+            estado=estado,
+            alcanzados=alcanzados.get(estado, 0),
+            porcentaje=(
+                round(100.0 * alcanzados.get(estado, 0) / total_leads, 2)
+                if total_leads
+                else 0.0
+            ),
+        )
+        for estado in _ETAPAS_WATERFALL
+    ]
+
+    return ConversionPipelineOut(
+        desde=desde,
+        hasta=hasta,
+        total_leads=total_leads,
+        etapas=etapas,
     )
 
 
@@ -920,6 +1127,22 @@ async def crear_cliente(
             )
 
         pipeline_id = pipeline_fila["id"]
+
+        # Primer punto de la línea de tiempo, igual que en
+        # get_or_create_pipeline (el otro camino que crea filas de
+        # client_pipeline). Sin esto el lead queda sin fecha de alta: no
+        # cuenta en /metricas/tendencia ni en ningún filtro de rango, y la
+        # asignación de abajo dejaría como único rastro un renglón con
+        # estado_anterior = estado_nuevo, que es la convención de
+        # "cambio de dueño", no la de "entró al embudo".
+        await conn.execute(
+            """
+            INSERT INTO pipeline_historial
+                (client_pipeline_id, estado_anterior, estado_nuevo, nota)
+            VALUES ($1, NULL, 'nuevo', 'Alta en el embudo')
+            """,
+            pipeline_id,
+        )
 
         # Asignar vendedor automáticamente según la estrategia
         vendedor_id = await asignar_vendedor_automatico(tenant_id, conn=conn)

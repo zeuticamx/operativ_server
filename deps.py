@@ -31,6 +31,7 @@ class UsuarioActual:
     tenant_id: UUID | None
     email: str
     role: str
+    es_gerencia_plataforma: bool = False
 
     @property
     def es_superadmin(self) -> bool:
@@ -64,12 +65,17 @@ async def usuario_actual(
 
     # Se relee de BD en vez de confiar solo en el JWT: si al usuario lo
     # desactivaron o lo movieron de tenant, el token viejo no debe seguir
-    # sirviendo hasta que expire.
+    # sirviendo hasta que expire. El LEFT JOIN contra gerencia_users hace
+    # lo mismo para el nivel gerencia de plataforma: si a alguien lo sacan
+    # de esa lista, pierde el nivel en la siguiente petición, no cuando
+    # expire el token.
     fila = await fetch_one(
         """
-        SELECT id, tenant_id, email, role, is_active
-        FROM portal_users
-        WHERE id = $1
+        SELECT pu.id, pu.tenant_id, pu.email, pu.role, pu.is_active,
+               (gu.id IS NOT NULL) AS es_gerencia_plataforma
+        FROM portal_users pu
+        LEFT JOIN gerencia_users gu ON LOWER(gu.email) = LOWER(pu.email)
+        WHERE pu.id = $1
         """,
         UUID(payload["sub"]),
     )
@@ -85,6 +91,7 @@ async def usuario_actual(
         tenant_id=fila["tenant_id"],
         email=fila["email"],
         role=fila["role"],
+        es_gerencia_plataforma=fila["es_gerencia_plataforma"],
     )
 
 
@@ -142,6 +149,26 @@ async def gerencia_actual(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Hace falta ser dueño o administrador del negocio",
+        )
+    return usuario
+
+
+async def gerencia_plataforma_actual(
+    usuario: UsuarioActual = Depends(usuario_actual),
+) -> UsuarioActual:
+    """
+    Para endpoints reservados al nivel gerencia de plataforma (tabla
+    gerencia_users), no al rol dentro de un tenant. No confundir con
+    `gerencia_actual`: ese dependency es sobre portal_users.role
+    (owner/superadmin) de UN negocio; este es un nivel aparte, sin tenant,
+    para quienes administran la plataforma completa (el equipo de
+    OperativAI). Sin endpoints propios todavía — queda listo para que las
+    próximas features de este tipo lo usen.
+    """
+    if not usuario.es_gerencia_plataforma:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Esta acción requiere nivel gerencia",
         )
     return usuario
 

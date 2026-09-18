@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 
 # ============================================================
@@ -61,6 +61,7 @@ class UsuarioOut(BaseModel):
     role: str
     tenant_id: UUID | None
     nombre_negocio: str | None = None
+    es_gerencia_plataforma: bool = False
 
 
 # ============================================================
@@ -444,6 +445,37 @@ class MetricasPipelineOut(BaseModel):
     ranking: list[RankingVendedorOut]
 
 
+class TendenciaMesOut(BaseModel):
+    # "YYYY-MM". String y no `date`: es una etiqueta de periodo, no un
+    # instante — el día 1 no significa nada por sí solo.
+    periodo: str
+    # Leads dados de alta en el mes (primer renglón de su bitácora).
+    nuevos: int
+    ganados: int
+    perdidos: int
+    monto_ganado: Decimal
+
+
+class TendenciaPipelineOut(BaseModel):
+    meses: list[TendenciaMesOut]
+
+
+class ConversionEtapaOut(BaseModel):
+    estado: str
+    # Leads del rango que pasaron por esta etapa alguna vez (no los que
+    # están ahí ahora mismo — eso ya lo cubre MetricaEtapaOut).
+    alcanzados: int
+    # Sobre el total de leads del rango. 'nuevo' es siempre 100.
+    porcentaje: float
+
+
+class ConversionPipelineOut(BaseModel):
+    desde: datetime | None
+    hasta: datetime | None
+    total_leads: int
+    etapas: list[ConversionEtapaOut]
+
+
 # ============================================================
 # CRM DE CAMPO — CLIENTES
 # ============================================================
@@ -680,7 +712,6 @@ class ReporteActividadOut(BaseModel):
     total_tareas_completadas: int
     vendedores: list[ActividadVendedorOut]
 
-
 # ============================================================
 # EVENTOS (los llama n8n, no el frontend)
 # ============================================================
@@ -726,3 +757,108 @@ class AlertaOut(BaseModel):
     
     class Config:
         from_attributes = True
+
+# ============================================================
+# PAGOS (Mercado Pago)
+# ============================================================
+# `monto`, `precio` y `creditos` viajan como Decimal: FastAPI los serializa
+# a string en el JSON, igual que monto_ganado del embudo. El front los
+# formatea con formatoMonto(), que ya espera string.
+
+TipoPago = Literal["subscription", "credit_purchase"]
+EstadoPago = Literal["pendiente", "aprobado", "rechazado", "cancelado", "reembolsado"]
+EstadoSuscripcion = Literal["activa", "pausada", "cancelada"]
+NombrePlan = Literal["starter", "pro", "enterprise"]
+
+
+class CrearPagoIn(BaseModel):
+    tipo: TipoPago
+    # Cuál de los dos aplica depende de `tipo`; lo cruza el validador de
+    # abajo. No se acepta el monto desde el cliente a propósito: el precio
+    # sale siempre de las tablas `planes`/`paquetes_creditos`, porque si no
+    # cualquiera podría contratar enterprise por un peso.
+    plan: NombrePlan | None = None
+    creditos: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=2)
+
+    @model_validator(mode="after")
+    def _coherente_con_el_tipo(self) -> "CrearPagoIn":
+        if self.tipo == "subscription":
+            if self.plan is None:
+                raise ValueError("Para una suscripción hace falta 'plan'")
+            if self.creditos is not None:
+                raise ValueError("'creditos' no aplica a una suscripción")
+        else:
+            if self.creditos is None:
+                raise ValueError("Para comprar créditos hace falta 'creditos'")
+            if self.plan is not None:
+                raise ValueError("'plan' no aplica a una compra de créditos")
+        return self
+
+
+class CrearPagoOut(BaseModel):
+    transaccion_id: UUID
+    mp_preference_id: str
+    # A dónde mandar al comprador. `sandbox_init_point` es el de pruebas:
+    # viene poblado solo con credenciales de test.
+    init_point: str
+    monto: Decimal
+    concepto: str
+
+
+class PlanOut(BaseModel):
+    nombre: str
+    descripcion: str | None
+    precio_monthly: Decimal
+    precio_annual: Decimal | None
+    # None = sin tope (enterprise).
+    max_vendedores: int | None
+    max_leads_mensuales: int | None
+    creditos_incluidos_mensual: Decimal
+    agente_ia_activo: bool
+    gestion_vendedores_activo: bool
+
+
+class PaqueteCreditosOut(BaseModel):
+    creditos: Decimal
+    precio: Decimal
+
+
+class CatalogoPagosOut(BaseModel):
+    """Lo que el portal necesita para pintar la pantalla de suscripción."""
+
+    planes: list[PlanOut]
+    paquetes: list[PaqueteCreditosOut]
+
+
+class TransaccionOut(BaseModel):
+    id: UUID
+    tipo: str
+    concepto: str | None
+    monto: Decimal
+    estado_pago: EstadoPago
+    metodo_pago: str | None
+    ultimos_4_digitos: str | None
+    creado_en: datetime
+
+
+class PreferenciaEstadoOut(BaseModel):
+    id: UUID
+    tipo: str
+    monto: Decimal
+    estado: EstadoPago
+    fecha: datetime
+
+
+class SuscripcionOut(BaseModel):
+    """
+    Estado de cobros del tenant. Todo nullable salvo los créditos: un
+    tenant que nunca pagó no tiene fila en tenant_subscriptions, y eso no
+    es un error — es el estado inicial.
+    """
+
+    plan: NombrePlan | None
+    estado_suscripcion: EstadoSuscripcion | None
+    fecha_renovacion: datetime | None
+    precio_monthly: Decimal | None
+    creditos_disponibles: Decimal
+    creditos_gastados: Decimal

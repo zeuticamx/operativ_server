@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from routers import eventos
+from services.acceso_pagos import AccesoPagos
 from services.pipeline import Pipeline, Servicios
 
 TENANT = uuid4()
@@ -67,6 +68,11 @@ def escenario(monkeypatch):
                 gestion_vendedores_activo=True,
             )
         )
+        # Permitido por defecto: la mayoría de estos tests no son sobre
+        # pagos, y así se comportan como si acceso_pagos no existiera.
+        acceso_pagos = Espia(
+            AccesoPagos(permitido=True, suscripcion_activa=False, tiene_creditos=False)
+        )
         get_or_create = Espia(embudo())
         asignar_auto = Espia(VENDEDOR)
         asignar = Espia()
@@ -83,6 +89,7 @@ def escenario(monkeypatch):
         yield object()
 
     monkeypatch.setattr(eventos, "get_tenant_servicios", esc.servicios)
+    monkeypatch.setattr(eventos, "acceso_pagos", esc.acceso_pagos)
     monkeypatch.setattr(eventos, "get_or_create_pipeline", esc.get_or_create)
     monkeypatch.setattr(eventos, "asignar_vendedor_automatico", esc.asignar_auto)
     monkeypatch.setattr(eventos, "asignar_vendedor", esc.asignar)
@@ -240,3 +247,74 @@ async def test_un_aviso_que_falla_no_tumba_el_mensaje_entrante(escenario, monkey
 
     assert salida.vendedor_id == VENDEDOR
     assert salida.asignado_ahora is True
+
+
+# ============================================================
+# Bloqueo por falta de pago (services/acceso_pagos.py)
+# ============================================================
+# n8n no sabe nada de pagos: todo lo que tiene para decidir si llama al
+# agente es `agente_ia_activo`. Por eso el bloqueo por no pagar tiene que
+# viajar disfrazado de "agente apagado", aunque tenant_servicios diga que
+# está encendido.
+async def test_sin_acceso_de_pagos_el_agente_se_reporta_apagado(escenario):
+    escenario.servicios.devuelve = Servicios(
+        tenant_id=TENANT, agente_ia_activo=True, gestion_vendedores_activo=True
+    )
+    escenario.acceso_pagos.devuelve = AccesoPagos(
+        permitido=False, suscripcion_activa=False, tiene_creditos=False
+    )
+
+    salida = await eventos.on_mensaje_entrante(TENANT, CLIENTE, MENSAJE)
+
+    assert salida.agente_ia_activo is False
+
+
+async def test_sin_acceso_de_pagos_con_modulo_apagado_tambien_se_reporta_apagado(escenario):
+    """El bloqueo aplica igual en el camino corto (módulo de vendedores apagado)."""
+    escenario.servicios.devuelve = Servicios(
+        tenant_id=TENANT, agente_ia_activo=True, gestion_vendedores_activo=False
+    )
+    escenario.acceso_pagos.devuelve = AccesoPagos(
+        permitido=False, suscripcion_activa=False, tiene_creditos=False
+    )
+
+    salida = await eventos.on_mensaje_entrante(TENANT, CLIENTE, MENSAJE)
+
+    assert salida.gestion_vendedores_activo is False
+    assert salida.agente_ia_activo is False
+
+
+async def test_con_creditos_disponibles_el_agente_sigue_activo_aunque_la_suscripcion_vencio(
+    escenario,
+):
+    """Cualquiera de las dos cosas alcanza: créditos sueltos sin suscripción vigente."""
+    escenario.servicios.devuelve = Servicios(
+        tenant_id=TENANT, agente_ia_activo=True, gestion_vendedores_activo=True
+    )
+    escenario.acceso_pagos.devuelve = AccesoPagos(
+        permitido=True, suscripcion_activa=False, tiene_creditos=True
+    )
+
+    salida = await eventos.on_mensaje_entrante(TENANT, CLIENTE, MENSAJE)
+
+    assert salida.agente_ia_activo is True
+
+
+async def test_bloqueado_por_pagos_se_avisa_al_vendedor_aunque_el_agente_estuviera_encendido(
+    escenario,
+):
+    """
+    Si el agente está bloqueado, nadie le contesta a este cliente: el
+    vendedor tiene que enterarse igual que si el agente estuviera apagado
+    a propósito (ver test_con_el_agente_apagado_se_avisa_al_vendedor).
+    """
+    escenario.servicios.devuelve = Servicios(
+        tenant_id=TENANT, agente_ia_activo=True, gestion_vendedores_activo=True
+    )
+    escenario.acceso_pagos.devuelve = AccesoPagos(
+        permitido=False, suscripcion_activa=False, tiene_creditos=False
+    )
+
+    await eventos.on_mensaje_entrante(TENANT, CLIENTE, MENSAJE)
+
+    assert escenario.notificar.veces == 1

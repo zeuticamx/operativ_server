@@ -17,6 +17,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends
 
+from services.acceso_pagos import acceso_pagos
 from services.asignacion import asignar_vendedor_automatico
 from deps import llamada_interna
 from services.notificaciones import notificar_vendedor_nuevo_lead
@@ -58,13 +59,22 @@ async def on_mensaje_entrante(
 
     Nunca se reasigna un lead que ya tiene dueño: un cliente que vuelve a
     escribir sigue siendo del mismo vendedor.
+
+    `agente_ia_activo` no es solo el flag guardado en tenant_servicios: se
+    apaga igual si al tenant se le venció la suscripción y ya no le quedan
+    créditos (ver services/acceso_pagos.py). n8n no sabe nada de pagos —
+    todo lo que tiene para decidir si llama al nodo del agente es este
+    booleano, así que el bloqueo por falta de pago tiene que viajar disfrazado
+    de "agente apagado".
     """
     servicios = await get_tenant_servicios(tenant_id)
+    acceso = await acceso_pagos(tenant_id)
+    agente_ia_activo = servicios.agente_ia_activo and acceso.permitido
 
     if not servicios.gestion_vendedores_activo:
         return MensajeEntranteOut(
             gestion_vendedores_activo=False,
-            agente_ia_activo=servicios.agente_ia_activo,
+            agente_ia_activo=agente_ia_activo,
         )
 
     asignado_ahora = False
@@ -89,7 +99,12 @@ async def on_mensaje_entrante(
     # El aviso va FUERA de la transacción: es una llamada de red y no debe
     # tener abierta una transacción de Postgres mientras espera. Si falla, el
     # lead ya quedó asignado igual.
-    if asignado_ahora and vendedor_id is not None and not servicios.agente_ia_activo:
+    #
+    # `agente_ia_activo` (el efectivo, no el guardado): si el agente está
+    # bloqueado por falta de pago, nadie le va a contestar a este cliente, y
+    # el vendedor tiene que enterarse igual que si el agente estuviera
+    # apagado a propósito.
+    if asignado_ahora and vendedor_id is not None and not agente_ia_activo:
         try:
             await notificar_vendedor_nuevo_lead(
                 vendedor_id, user_id, mensaje, tenant_id=tenant_id
@@ -101,7 +116,7 @@ async def on_mensaje_entrante(
 
     return MensajeEntranteOut(
         gestion_vendedores_activo=True,
-        agente_ia_activo=servicios.agente_ia_activo,
+        agente_ia_activo=agente_ia_activo,
         pipeline_id=embudo.id,
         vendedor_id=vendedor_id,
         asignado_ahora=asignado_ahora,

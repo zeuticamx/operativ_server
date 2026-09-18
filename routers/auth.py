@@ -448,4 +448,5 @@ async def yo(usuario: UsuarioActual = Depends(usuario_actual)):
         role=usuario.role,
         tenant_id=usuario.tenant_id,
         nombre_negocio=nombre_negocio,
+        es_gerencia_plataforma=usuario.es_gerencia_plataforma,
     )
