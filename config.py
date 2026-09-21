@@ -38,6 +38,22 @@ class Settings:
     META_API_VERSION: str = os.getenv("META_API_VERSION", "v26.0")
     META_REDIRECT_URI: str = os.getenv("META_REDIRECT_URI", "")
 
+    # ---- WhatsApp (envío de mensajes, ver services/whatsapp.py) ----
+    # Proveedor activo detrás de ProveedorWhatsApp. Hoy "kontesta", mientras
+    # la app de Meta no tiene Acceso Avanzado aprobado en App Review; el día
+    # que se apruebe, pasar esto a "meta" no debería tocar ningún router.
+    WHATSAPP_PROVIDER: str = os.getenv("WHATSAPP_PROVIDER", "kontesta")
+
+    # ---- Kontesta ----
+    KONTESTA_API_KEY: str = os.getenv("KONTESTA_API_KEY", "")
+    KONTESTA_API_BASE_URL: str = os.getenv(
+        "KONTESTA_API_BASE_URL", "https://api.kontesta.app/v1"
+    ).rstrip("/")
+    # Secreto para validar la firma HMAC de los webhooks entrantes
+    # (X-Kontesta-Signature). Vacío = verificar_webhook() rechaza todo.
+    # Mismo criterio de fallar cerrado que MERCADOPAGO_WEBHOOK_SECRET.
+    KONTESTA_WEBHOOK_SECRET: str = os.getenv("KONTESTA_WEBHOOK_SECRET", "")
+
     # ---- Google (cuenta de servicio compartida, para Sheets/Docs) ----
     GOOGLE_SERVICE_ACCOUNT_JSON: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
@@ -128,6 +144,11 @@ class Settings:
         """Sin access token no se puede crear una preferencia ni consultar un pago."""
         return bool(self.MERCADOPAGO_ACCESS_TOKEN)
 
+    @property
+    def kontesta_configurado(self) -> bool:
+        """Sin API key no se puede autenticar ninguna llamada a Kontesta."""
+        return bool(self.KONTESTA_API_KEY)
+
     def validate(self) -> None:
         """Falla temprano si falta algo crítico, en vez de a media petición."""
         faltantes = []
@@ -176,6 +197,21 @@ class Settings:
                 "pagos pero /api/pagos/webhook los va a rechazar, así que "
                 "ningún cobro se acreditará."
             )
+
+        # Igual criterio: un despliegue puede no mandar WhatsApp todavía.
+        # Pero si WHATSAPP_PROVIDER=kontesta y falta la API key, todo envío
+        # va a fallar en el primer request y conviene verlo al arrancar.
+        if self.WHATSAPP_PROVIDER == "kontesta" and not self.kontesta_configurado:
+            logging.getLogger("operativai.config").warning(
+                "KONTESTA_API_KEY sin configurar: los envíos de WhatsApp vía "
+                "Kontesta van a fallar."
+            )
+            if not self.KONTESTA_WEBHOOK_SECRET:
+                logging.getLogger("operativai.config").warning(
+                    "KONTESTA_WEBHOOK_SECRET sin configurar: "
+                    "verificar_webhook() va a rechazar todos los webhooks "
+                    "entrantes de Kontesta."
+                )
 
 
 @lru_cache
