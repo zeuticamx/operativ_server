@@ -23,8 +23,10 @@ from routers import (
     clientes,
     conversaciones,
     eventos,
+    gerencia,
     herramientas,
     pagos,
+    pagos_stripe,
     pipeline_config,
     reportes,
     tareas,
@@ -76,9 +78,13 @@ app.include_router(vendedores.router_clientes, prefix="/api")
 app.include_router(pipeline_config.router, prefix="/api")
 app.include_router(alertas.router, prefix="/api")
 
-# Cobros (Mercado Pago). El webhook queda en /api/pagos/webhook y es el
-# único endpoint del módulo sin JWT: se autentica por la firma HMAC.
+# Cobros. La pasarela activa la decide PAYMENT_PROVIDER: hoy Stripe, con
+# Mercado Pago inhabilitado pero sin borrar. Cada una tiene su webhook, y
+# son los únicos endpoints del módulo sin JWT: se autentican por firma HMAC.
+#   Stripe       -> /api/pagos/stripe/webhook
+#   Mercado Pago -> /api/pagos/webhook  (503 mientras no sea el proveedor)
 app.include_router(pagos.router, prefix="/api")
+app.include_router(pagos_stripe.router, prefix="/api")
 
 # CRM de campo: cartera, visitas con geocerca, seguimientos y reportes.
 # Convive con el embudo de chat de arriba; comparten la tabla vendedores.
@@ -86,6 +92,10 @@ app.include_router(clientes.router, prefix="/api")
 app.include_router(visitas.router, prefix="/api")
 app.include_router(tareas.router, prefix="/api")
 app.include_router(reportes.router, prefix="/api")
+
+# Panel de plataforma: nivel gerencia (tabla gerencia_users), no el rol
+# owner de un tenant. Ve todos los negocios, así que no filtra por tenant.
+app.include_router(gerencia.router, prefix="/api")
 
 # Lo llama n8n con X-Internal-Token, no el frontend.
 app.include_router(eventos.router, prefix="/api")

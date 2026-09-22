@@ -1,14 +1,14 @@
 """
 Job de background: pausa las suscripciones que vencieron sin renovarse.
 
-Hoy no hay cobro recurrente automático (el checkout es por preferencia
-suelta, no por preapproval de Mercado Pago): "renovar" es que el dueño
+Hoy no hay cobro recurrente automático (el checkout de Stripe es en modo
+`payment`, un cargo único, no una Subscription): "renovar" es que el dueño
 vuelva a pagar desde /suscripcion. Este job no cobra nada ni reintenta un
 cargo — solo refleja en `estado` lo que ya es cierto (que pasó la fecha de
 renovación y nadie pagó de nuevo), para que services/acceso_pagos.py tenga
 de dónde leer sin tener que recalcular la fecha en cada request.
 
-Cuando el dueño sí vuelve a pagar, _procesar_pago_aprobado (routers/pagos.py)
+Cuando el dueño sí vuelve a pagar, procesar_pago_aprobado (services/pagos.py)
 hace el UPSERT que deja `estado = 'activa'` de nuevo — este job y ese código
 nunca escriben al mismo tiempo la misma fila en direcciones opuestas: uno
 pausa por vencimiento, el otro reactiva por pago aprobado.

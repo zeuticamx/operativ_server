@@ -1,14 +1,20 @@
 """
-Tests de cobros con Mercado Pago.
+Tests de cobros: la parte compartida + el camino de Mercado Pago.
 
 Se concentran en las dos cosas que, si fallan, cuestan dinero de verdad:
 
   1. la validación de la firma del webhook (sin ella, cualquiera se regala
      créditos mandando un POST)
-  2. la idempotencia al acreditar (Mercado Pago manda el mismo aviso varias
+  2. la idempotencia al acreditar (toda pasarela manda el mismo aviso varias
      veces y el saldo no puede sumarse dos veces)
 
-La API de Mercado Pago no se llama nunca: lo que se prueba es nuestro lado.
+La entrega de lo comprado (activar el plan, acreditar créditos) vive en
+services/pagos.py y no depende del proveedor: se prueba una sola vez acá y
+vale igual para Stripe. Lo específico de Stripe está en test_pagos_stripe.py.
+
+Mercado Pago está inhabilitado por PAYMENT_PROVIDER, así que los tests de
+su camino lo vuelven a encender con monkeypatch. La API de Mercado Pago no
+se llama nunca: lo que se prueba es nuestro lado.
 """
 
 import hashlib
@@ -23,6 +29,7 @@ from pydantic import ValidationError
 from config import settings
 from routers import pagos
 from schemas import CrearPagoIn
+from services.pagos import acreditar_creditos, activar_suscripcion, cotizar
 from session import execute, fetch_one, fetch_value
 
 SECRETO = "secreto-de-prueba"
@@ -36,7 +43,13 @@ def firmar(data_id: str, request_id: str, ts: str = "1700000000") -> str:
 
 
 @pytest.fixture
-def con_secreto(monkeypatch):
+def proveedor_mp(monkeypatch):
+    """Vuelve a encender Mercado Pago, que en la config real está apagado."""
+    monkeypatch.setattr(settings, "PAYMENT_PROVIDER", "mercadopago")
+
+
+@pytest.fixture
+def con_secreto(monkeypatch, proveedor_mp):
     monkeypatch.setattr(settings, "MERCADOPAGO_WEBHOOK_SECRET", SECRETO)
     return SECRETO
 
@@ -164,7 +177,7 @@ def test_con_https_en_base_url_frontend_si_manda_auto_return(monkeypatch):
 @pytest.mark.asyncio
 async def test_cotizar_plan_devuelve_el_precio_de_la_tabla(db):
     esperado = await fetch_value("SELECT precio_monthly FROM planes WHERE nombre = 'pro'")
-    monto, concepto = await pagos._cotizar(CrearPagoIn(tipo="subscription", plan="pro"))
+    monto, concepto = await cotizar(CrearPagoIn(tipo="subscription", plan="pro"))
 
     assert monto == esperado
     assert "pro" in concepto
@@ -173,7 +186,7 @@ async def test_cotizar_plan_devuelve_el_precio_de_la_tabla(db):
 @pytest.mark.asyncio
 async def test_cotizar_paquete_devuelve_el_precio_de_la_tabla(db):
     esperado = await fetch_value("SELECT precio FROM paquetes_creditos WHERE creditos = 500")
-    monto, _ = await pagos._cotizar(
+    monto, _ = await cotizar(
         CrearPagoIn(tipo="credit_purchase", creditos=Decimal(500))
     )
     assert monto == esperado
@@ -183,7 +196,7 @@ async def test_cotizar_paquete_devuelve_el_precio_de_la_tabla(db):
 async def test_un_paquete_inventado_da_404(db):
     """Pedir 7 créditos (que no es un paquete) no genera un cobro raro."""
     with pytest.raises(HTTPException) as exc:
-        await pagos._cotizar(CrearPagoIn(tipo="credit_purchase", creditos=Decimal(7)))
+        await cotizar(CrearPagoIn(tipo="credit_purchase", creditos=Decimal(7)))
     assert exc.value.status_code == 404
 
 
@@ -209,7 +222,7 @@ async def test_acreditar_suma_al_saldo_y_deja_rastro(db, tenant_y_usuario):
     tenant_id = tenant_y_usuario["tenant_id"]
     tx_id = await _transaccion_de_creditos(tenant_id, Decimal(500))
 
-    await pagos._acreditar_creditos(tenant_id, tx_id, Decimal(500), "500 créditos")
+    await acreditar_creditos(tenant_id, tx_id, Decimal(500), "500 créditos")
 
     saldo = await fetch_value(
         "SELECT creditos_disponibles FROM tenant_credits WHERE tenant_id = $1", tenant_id
@@ -235,9 +248,9 @@ async def test_el_mismo_pago_no_se_acredita_dos_veces(db, tenant_y_usuario):
     tenant_id = tenant_y_usuario["tenant_id"]
     tx_id = await _transaccion_de_creditos(tenant_id, Decimal(1000))
 
-    await pagos._acreditar_creditos(tenant_id, tx_id, Decimal(1000), "1000 créditos")
-    await pagos._acreditar_creditos(tenant_id, tx_id, Decimal(1000), "1000 créditos")
-    await pagos._acreditar_creditos(tenant_id, tx_id, Decimal(1000), "1000 créditos")
+    await acreditar_creditos(tenant_id, tx_id, Decimal(1000), "1000 créditos")
+    await acreditar_creditos(tenant_id, tx_id, Decimal(1000), "1000 créditos")
+    await acreditar_creditos(tenant_id, tx_id, Decimal(1000), "1000 créditos")
 
     saldo = await fetch_value(
         "SELECT creditos_disponibles FROM tenant_credits WHERE tenant_id = $1", tenant_id
@@ -257,8 +270,8 @@ async def test_dos_compras_distintas_si_se_suman(db, tenant_y_usuario):
     tx1 = await _transaccion_de_creditos(tenant_id, Decimal(100))
     tx2 = await _transaccion_de_creditos(tenant_id, Decimal(500))
 
-    await pagos._acreditar_creditos(tenant_id, tx1, Decimal(100), "100 créditos")
-    await pagos._acreditar_creditos(tenant_id, tx2, Decimal(500), "500 créditos")
+    await acreditar_creditos(tenant_id, tx1, Decimal(100), "100 créditos")
+    await acreditar_creditos(tenant_id, tx2, Decimal(500), "500 créditos")
 
     saldo = await fetch_value(
         "SELECT creditos_disponibles FROM tenant_credits WHERE tenant_id = $1", tenant_id
@@ -273,7 +286,7 @@ async def test_dos_compras_distintas_si_se_suman(db, tenant_y_usuario):
 async def test_activar_suscripcion_deja_el_plan_y_prende_los_servicios(db, tenant_y_usuario):
     tenant_id = tenant_y_usuario["tenant_id"]
 
-    await pagos._activar_suscripcion(tenant_id, "pro")
+    await activar_suscripcion(tenant_id, "pro")
 
     sub = await fetch_one(
         "SELECT plan, estado, precio_monthly, fecha_renovacion FROM tenant_subscriptions WHERE tenant_id = $1",
@@ -296,8 +309,8 @@ async def test_cambiar_de_plan_pisa_la_suscripcion_en_vez_de_duplicarla(db, tena
     """UNIQUE(tenant_id): un tenant tiene una sola suscripción."""
     tenant_id = tenant_y_usuario["tenant_id"]
 
-    await pagos._activar_suscripcion(tenant_id, "starter")
-    await pagos._activar_suscripcion(tenant_id, "enterprise")
+    await activar_suscripcion(tenant_id, "starter")
+    await activar_suscripcion(tenant_id, "enterprise")
 
     filas = await fetch_value(
         "SELECT COUNT(*) FROM tenant_subscriptions WHERE tenant_id = $1", tenant_id
@@ -314,7 +327,7 @@ async def test_cambiar_de_plan_pisa_la_suscripcion_en_vez_de_duplicarla(db, tena
 async def test_un_plan_inexistente_no_activa_nada(db, tenant_y_usuario):
     tenant_id = tenant_y_usuario["tenant_id"]
 
-    await pagos._activar_suscripcion(tenant_id, "plan_que_no_existe")
+    await activar_suscripcion(tenant_id, "plan_que_no_existe")
 
     filas = await fetch_value(
         "SELECT COUNT(*) FROM tenant_subscriptions WHERE tenant_id = $1", tenant_id
@@ -384,7 +397,7 @@ async def test_no_se_puede_espiar_la_preferencia_de_otro_tenant(
     )
 
     respuesta = await http_client.get(
-        "/api/pagos/preferencia/pref-ajena",
+        "/api/pagos/checkout/pref-ajena",
         headers={"Authorization": f"Bearer {tenant_y_usuario['token']}"},
     )
     assert respuesta.status_code == 404
@@ -417,11 +430,33 @@ async def test_el_webhook_ignora_los_avisos_que_no_son_de_pago(http_client, con_
 
 
 @pytest.mark.asyncio
-async def test_sin_secreto_configurado_el_webhook_no_atiende(http_client, monkeypatch):
+async def test_sin_secreto_configurado_el_webhook_no_atiende(
+    http_client, monkeypatch, proveedor_mp
+):
     """Fallar cerrado: sin secreto no hay forma de distinguir un aviso real."""
     monkeypatch.setattr(settings, "MERCADOPAGO_WEBHOOK_SECRET", "")
     respuesta = await http_client.post(
         "/api/pagos/webhook", json={"type": "payment", "data": {"id": "1"}}
+    )
+    assert respuesta.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_con_stripe_activo_el_webhook_de_mercado_pago_no_atiende(
+    http_client, monkeypatch
+):
+    """
+    El caso de la migración: MP puede seguir teniendo la URL configurada en
+    su panel y mandando avisos. Mientras Stripe sea la pasarela activa, no
+    se acredita nada por ese canal aunque el secreto siga puesto.
+    """
+    monkeypatch.setattr(settings, "PAYMENT_PROVIDER", "stripe")
+    monkeypatch.setattr(settings, "MERCADOPAGO_WEBHOOK_SECRET", SECRETO)
+
+    respuesta = await http_client.post(
+        "/api/pagos/webhook",
+        json={"type": "payment", "data": {"id": "123456"}},
+        headers={"x-signature": firmar("123456", "req-1"), "x-request-id": "req-1"},
     )
     assert respuesta.status_code == 503
 
@@ -462,7 +497,7 @@ class _ClienteFalso:
 
 
 @pytest.fixture
-def mp_simulado(monkeypatch):
+def mp_simulado(monkeypatch, proveedor_mp):
     """Deja crear-pago operativo sin llamar a Mercado Pago de verdad."""
     monkeypatch.setattr(settings, "MERCADOPAGO_ACCESS_TOKEN", "token-de-prueba")
     _ClienteFalso.ultimo_payload = None
@@ -491,8 +526,9 @@ async def test_crear_pago_guarda_la_transaccion_con_el_precio_de_la_base(
 
     assert respuesta.status_code == 201
     datos = respuesta.json()
-    assert datos["mp_preference_id"] == "pref-123"
-    assert datos["init_point"] == "https://mp.test/checkout"
+    assert datos["proveedor"] == "mercadopago"
+    assert datos["referencia"] == "pref-123"
+    assert datos["checkout_url"] == "https://mp.test/checkout"
 
     precio_real = await fetch_value("SELECT precio_monthly FROM planes WHERE nombre = 'pro'")
     fila = await fetch_one(
@@ -577,7 +613,7 @@ async def test_un_member_no_puede_contratar(http_client, tenant_y_usuario, mp_si
 
 @pytest.mark.asyncio
 async def test_sin_access_token_configurado_crear_pago_no_atiende(
-    http_client, tenant_y_usuario, monkeypatch
+    http_client, tenant_y_usuario, monkeypatch, proveedor_mp
 ):
     monkeypatch.setattr(settings, "MERCADOPAGO_ACCESS_TOKEN", "")
     respuesta = await http_client.post(

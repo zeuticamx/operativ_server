@@ -44,6 +44,10 @@ TABLAS = [
     ("clientes", "portal"),
     ("visitas", "portal"),
     ("tareas_seguimiento", "portal"),
+    ("gerencia_users", "portal"),
+    ("tenant_estado_plataforma", "portal"),
+    ("tenant_token_usage", "portal"),
+    ("gerencia_auditoria", "portal"),
 ]
 
 FUNCIONES = [

@@ -1,6 +1,6 @@
 """Schemas de entrada y salida de la API."""
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 from uuid import UUID
@@ -42,6 +42,11 @@ class ReenviarCodigoIn(BaseModel):
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
+
+
+class GoogleLoginIn(BaseModel):
+    """ID token (JWT) que entrega el botón "Sign in with Google" del portal."""
+    credential: str
 
 
 class TokenOut(BaseModel):
@@ -771,7 +776,7 @@ class AlertaOut(BaseModel):
         from_attributes = True
 
 # ============================================================
-# PAGOS (Mercado Pago)
+# PAGOS (Stripe; Mercado Pago inhabilitado, ver PAYMENT_PROVIDER)
 # ============================================================
 # `monto`, `precio` y `creditos` viajan como Decimal: FastAPI los serializa
 # a string en el JSON, igual que monto_ganado del embudo. El front los
@@ -781,6 +786,7 @@ TipoPago = Literal["subscription", "credit_purchase"]
 EstadoPago = Literal["pendiente", "aprobado", "rechazado", "cancelado", "reembolsado"]
 EstadoSuscripcion = Literal["activa", "pausada", "cancelada"]
 NombrePlan = Literal["starter", "pro", "enterprise"]
+ProveedorPago = Literal["stripe", "mercadopago"]
 
 
 class CrearPagoIn(BaseModel):
@@ -808,11 +814,19 @@ class CrearPagoIn(BaseModel):
 
 
 class CrearPagoOut(BaseModel):
+    """
+    Lo que necesita el portal para mandar al comprador a pagar.
+
+    Los campos son neutros a propósito: con Stripe `referencia` es la
+    Checkout Session (cs_...) y con Mercado Pago la preferencia. El front
+    no tiene por qué saber cuál de las dos pasarelas está activa — solo
+    redirige a `checkout_url`.
+    """
+
     transaccion_id: UUID
-    mp_preference_id: str
-    # A dónde mandar al comprador. `sandbox_init_point` es el de pruebas:
-    # viene poblado solo con credenciales de test.
-    init_point: str
+    proveedor: ProveedorPago
+    referencia: str
+    checkout_url: str
     monto: Decimal
     concepto: str
 
@@ -853,7 +867,9 @@ class TransaccionOut(BaseModel):
     creado_en: datetime
 
 
-class PreferenciaEstadoOut(BaseModel):
+class CheckoutEstadoOut(BaseModel):
+    """Cómo quedó un checkout concreto; lo consulta la pantalla de retorno."""
+
     id: UUID
     tipo: str
     monto: Decimal
@@ -874,3 +890,197 @@ class SuscripcionOut(BaseModel):
     precio_monthly: Decimal | None
     creditos_disponibles: Decimal
     creditos_gastados: Decimal
+
+
+# ============================================================
+# GERENCIA DE PLATAFORMA
+# ============================================================
+# Todo lo de acá es del nivel gerencia (tabla gerencia_users), no del rol
+# owner/superadmin de un tenant: son dos cosas distintas, ver deps.py.
+# Nada de esta sección se filtra por tenant — el punto es ver todos.
+
+EstadoTenantPlataforma = Literal["activo", "prueba", "suspendido", "baja"]
+OrigenTokens = Literal["agente", "herramienta", "resumen", "otro"]
+
+
+class UsoTokensIn(BaseModel):
+    """
+    Lo que reporta n8n después de cada llamada al modelo.
+
+    `idempotency_key` es opcional pero muy recomendable: con ella, un nodo
+    de n8n que se reintenta no cuenta el consumo dos veces. Lo natural es
+    mandar el id de la ejecución más el del nodo.
+    """
+
+    tenant_id: UUID
+    conversation_id: UUID | None = None
+    origen: OrigenTokens = "agente"
+    modelo: str | None = Field(default=None, max_length=100)
+    tokens_entrada: int = Field(default=0, ge=0)
+    tokens_salida: int = Field(default=0, ge=0)
+    costo_usd: Decimal | None = Field(default=None, ge=0, max_digits=12, decimal_places=6)
+    idempotency_key: str | None = Field(default=None, max_length=120)
+
+
+class UsoTokensOut(BaseModel):
+    registrado: bool
+    # False cuando la idempotency_key ya estaba: no es un error, es el
+    # candado haciendo su trabajo. n8n no tiene que reintentar.
+    duplicado: bool = False
+
+
+class ConsumoTenantOut(BaseModel):
+    """Consumo de un tenant dentro del rango consultado."""
+
+    tokens_entrada: int
+    tokens_salida: int
+    tokens_total: int
+    costo_usd: Decimal
+    llamadas: int
+
+
+class TenantGerenciaOut(BaseModel):
+    tenant_id: UUID
+    nombre: str
+    alta: datetime | None
+
+    estado: EstadoTenantPlataforma
+    estado_motivo: str | None
+    estado_actualizado_en: datetime | None
+    estado_actualizado_por: str | None
+
+    agente_ia_activo: bool
+    gestion_vendedores_activo: bool
+    # El efectivo, ya cruzado con pagos y suspensión: es lo que de verdad
+    # responde n8n. Puede diferir de `agente_ia_activo`, y esa diferencia es
+    # justo lo que gerencia necesita ver.
+    agente_operando: bool
+
+    plan: NombrePlan | None
+    estado_suscripcion: EstadoSuscripcion | None
+    fecha_renovacion: datetime | None
+    precio_monthly: Decimal | None
+    creditos_disponibles: Decimal
+    creditos_gastados: Decimal
+
+    usuarios_portal: int
+    vendedores_activos: int
+    canales_activos: int
+    ultimo_mensaje: datetime | None
+
+    consumo: ConsumoTenantOut
+
+
+class TenantsGerenciaOut(BaseModel):
+    total: int
+    dias: int
+    items: list[TenantGerenciaOut]
+
+
+class PuntoConsumoOut(BaseModel):
+    """Un día de la serie. `dia` en ISO (YYYY-MM-DD), en UTC."""
+
+    dia: date
+    tokens_total: int
+    costo_usd: Decimal
+    llamadas: int
+
+
+class ConsumoModeloOut(BaseModel):
+    modelo: str
+    tokens_total: int
+    costo_usd: Decimal
+    llamadas: int
+
+
+class ConsumoOut(BaseModel):
+    desde: datetime
+    hasta: datetime
+    total: ConsumoTenantOut
+    por_dia: list[PuntoConsumoOut]
+    por_modelo: list[ConsumoModeloOut]
+
+
+class ResumenGerenciaOut(BaseModel):
+    """Los números de la portada del panel de plataforma."""
+
+    dias: int
+
+    tenants_total: int
+    tenants_activos: int
+    tenants_prueba: int
+    tenants_suspendidos: int
+    tenants_baja: int
+    # Alta dentro de la ventana consultada.
+    tenants_nuevos: int
+    # Con al menos un mensaje en la ventana. "Activos" comercialmente no es
+    # lo mismo que activos de verdad, y la brecha entre los dos números es
+    # el dato que importa.
+    tenants_con_actividad: int
+    # Suscripción activa pero cero mensajes en la ventana: pagan y no usan.
+    tenants_en_riesgo: int
+
+    suscripciones_activas: int
+    mrr: Decimal
+
+    mensajes: int
+    consumo: ConsumoTenantOut
+    # Ingreso cobrado (transacciones aprobadas) dentro de la ventana.
+    ingresos_periodo: Decimal
+
+
+class CambiarEstadoTenantIn(BaseModel):
+    estado: EstadoTenantPlataforma
+    # Obligatorio si el estado no es 'activo': lo valida el router, que es
+    # quien puede devolver un 400 con un mensaje decente.
+    motivo: str | None = Field(default=None, max_length=1000)
+    notas: str | None = Field(default=None, max_length=2000)
+
+
+class CambiarServiciosTenantIn(BaseModel):
+    """
+    Los dos interruptores de tenant_servicios. None = no tocar, para poder
+    apagar uno sin tener que mandar el estado del otro.
+    """
+
+    agente_ia_activo: bool | None = None
+    gestion_vendedores_activo: bool | None = None
+    motivo: str | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def al_menos_uno(self):
+        if self.agente_ia_activo is None and self.gestion_vendedores_activo is None:
+            raise ValueError("Hay que indicar al menos un servicio para cambiar")
+        return self
+
+
+class AjusteCreditosIn(BaseModel):
+    """
+    Regalo o descuento manual de créditos. Positivo suma, negativo resta —
+    mismo criterio de signo que credit_transactions.cantidad.
+    """
+
+    cantidad: Decimal = Field(max_digits=12, decimal_places=2)
+    motivo: str = Field(min_length=3, max_length=500)
+
+    @model_validator(mode="after")
+    def no_cero(self):
+        if self.cantidad == 0:
+            raise ValueError("Un ajuste de cero créditos no hace nada")
+        return self
+
+
+class AjusteCreditosOut(BaseModel):
+    creditos_disponibles: Decimal
+
+
+class EntradaAuditoriaOut(BaseModel):
+    id: UUID
+    actor_email: str
+    accion: str
+    tenant_id: UUID | None
+    # Se resuelve al vuelo contra tenants: la bitácora guarda solo el UUID
+    # para que el registro sobreviva al borrado del negocio.
+    tenant_nombre: str | None
+    detalle: dict
+    creado_en: datetime

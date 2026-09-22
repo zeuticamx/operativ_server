@@ -391,6 +391,97 @@ un solo check-in malo. Y cada elemento va en su propia transacción: un
 cliente borrado mientras el teléfono estaba sin señal no puede costar el
 resto de la cola.
 
+### Panel de plataforma (nivel gerencia)
+
+`/api/gerencia/*` — todo el router exige **nivel gerencia**, que no es el
+rol `owner`/`superadmin` de un tenant. Son dos cosas distintas y conviene
+no mezclarlas:
+
+| | `gerencia_actual` (deps.py) | `gerencia_plataforma_actual` (deps.py) |
+|---|---|---|
+| De dónde sale | `portal_users.role` ∈ {owner, superadmin} | el correo está en `gerencia_users` |
+| Alcance | **su** tenant | todos los tenants |
+| Para qué | configurar su negocio | administrar el servicio |
+
+El alta sigue siendo manual por SQL (no hay endpoint todavía):
+
+```sql
+INSERT INTO gerencia_users (email, full_name, cargo)
+VALUES ('alguien@operativai.com.mx', 'Nombre Apellido', 'Operaciones');
+```
+
+Se resuelve por `LOWER(email)` contra el `portal_users` de la sesión, así
+que quien entra sigue autenticándose con su cuenta de siempre (o con
+Google). Sacar a alguien de la tabla le quita el nivel en la **siguiente
+petición**, no cuando expire su token: `deps.usuario_actual` relee el LEFT
+JOIN en cada request.
+
+| Método | Ruta | Qué hace |
+|---|---|---|
+| GET | `/gerencia/resumen?dias=` | KPIs: negocios por estado, MRR, cobrado, consumo, "pagan y no usan" |
+| GET | `/gerencia/tenants?dias=&q=&estado=&orden=&limite=&offset=` | Listado con estado, plan y consumo agregado |
+| GET | `/gerencia/tenants/{id}` | Ficha de un negocio |
+| GET | `/gerencia/tenants/{id}/transacciones` | Sus cobros (existe aparte de `/api/pagos` porque aquel sale del tenant del JWT) |
+| PATCH | `/gerencia/tenants/{id}/estado` | activo / prueba / suspendido / baja |
+| PATCH | `/gerencia/tenants/{id}/servicios` | Enciende o apaga agente y módulo de vendedores |
+| POST | `/gerencia/tenants/{id}/creditos` | Ajuste manual de saldo (positivo suma, negativo resta) |
+| GET | `/gerencia/consumo?dias=&tenant_id=` | Serie diaria de tokens y desglose por modelo |
+| GET | `/gerencia/auditoria?tenant_id=&accion=&limite=` | Bitácora, solo lectura |
+
+Las tres acciones que cambian algo escriben en `gerencia_auditoria` **dentro
+de la misma transacción** que el cambio.
+
+**La suspensión tiene dientes.** `tenant_estado_plataforma.estado` en
+`suspendido` o `baja` hace que `services/acceso_pagos.py` devuelva
+`permitido=False`, y de ahí sale el `agente_ia_activo=false` que recibe n8n
+en `/api/eventos/mensaje-entrante`. No es una etiqueta: el agente deja de
+contestar aunque el negocio tenga plan vigente y créditos. `prueba` no
+bloquea nada.
+
+`tenants` es de n8n, así que el estado vive en su propia tabla del portal
+(`tenant_estado_plataforma`) en vez de como columna — mismo criterio que
+`tenant_servicios`.
+
+**Ojo con `SQL_AGENTE_OPERANDO`** (routers/gerencia.py): es el gate de
+pagos escrito en SQL para resolver la página entera de una vez en lugar de
+una consulta por fila. Duplica la regla de `services/acceso_pagos.py`, que
+sigue siendo la fuente de verdad. `tests/test_gerencia.py` compara las dos
+implementaciones sobre una matriz de casos justamente para que no se
+separen en silencio; si cambias una, cambia la otra.
+
+### Consumo de tokens (lo escribe n8n)
+
+`POST /api/eventos/uso-tokens` — con `X-Internal-Token`, igual que
+`/mensaje-entrante`. Se llama **después** de que el modelo respondió: lo que
+se mide es el consumo real, no el estimado.
+
+```json
+{
+  "tenant_id": "…", "conversation_id": "…",
+  "origen": "agente",            // agente | herramienta | resumen | otro
+  "modelo": "gpt-4o-mini",
+  "tokens_entrada": 1200, "tokens_salida": 340,
+  "costo_usd": "0.012000",
+  "idempotency_key": "{{$execution.id}}:agente"
+}
+```
+
+Va suelto y no colgado de `/mensaje-entrante` porque una sola respuesta
+puede ser varias llamadas al modelo (el agente más cada herramienta), y
+cada una tiene su propio consumo.
+
+`idempotency_key` es opcional pero muy recomendable: hay un índice único
+parcial sobre esa columna, así que un nodo reintentado no cuenta dos veces
+— la respuesta trae `duplicado: true` y n8n puede seguir. Sin la llave no
+hay candado, que es lo correcto: dos llamadas iguales al modelo son dos
+consumos reales.
+
+`tenant_token_usage` es el libro mayor crudo del costo del proveedor. **No
+reemplaza a `tenant_credits`**, que es la unidad que se le cobra al cliente
+y tiene su propio libro (`credit_transactions`). Están separados a propósito:
+el día que cambie la equivalencia token→crédito, el histórico de consumo no
+se toca.
+
 ## Flujo de conexión con Meta
 
 ```

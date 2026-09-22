@@ -57,6 +57,18 @@ class Settings:
     # ---- Google (cuenta de servicio compartida, para Sheets/Docs) ----
     GOOGLE_SERVICE_ACCOUNT_JSON: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
+    # ---- Login con Google (OAuth de portal_users, opcional) ----
+    # Client ID/secret del proyecto de Google Cloud para "Sign in with
+    # Google". El frontend usa el client_id para el botón de Google
+    # Identity Services; el backend valida el ID token resultante contra
+    # el mismo client_id como audiencia (ver services/google_login.py).
+    # GOOGLE_CLIENT_SECRET no hace falta para ese flujo (no es un
+    # Authorization Code exchange), se deja cargado por si hiciera falta
+    # más adelante. .strip() porque el .env trae un espacio colgando al
+    # final del client_id.
+    GOOGLE_CLIENT_ID: str = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+    GOOGLE_CLIENT_SECRET: str = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+
     # ---- SMTP (código de verificación del alta) ----
     SMTP_HOST: str = os.getenv("SMTP_HOST", "")
     # 587 = STARTTLS (lo normal). 465 = TLS directo, se detecta por el número.
@@ -100,7 +112,35 @@ class Settings:
         os.getenv("SUSCRIPCION_REVISION_INTERVALO_HORAS", "1")
     )
 
-    # ---- Mercado Pago ----
+    # ---- Pasarela de cobro activa ----
+    # "stripe" | "mercadopago". Mismo patrón que WHATSAPP_PROVIDER: el
+    # módulo de Mercado Pago sigue entero en el código, pero mientras esto
+    # diga "stripe" sus endpoints responden 503 y el portal cobra por
+    # Stripe. Volver a MP es cambiar esta variable, sin tocar código.
+    #
+    # El historial de cobros NO depende de esto: las transacciones viejas
+    # de Mercado Pago se siguen leyendo igual.
+    PAYMENT_PROVIDER: str = os.getenv("PAYMENT_PROVIDER", "stripe").strip().lower()
+
+    # ---- Stripe ----
+    # sk_test_... en pruebas, sk_live_... en producción. Sin esto,
+    # /api/pagos/crear-pago responde 503 en vez de un 500 al llamar a la API.
+    STRIPE_SECRET_KEY: str = os.getenv("STRIPE_SECRET_KEY", "")
+    # Pública a propósito: es la que usaría el navegador si algún día se
+    # monta Stripe Elements en vez de redirigir al Checkout hospedado.
+    STRIPE_PUBLIC_KEY: str = os.getenv("STRIPE_PUBLIC_KEY", "")
+    # Secreto de firma del webhook (whsec_...). Lo da el panel de Stripe al
+    # crear el endpoint, o `stripe listen` en local. No es la secret key:
+    # sirve solo para validar el HMAC de la cabecera Stripe-Signature.
+    #
+    # Vacío = /api/pagos/stripe/webhook responde 503 y no procesa nada.
+    # Mismo criterio de fallar cerrado que MERCADOPAGO_WEBHOOK_SECRET: un
+    # webhook de cobros sin validar es alguien regalándose créditos.
+    STRIPE_WEBHOOK_SECRET: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+    # Stripe espera el código de moneda en minúsculas (iso 4217).
+    STRIPE_CURRENCY: str = os.getenv("STRIPE_CURRENCY", "mxn").strip().lower()
+
+    # ---- Mercado Pago (deshabilitado; ver PAYMENT_PROVIDER) ----
     MERCADOPAGO_ACCESS_TOKEN: str = os.getenv("MERCADOPAGO_ACCESS_TOKEN", "")
     # Pública a propósito: es la que el navegador usa si algún día se monta
     # el Brick de checkout en vez de redirigir al init_point.
@@ -145,9 +185,27 @@ class Settings:
         return bool(self.MERCADOPAGO_ACCESS_TOKEN)
 
     @property
+    def stripe_activo(self) -> bool:
+        return self.PAYMENT_PROVIDER == "stripe"
+
+    @property
+    def mercadopago_activo(self) -> bool:
+        return self.PAYMENT_PROVIDER == "mercadopago"
+
+    @property
+    def stripe_configurado(self) -> bool:
+        """Sin secret key no se puede crear un Checkout ni consultar un pago."""
+        return bool(self.STRIPE_SECRET_KEY)
+
+    @property
     def kontesta_configurado(self) -> bool:
         """Sin API key no se puede autenticar ninguna llamada a Kontesta."""
         return bool(self.KONTESTA_API_KEY)
+
+    @property
+    def google_login_configurado(self) -> bool:
+        """Sin client_id no se puede validar la audiencia del ID token."""
+        return bool(self.GOOGLE_CLIENT_ID)
 
     def validate(self) -> None:
         """Falla temprano si falta algo crítico, en vez de a media petición."""
@@ -183,20 +241,41 @@ class Settings:
                 "entrantes al módulo de vendedores."
             )
 
-        # Tampoco se exige: un despliegue sin cobros arranca igual. Pero se
-        # avisa por separado, porque faltar el token y faltar el secreto del
-        # webhook rompen cosas distintas (crear el pago vs. acreditarlo).
-        if not self.mercadopago_configurado:
-            logging.getLogger("operativai.config").warning(
-                "MERCADOPAGO_ACCESS_TOKEN sin configurar: /api/pagos/crear-pago "
-                "va a responder 503."
+        # Los cobros no se exigen: un despliegue sin pasarela arranca igual.
+        # Pero se avisa por separado de la llave y del secreto del webhook,
+        # porque rompen cosas distintas (crear el pago vs. acreditarlo).
+        log_config = logging.getLogger("operativai.config")
+
+        if self.PAYMENT_PROVIDER not in ("stripe", "mercadopago"):
+            raise RuntimeError(
+                f"PAYMENT_PROVIDER inválido: {self.PAYMENT_PROVIDER!r}. "
+                "Usa 'stripe' o 'mercadopago'."
             )
-        elif not self.MERCADOPAGO_WEBHOOK_SECRET:
-            logging.getLogger("operativai.config").warning(
-                "MERCADOPAGO_WEBHOOK_SECRET sin configurar: se pueden crear "
-                "pagos pero /api/pagos/webhook los va a rechazar, así que "
-                "ningún cobro se acreditará."
-            )
+
+        if self.stripe_activo:
+            if not self.stripe_configurado:
+                log_config.warning(
+                    "STRIPE_SECRET_KEY sin configurar: /api/pagos/crear-pago "
+                    "va a responder 503."
+                )
+            elif not self.STRIPE_WEBHOOK_SECRET:
+                log_config.warning(
+                    "STRIPE_WEBHOOK_SECRET sin configurar: se pueden crear "
+                    "pagos pero /api/pagos/stripe/webhook los va a rechazar, "
+                    "así que ningún cobro se acreditará."
+                )
+        else:
+            if not self.mercadopago_configurado:
+                log_config.warning(
+                    "MERCADOPAGO_ACCESS_TOKEN sin configurar: "
+                    "/api/pagos/crear-pago va a responder 503."
+                )
+            elif not self.MERCADOPAGO_WEBHOOK_SECRET:
+                log_config.warning(
+                    "MERCADOPAGO_WEBHOOK_SECRET sin configurar: se pueden crear "
+                    "pagos pero /api/pagos/webhook los va a rechazar, así que "
+                    "ningún cobro se acreditará."
+                )
 
         # Igual criterio: un despliegue puede no mandar WhatsApp todavía.
         # Pero si WHATSAPP_PROVIDER=kontesta y falta la API key, todo envío
@@ -212,6 +291,15 @@ class Settings:
                     "verificar_webhook() va a rechazar todos los webhooks "
                     "entrantes de Kontesta."
                 )
+
+        # Tampoco se exige: el alta y el login con correo siguen funcionando
+        # sin esto. Pero si falta, POST /auth/google responde 503 y el botón
+        # de Google del portal no sirve para nada.
+        if not self.google_login_configurado:
+            logging.getLogger("operativai.config").warning(
+                "GOOGLE_CLIENT_ID sin configurar: POST /api/auth/google va a "
+                "responder 503 y el botón de Google no va a funcionar."
+            )
 
 
 @lru_cache

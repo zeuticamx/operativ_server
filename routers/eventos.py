@@ -20,9 +20,10 @@ from fastapi import APIRouter, Depends
 from services.acceso_pagos import acceso_pagos
 from services.asignacion import asignar_vendedor_automatico
 from deps import llamada_interna
+from services.gerencia import registrar_uso_tokens
 from services.notificaciones import notificar_vendedor_nuevo_lead
 from services.pipeline import asignar_vendedor, get_or_create_pipeline, get_tenant_servicios
-from schemas import MensajeEntranteIn, MensajeEntranteOut
+from schemas import MensajeEntranteIn, MensajeEntranteOut, UsoTokensIn, UsoTokensOut
 from session import transaccion
 
 log = logging.getLogger("operativai.eventos")
@@ -126,3 +127,34 @@ async def on_mensaje_entrante(
 @router.post("/mensaje-entrante", response_model=MensajeEntranteOut)
 async def mensaje_entrante(datos: MensajeEntranteIn):
     return await on_mensaje_entrante(datos.tenant_id, datos.user_id, datos.mensaje)
+
+
+@router.post("/uso-tokens", response_model=UsoTokensOut)
+async def uso_tokens(datos: UsoTokensIn):
+    """
+    n8n reporta lo que gastó una llamada al modelo.
+
+    Lo consume el panel de plataforma (/api/gerencia/consumo). Se llama
+    DESPUÉS de que el modelo respondió, no antes: lo que se mide es el
+    consumo real, no el estimado.
+
+    Va suelto y no colgado de /mensaje-entrante a propósito. Aquel se llama
+    una vez por mensaje entrante, antes de saber si el agente va a
+    contestar; una respuesta puede terminar siendo varias llamadas al
+    modelo (la del agente más las herramientas que use), y cada una tiene
+    su propio consumo.
+
+    Con `idempotency_key`, un nodo reintentado no cuenta dos veces: la
+    respuesta trae `duplicado=true` y n8n puede seguir tranquilo.
+    """
+    registrado = await registrar_uso_tokens(
+        datos.tenant_id,
+        conversation_id=datos.conversation_id,
+        origen=datos.origen,
+        modelo=datos.modelo,
+        tokens_entrada=datos.tokens_entrada,
+        tokens_salida=datos.tokens_salida,
+        costo_usd=datos.costo_usd,
+        idempotency_key=datos.idempotency_key,
+    )
+    return UsoTokensOut(registrado=registrado, duplicado=not registrado)

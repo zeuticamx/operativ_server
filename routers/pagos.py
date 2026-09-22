@@ -1,28 +1,30 @@
 """
-Cobros con Mercado Pago: suscripción por plan + compra de créditos.
+Cobros: suscripción por plan + compra de créditos.
 
-Dos reglas que valen para todo el módulo:
+La pasarela activa la decide `PAYMENT_PROVIDER` (config.py). Hoy es
+**Stripe**; Mercado Pago sigue entero en este archivo pero inhabilitado —
+no se borró nada, así que volver a MP es cambiar esa variable de entorno.
 
-1. El precio NUNCA llega del cliente. `crear-pago` recibe qué se quiere
-   comprar (un plan o un paquete de créditos) y el monto sale de las tablas
-   `planes` / `paquetes_creditos`. Si el monto viajara en el body, cualquiera
-   podría contratar enterprise por un peso.
+Qué vive dónde:
 
-2. Lo que da por bueno un pago es el webhook, no el regreso del navegador.
-   Las back_urls solo sirven para mostrarle algo al usuario; alguien puede
-   abrir /pagos/exito a mano. El estado real se escribe cuando Mercado Pago
-   avisa por /webhook y nosotros le repreguntamos por su propia API.
+    services/pagos.py        cotizar + entregar lo comprado (sin proveedor)
+    services/stripe_pagos.py llamadas a la API de Stripe + firma del webhook
+    este archivo             endpoints del portal, y el camino de Mercado
+                             Pago (crear preferencia + su webhook)
+    routers/pagos_stripe.py  el webhook de Stripe
+
+Las dos reglas del módulo (el precio sale de la base, y lo que da por bueno
+un pago es el webhook y no el regreso del navegador) están explicadas en el
+docstring de services/pagos.py.
 """
 
 import hashlib
 import hmac
 import logging
-from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-import asyncpg
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, status
 
@@ -30,15 +32,21 @@ from config import settings
 from deps import UsuarioActual, gerencia_actual, tenant_actual
 from schemas import (
     CatalogoPagosOut,
+    CheckoutEstadoOut,
     CrearPagoIn,
     CrearPagoOut,
     PaqueteCreditosOut,
     PlanOut,
-    PreferenciaEstadoOut,
     SuscripcionOut,
     TransaccionOut,
 )
-from session import execute, fetch_all, fetch_one, fetch_value, transaccion
+from services.pagos import (
+    cotizar,
+    marcar_cancelada,
+    procesar_pago_aprobado,
+)
+from services.stripe_pagos import crear_checkout_session
+from session import execute, fetch_all, fetch_one, fetch_value
 
 router = APIRouter(prefix="/pagos", tags=["pagos"])
 
@@ -46,11 +54,6 @@ log = logging.getLogger("operativai.pagos")
 
 MP_API = "https://api.mercadopago.com"
 TIMEOUT = httpx.Timeout(15.0)
-
-# Cuántos días dura un ciclo. 30 fijos y no "el mismo día del mes que
-# viene": sin dateutil, sumar un mes calendario a un 31 de enero es un caso
-# borde que no vale la pena resolver a mano hasta que el negocio lo pida.
-DIAS_CICLO = 30
 
 HISTORIAL_LIMITE = 50
 
@@ -71,8 +74,19 @@ ESTADOS_MP: dict[str, str] = {
 }
 
 
-def _exigir_mercadopago() -> None:
-    """503 si falta el access token, en vez de un 500 al llamar a la API."""
+def _exigir_pasarela() -> None:
+    """
+    503 si la pasarela activa no tiene credenciales, en vez de un 500 al
+    llamar a su API.
+    """
+    if settings.stripe_activo:
+        if not settings.stripe_configurado:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Los cobros no están configurados (falta STRIPE_SECRET_KEY)",
+            )
+        return
+
     if not settings.mercadopago_configurado:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -121,36 +135,99 @@ async def catalogo(_tenant_id: UUID = Depends(tenant_actual)) -> CatalogoPagosOu
 # ============================================================
 # CREAR PAGO
 # ============================================================
-async def _cotizar(datos: CrearPagoIn) -> tuple[Decimal, str]:
+@router.post("/crear-pago", response_model=CrearPagoOut, status_code=201)
+async def crear_pago(
+    datos: CrearPagoIn,
+    usuario: UsuarioActual = Depends(gerencia_actual),
+) -> CrearPagoOut:
     """
-    Traduce "qué quiere comprar" a (monto, concepto), leyendo el precio de
-    la base. Un plan o un paquete que no exista (o esté dado de baja) es un
-    404 y no un cobro por un monto inventado.
-    """
-    if datos.tipo == "subscription":
-        fila = await fetch_one(
-            "SELECT precio_monthly, descripcion FROM planes WHERE nombre = $1 AND activo",
-            datos.plan,
-        )
-        if fila is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Ese plan no existe o no está disponible",
-            )
-        return fila["precio_monthly"], f"Suscripción {datos.plan}"
+    Abre el checkout de la pasarela activa y deja la transacción en
+    'pendiente'.
 
-    fila = await fetch_one(
-        "SELECT precio FROM paquetes_creditos WHERE creditos = $1 AND activo",
+    Solo gerencia (owner/superadmin): contratar un plan cambia lo que paga
+    el negocio, no es una acción de 'member'.
+    """
+    _exigir_pasarela()
+
+    if usuario.tenant_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="El usuario no tiene un negocio asociado todavía",
+        )
+
+    monto, concepto = await cotizar(datos)
+
+    # La fila se crea antes de llamar a la pasarela porque su id es la
+    # referencia que le mandamos (client_reference_id en Stripe,
+    # external_reference en Mercado Pago). Queda 'pendiente' hasta que el
+    # webhook diga otra cosa.
+    transaccion_id: UUID = await fetch_value(
+        """
+        INSERT INTO tenant_transactions
+            (tenant_id, tipo, concepto, monto, estado_pago, plan_nombre, creditos_comprados)
+        VALUES ($1, $2, $3, $4, 'pendiente', $5, $6)
+        RETURNING id
+        """,
+        usuario.tenant_id,
+        datos.tipo,
+        concepto,
+        monto,
+        datos.plan,
         datos.creditos,
     )
-    if fila is None:
+
+    if settings.stripe_activo:
+        return await _crear_pago_stripe(transaccion_id, concepto, monto, usuario.email)
+    return await _crear_pago_mercadopago(transaccion_id, concepto, monto, usuario.email)
+
+
+async def _crear_pago_stripe(
+    transaccion_id: UUID, concepto: str, monto: Decimal, email: str
+) -> CrearPagoOut:
+    try:
+        sesion = await crear_checkout_session(transaccion_id, concepto, monto, email)
+    except HTTPException:
+        # Sin checkout no hay nada que cobrar: la fila pendiente se cierra
+        # para que no quede colgada en el historial del cliente para siempre.
+        await marcar_cancelada(transaccion_id)
+        raise
+
+    session_id = str(sesion.get("id", ""))
+    url = sesion.get("url")
+    if not session_id or not url:
+        await marcar_cancelada(transaccion_id)
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No hay un paquete de créditos de esa cantidad",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Stripe no devolvió un checkout válido",
         )
-    return fila["precio"], f"{int(datos.creditos)} créditos"
+
+    await execute(
+        """
+        UPDATE tenant_transactions
+           SET stripe_session_id = $2, updated_at = NOW()
+         WHERE id = $1
+        """,
+        transaccion_id,
+        session_id,
+    )
+
+    return CrearPagoOut(
+        transaccion_id=transaccion_id,
+        proveedor="stripe",
+        referencia=session_id,
+        checkout_url=url,
+        monto=monto,
+        concepto=concepto,
+    )
 
 
+# ============================================================
+# MERCADO PAGO (inhabilitado; ver PAYMENT_PROVIDER)
+# ============================================================
+# Nada de acá para abajo corre mientras PAYMENT_PROVIDER sea "stripe". Se
+# conserva completo y funcionando a propósito: es el camino de vuelta si
+# Stripe no sirve para algún mercado, y las transacciones viejas de MP
+# siguen en el historial.
 def _payload_preferencia(
     transaccion_id: UUID, concepto: str, monto: Decimal, email: str
 ) -> dict[str, Any]:
@@ -190,46 +267,10 @@ def _payload_preferencia(
     return payload
 
 
-@router.post("/crear-pago", response_model=CrearPagoOut, status_code=201)
-async def crear_pago(
-    datos: CrearPagoIn,
-    usuario: UsuarioActual = Depends(gerencia_actual),
+async def _crear_pago_mercadopago(
+    transaccion_id: UUID, concepto: str, monto: Decimal, email: str
 ) -> CrearPagoOut:
-    """
-    Crea la preferencia en Mercado Pago y deja la transacción en 'pendiente'.
-
-    Solo gerencia (owner/superadmin): contratar un plan cambia lo que paga
-    el negocio, no es una acción de 'member'.
-    """
-    _exigir_mercadopago()
-
-    if usuario.tenant_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="El usuario no tiene un negocio asociado todavía",
-        )
-
-    monto, concepto = await _cotizar(datos)
-
-    # La fila se crea antes de llamar a Mercado Pago porque su id es el
-    # external_reference que le mandamos. Queda 'pendiente' hasta que el
-    # webhook diga otra cosa.
-    transaccion_id: UUID = await fetch_value(
-        """
-        INSERT INTO tenant_transactions
-            (tenant_id, tipo, concepto, monto, estado_pago, plan_nombre, creditos_comprados)
-        VALUES ($1, $2, $3, $4, 'pendiente', $5, $6)
-        RETURNING id
-        """,
-        usuario.tenant_id,
-        datos.tipo,
-        concepto,
-        monto,
-        datos.plan,
-        datos.creditos,
-    )
-
-    payload = _payload_preferencia(transaccion_id, concepto, monto, usuario.email)
+    payload = _payload_preferencia(transaccion_id, concepto, monto, email)
 
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as cliente:
@@ -243,7 +284,7 @@ async def crear_pago(
     except httpx.HTTPError as e:
         # Sin preferencia no hay nada que cobrar: la fila pendiente se cierra
         # para que no quede colgada en el historial del cliente para siempre.
-        await _marcar_cancelada(transaccion_id)
+        await marcar_cancelada(transaccion_id)
         # `str(e)` de un HTTPStatusError no trae el body de la respuesta, y
         # ahí es donde Mercado Pago dice la causa real (p. ej. "auto_return
         # invalid. back_url.success must be defined"). Sin esto, cada 400 de
@@ -263,7 +304,7 @@ async def crear_pago(
     # credenciales productivas el que sirve es init_point.
     init_point = preferencia.get("init_point") or preferencia.get("sandbox_init_point")
     if not mp_preference_id or not init_point:
-        await _marcar_cancelada(transaccion_id)
+        await marcar_cancelada(transaccion_id)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Mercado Pago no devolvió un checkout válido",
@@ -281,27 +322,14 @@ async def crear_pago(
 
     return CrearPagoOut(
         transaccion_id=transaccion_id,
-        mp_preference_id=mp_preference_id,
-        init_point=init_point,
+        proveedor="mercadopago",
+        referencia=mp_preference_id,
+        checkout_url=init_point,
         monto=monto,
         concepto=concepto,
     )
 
 
-async def _marcar_cancelada(transaccion_id: UUID) -> None:
-    await execute(
-        """
-        UPDATE tenant_transactions
-           SET estado_pago = 'cancelado', updated_at = NOW()
-         WHERE id = $1 AND estado_pago = 'pendiente'
-        """,
-        transaccion_id,
-    )
-
-
-# ============================================================
-# WEBHOOK
-# ============================================================
 def _firma_valida(x_signature: str | None, x_request_id: str | None, data_id: str) -> bool:
     """
     Valida el HMAC que manda Mercado Pago en `x-signature`.
@@ -357,6 +385,15 @@ async def webhook(
     arregla un aviso de un tipo que no nos interesa o de un pago que no es
     nuestro. Solo la firma inválida corta con 401.
     """
+    # Con Stripe activo este endpoint no debería recibir nada. Si Mercado
+    # Pago todavía tiene la URL configurada y sigue avisando, se rechaza
+    # explícitamente en vez de acreditar por un canal que ya no se usa.
+    if not settings.mercadopago_activo:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Mercado Pago no es la pasarela activa",
+        )
+
     if not settings.MERCADOPAGO_WEBHOOK_SECRET:
         # Fallar cerrado: sin secreto no hay forma de distinguir un aviso
         # real de uno inventado, y este endpoint mueve dinero.
@@ -441,175 +478,9 @@ async def webhook(
     if nuevo_estado == "aprobado":
         # En background para contestarle rápido a Mercado Pago: si tardamos,
         # da el aviso por fallido y lo reintenta.
-        tareas.add_task(_procesar_pago_aprobado, transaccion_id)
+        tareas.add_task(procesar_pago_aprobado, transaccion_id)
 
     return {"recibido": True}
-
-
-# ============================================================
-# ENTREGA DE LO COMPRADO
-# ============================================================
-async def _procesar_pago_aprobado(transaccion_id: UUID) -> None:
-    """
-    Entrega lo que se pagó: activa el plan o acredita los créditos.
-
-    Corre fuera del request, así que no puede devolver un error al cliente:
-    todo lo que falle se registra en el log.
-
-    Es idempotente porque Mercado Pago manda el mismo aviso varias veces:
-      - suscripción -> UPSERT, escribe siempre el mismo estado final
-      - créditos    -> el índice único parcial de credit_transactions
-                       (una fila 'compra' por transacción) hace que el
-                       segundo intento aborte la transacción entera antes de
-                       tocar el saldo
-    """
-    try:
-        fila = await fetch_one(
-            """
-            SELECT tenant_id, tipo, plan_nombre, creditos_comprados, concepto
-            FROM tenant_transactions
-            WHERE id = $1 AND estado_pago = 'aprobado'
-            """,
-            transaccion_id,
-        )
-        if fila is None:
-            return
-
-        if fila["tipo"] == "subscription":
-            await _activar_suscripcion(fila["tenant_id"], fila["plan_nombre"])
-        elif fila["tipo"] == "credit_purchase":
-            await _acreditar_creditos(
-                fila["tenant_id"],
-                transaccion_id,
-                fila["creditos_comprados"],
-                fila["concepto"],
-            )
-    except Exception:  # noqa: BLE001 - es un background task: nada puede escapar
-        log.exception("Falló el procesamiento del pago %s", transaccion_id)
-
-
-async def _activar_suscripcion(tenant_id: UUID, plan: str) -> None:
-    """Deja el plan vigente y prende los servicios que ese plan incluye."""
-    plan_fila = await fetch_one(
-        """
-        SELECT precio_monthly, agente_ia_activo, gestion_vendedores_activo
-        FROM planes
-        WHERE nombre = $1
-        """,
-        plan,
-    )
-    if plan_fila is None:
-        log.error("Pago aprobado de un plan inexistente: %s", plan)
-        return
-
-    renovacion = datetime.now(timezone.utc) + timedelta(days=DIAS_CICLO)
-
-    async with transaccion() as conn:
-        await conn.execute(
-            """
-            INSERT INTO tenant_subscriptions
-                (tenant_id, plan, estado, precio_monthly, fecha_inicio,
-                 fecha_renovacion, intentos_fallidos)
-            VALUES ($1, $2, 'activa', $3, NOW(), $4, 0)
-            ON CONFLICT (tenant_id) DO UPDATE SET
-                plan              = EXCLUDED.plan,
-                estado            = 'activa',
-                precio_monthly    = EXCLUDED.precio_monthly,
-                fecha_renovacion  = EXCLUDED.fecha_renovacion,
-                intentos_fallidos = 0,
-                updated_at        = NOW()
-            """,
-            tenant_id,
-            plan,
-            plan_fila["precio_monthly"],
-            renovacion,
-        )
-
-        # tenant_servicios es la tabla que miran el resto de los módulos
-        # para saber si el agente / el CRM están encendidos. El plan es
-        # quien manda sobre esos flags.
-        await conn.execute(
-            """
-            INSERT INTO tenant_servicios
-                (tenant_id, agente_ia_activo, gestion_vendedores_activo, actualizado_en)
-            VALUES ($1, $2, $3, NOW())
-            ON CONFLICT (tenant_id) DO UPDATE SET
-                agente_ia_activo          = EXCLUDED.agente_ia_activo,
-                gestion_vendedores_activo = EXCLUDED.gestion_vendedores_activo,
-                actualizado_en            = NOW()
-            """,
-            tenant_id,
-            plan_fila["agente_ia_activo"],
-            plan_fila["gestion_vendedores_activo"],
-        )
-
-    log.info("Suscripción %s activada para el tenant %s", plan, tenant_id)
-
-
-async def _acreditar_creditos(
-    tenant_id: UUID,
-    transaccion_id: UUID,
-    creditos: Decimal | None,
-    concepto: str | None,
-) -> None:
-    if creditos is None or creditos <= 0:
-        log.error("Compra de créditos sin cantidad: %s", transaccion_id)
-        return
-
-    try:
-        async with transaccion() as conn:
-            await conn.execute(
-                """
-                INSERT INTO tenant_credits (tenant_id)
-                VALUES ($1)
-                ON CONFLICT (tenant_id) DO NOTHING
-                """,
-                tenant_id,
-            )
-
-            # FOR UPDATE: dos webhooks del mismo tenant a la vez se serializan
-            # acá en vez de pisarse el saldo.
-            saldo_anterior = await conn.fetchval(
-                "SELECT creditos_disponibles FROM tenant_credits WHERE tenant_id = $1 FOR UPDATE",
-                tenant_id,
-            )
-            saldo_nuevo = (saldo_anterior or Decimal(0)) + creditos
-
-            # Va ANTES de tocar el saldo: si este pago ya se acreditó, el
-            # índice único parcial lanza acá y la transacción entera se
-            # descarta sin haber sumado nada.
-            await conn.execute(
-                """
-                INSERT INTO credit_transactions
-                    (tenant_id, tipo, cantidad, concepto, tenant_transaction_id,
-                     saldo_anterior, saldo_nuevo)
-                VALUES ($1, 'compra', $2, $3, $4, $5, $6)
-                """,
-                tenant_id,
-                creditos,
-                concepto,
-                transaccion_id,
-                saldo_anterior or Decimal(0),
-                saldo_nuevo,
-            )
-
-            await conn.execute(
-                """
-                UPDATE tenant_credits
-                   SET creditos_disponibles = $2,
-                       fecha_ultima_compra  = NOW(),
-                       updated_at           = NOW()
-                 WHERE tenant_id = $1
-                """,
-                tenant_id,
-                saldo_nuevo,
-            )
-    except asyncpg.UniqueViolationError:
-        # El aviso repetido de siempre. No es un error.
-        log.info("El pago %s ya estaba acreditado; no se repite", transaccion_id)
-        return
-
-    log.info("Acreditados %s créditos al tenant %s", creditos, tenant_id)
 
 
 # ============================================================
@@ -659,25 +530,30 @@ async def historial(tenant_id: UUID = Depends(tenant_actual)) -> list[Transaccio
     return [TransaccionOut(**dict(f)) for f in filas]
 
 
-@router.get("/preferencia/{mp_preference_id}", response_model=PreferenciaEstadoOut)
-async def estado_preferencia(
-    mp_preference_id: str,
+@router.get("/checkout/{referencia}", response_model=CheckoutEstadoOut)
+async def estado_checkout(
+    referencia: str,
     tenant_id: UUID = Depends(tenant_actual),
-) -> PreferenciaEstadoOut:
+) -> CheckoutEstadoOut:
     """
     Estado de un pago concreto. Lo usa la pantalla de retorno para decirle
     al usuario si su pago ya quedó confirmado.
 
-    El filtro por tenant_id no es decorativo: sin él, conocer un id de
-    preferencia ajeno alcanzaría para espiar los cobros de otro negocio.
+    Busca por los dos proveedores: `referencia` es una Checkout Session de
+    Stripe (cs_...) o una preferencia de Mercado Pago. Así un pago viejo de
+    MP se sigue pudiendo consultar con el mismo endpoint.
+
+    El filtro por tenant_id no es decorativo: sin él, conocer una referencia
+    ajena alcanzaría para espiar los cobros de otro negocio.
     """
     fila = await fetch_one(
         """
         SELECT id, tipo, monto, estado_pago AS estado, created_at AS fecha
         FROM tenant_transactions
-        WHERE mp_preference_id = $1 AND tenant_id = $2
+        WHERE tenant_id = $2
+          AND (stripe_session_id = $1 OR mp_preference_id = $1)
         """,
-        mp_preference_id,
+        referencia,
         tenant_id,
     )
 
@@ -687,4 +563,4 @@ async def estado_preferencia(
             detail="Pago no encontrado",
         )
 
-    return PreferenciaEstadoOut(**dict(fila))
+    return CheckoutEstadoOut(**dict(fila))

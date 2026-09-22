@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from config import settings
 from services.correo import ErrorEnvioCorreo, enviar_codigo_verificacion
+from services.google_login import TokenGoogleInvalido, verificar_credential
 from deps import UsuarioActual, usuario_actual
 from security import (
     crear_access_token,
@@ -22,6 +23,7 @@ from security import (
 )
 from session import execute, fetch_one, get_pool
 from schemas import (
+    GoogleLoginIn,
     LoginIn,
     RefreshIn,
     RegistroIn,
@@ -104,14 +106,18 @@ async def _mandar_codigo(email: str, codigo: str, negocio: str) -> None:
 async def _crear_cuenta(
     conn: asyncpg.Connection,
     email: str,
-    password_hash: str,
+    password_hash: str | None,
     full_name: str | None,
     nombre_negocio: str,
+    google_id: str | None = None,
 ) -> tuple[UUID, UUID]:
     """
     Crea el negocio (tenant), su configuración de agente por defecto y el
     usuario dueño. Quien llama abre la transacción: si algo falla, no queda
     un tenant huérfano sin usuario.
+
+    `password_hash` es None para cuentas que entran solo por Google
+    (POST /auth/google): no hay contraseña que hashear en ese camino.
     """
     tenant_id = await conn.fetchval(
         "INSERT INTO tenants (name) VALUES ($1) RETURNING id",
@@ -131,14 +137,16 @@ async def _crear_cuenta(
 
     user_id = await conn.fetchval(
         """
-        INSERT INTO portal_users (tenant_id, email, password_hash, full_name, role)
-        VALUES ($1, $2, $3, $4, 'owner')
+        INSERT INTO portal_users
+            (tenant_id, email, password_hash, full_name, role, google_id)
+        VALUES ($1, $2, $3, $4, 'owner', $5)
         RETURNING id
         """,
         tenant_id,
         email,
         password_hash,
         full_name,
+        google_id,
     )
 
     return user_id, tenant_id
@@ -388,6 +396,109 @@ async def login(datos: LoginIn):
             "UPDATE portal_users SET password_hash = $1 WHERE id = $2",
             hash_password(datos.password),
             fila["id"],
+        )
+
+    await execute(
+        "UPDATE portal_users SET last_login_at = NOW() WHERE id = $1",
+        fila["id"],
+    )
+
+    return TokenOut(
+        access_token=crear_access_token(
+            fila["id"], fila["tenant_id"], fila["role"]
+        ),
+        refresh_token=crear_refresh_token(fila["id"]),
+    )
+
+
+@router.post("/google", response_model=TokenOut)
+async def login_google(datos: GoogleLoginIn):
+    """
+    Login/alta con Google, alternativa opcional al correo+contraseña de
+    arriba — no lo reemplaza, ambos caminos conviven.
+
+    El frontend manda el ID token que entrega el botón "Sign in with
+    Google" (Google Identity Services); acá se valida contra Google y,
+    según el correo del token:
+      - ya hay una cuenta con ese google_id       -> entra directo.
+      - ya hay una cuenta con ese correo (alta con contraseña) -> se
+        vincula el google_id a esa fila y entra, en vez de duplicar.
+      - no hay ninguna  -> se da de alta un negocio nuevo, igual que
+        /verificar pero sin password_hash.
+    """
+    if not settings.google_login_configurado:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="El login con Google no está configurado",
+        )
+
+    try:
+        payload = await verificar_credential(datos.credential)
+    except TokenGoogleInvalido:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token de Google inválido",
+        )
+
+    # Sin el correo confirmado por Google no hay identidad en la que
+    # confiar para entrar o vincular una cuenta existente.
+    if not payload.get("email_verified", False):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tu correo de Google no está verificado",
+        )
+
+    google_id = payload["sub"]
+    email = payload["email"].lower()
+    full_name = payload.get("name")
+
+    async with get_pool().acquire() as conn:
+        async with conn.transaction():
+            fila = await conn.fetchrow(
+                """
+                SELECT id, tenant_id, role, is_active
+                FROM portal_users
+                WHERE google_id = $1
+                """,
+                google_id,
+            )
+
+            if fila is None:
+                # ¿Cuenta ya dada de alta con correo+contraseña? Se vincula
+                # en vez de duplicar; el UNIQUE de email tampoco dejaría
+                # crear una fila nueva con el mismo correo.
+                fila = await conn.fetchrow(
+                    """
+                    UPDATE portal_users SET google_id = $2
+                    WHERE LOWER(email) = LOWER($1) AND google_id IS NULL
+                    RETURNING id, tenant_id, role, is_active
+                    """,
+                    email,
+                    google_id,
+                )
+
+            if fila is None:
+                # Cuenta nueva: negocio de arranque con el nombre que dio
+                # Google, editable después desde el portal.
+                user_id, tenant_id = await _crear_cuenta(
+                    conn,
+                    email,
+                    None,
+                    full_name,
+                    (full_name or "").strip() or "Mi negocio",
+                    google_id=google_id,
+                )
+                fila = {
+                    "id": user_id,
+                    "tenant_id": tenant_id,
+                    "role": "owner",
+                    "is_active": True,
+                }
+
+    if not fila["is_active"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="La cuenta está desactivada",
         )
 
     await execute(
