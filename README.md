@@ -152,6 +152,7 @@ GET    /api/canales                  Canales conectados
 POST   /api/canales/meta/conectar    code → user token de larga duración
 GET    /api/canales/meta/paginas     Páginas que el usuario autorizó
 POST   /api/canales/meta/activar     Guarda tokens + suscribe webhooks
+POST   /api/canales/whatsapp/conectar  Registra la línea de Kontesta del tenant
 DELETE /api/canales/{tipo}           Desconecta
 ```
 
@@ -436,5 +437,15 @@ Se puede desarrollar y probar todo hoy con las páginas propias.
   desautorización que valdría la pena escuchar.
 - **Multi-usuario por tenant**: el schema lo soporta (varios `portal_users`
   con el mismo `tenant_id`), pero no hay endpoints de invitación todavía.
-- **WhatsApp**: los endpoints están pensados para Messenger/Instagram. El
-  alta de WhatsApp usa Embedded Signup, que es otro flujo.
+- **WhatsApp**: el alta pasa hoy por Kontesta (`services/whatsapp.py`), que
+  es un intermediario temporal mientras la app de Meta no tenga Acceso
+  Avanzado aprobado. La cuenta de Kontesta es una sola, la de OperativAI:
+  el número de cada negocio se da de alta como línea dentro de ella *fuera
+  del portal*, y `POST /api/canales/whatsapp/conectar` solo registra qué
+  línea es de qué tenant. Falta: verificar contra Kontesta que la línea
+  exista y sea del negocio (su API no documenta cómo consultarlas), y un
+  índice único parcial sobre `channel_credentials.phone_number_id` que
+  cierre del todo la carrera que hoy solo cubre un SELECT previo — es tabla
+  del lado de n8n, así que le toca a quien sea dueño de ese esquema. El
+  alta nativa de Meta (Embedded Signup) sigue siendo otro flujo, para
+  cuando se migre a `MetaProvider`.

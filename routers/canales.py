@@ -1,12 +1,17 @@
 """
-Conexión de canales con Meta.
+Conexión de canales.
 
-Flujo:
+Facebook / Instagram (OAuth con Meta):
   1. El frontend abre el popup de Facebook Login for Business
   2. Meta devuelve un `code`
   3. POST /canales/meta/conectar  → guarda el user token de larga duración
   4. GET  /canales/meta/paginas   → lista lo que el usuario autorizó
   5. POST /canales/meta/activar   → guarda page tokens y suscribe webhooks
+
+WhatsApp (hoy vía Kontesta, ver services/whatsapp.py):
+  No hay OAuth. La cuenta de Kontesta es la de OperativAI y el número del
+  negocio se da de alta como una línea dentro de ella, fuera del portal;
+  POST /canales/whatsapp/conectar solo registra qué línea es de qué tenant.
 """
 
 from uuid import UUID
@@ -20,6 +25,7 @@ from schemas import (
     ActivarCanalesIn,
     CanalOut,
     ConectarMetaIn,
+    ConectarWhatsAppIn,
     PaginaDisponible,
 )
 from services import meta
@@ -212,6 +218,72 @@ async def activar_canales(
         )
 
     return {"resultados": resultados}
+
+
+# ============================================================
+# WhatsApp (vía Kontesta)
+# ============================================================
+@router.post("/whatsapp/conectar")
+async def conectar_whatsapp(
+    datos: ConectarWhatsAppIn,
+    tenant_id: UUID = Depends(tenant_actual),
+):
+    """
+    Registra qué línea de Kontesta corresponde a este tenant.
+
+    A diferencia de Meta no hay OAuth ni token que guardar: la API key de
+    Kontesta es una sola para toda la plataforma (KONTESTA_API_KEY) y el
+    número del negocio ya vive como línea dentro de esa cuenta. Lo que hace
+    falta guardar es la correspondencia línea → tenant, que es de donde n8n
+    saca el tenant de cada mensaje entrante.
+
+    ⚠️ No se verifica contra Kontesta que la línea exista ni que sea de este
+    negocio: la API de Kontesta no documenta un endpoint para consultarlas.
+    Mientras tanto el alta es declarativa y el único control es que nadie
+    pueda reclamar una línea que otro tenant ya tiene registrada.
+    """
+    # channel_credentials es tabla del lado de n8n, así que la unicidad de
+    # la línea se comprueba acá y no con un índice: sin esto, un tenant
+    # podría reclamar el número de otro y quedarse con su conversación.
+    # Queda una ventana de carrera mínima entre el SELECT y el INSERT; el
+    # arreglo de fondo es un índice único parcial, que le toca a quien sea
+    # dueño del esquema de n8n.
+    ocupada = await fetch_one(
+        """
+        SELECT 1 FROM channel_credentials
+        WHERE channel_type = 'whatsapp'
+          AND phone_number_id = $1
+          AND is_active
+          AND tenant_id <> $2
+        """,
+        datos.phone_number_id,
+        tenant_id,
+    )
+    if ocupada is not None:
+        # Sin decir de quién es: mismo criterio que el 404 de tenant ajeno,
+        # no confirmar qué otras cuentas existen.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Ese número ya está conectado en otra cuenta",
+        )
+
+    # access_token va en NULL a propósito: con Kontesta no hay credencial
+    # por tenant que cifrar, solo el id de la línea.
+    await fetch_one(
+        "SELECT set_channel_credentials($1, 'whatsapp', NULL, $2, NULL, NULL)",
+        tenant_id,
+        datos.phone_number_id,
+    )
+    await execute(
+        """
+        INSERT INTO tenant_channels (tenant_id, channel_type)
+        VALUES ($1, 'whatsapp')
+        ON CONFLICT (tenant_id, channel_type) DO UPDATE SET is_active = true
+        """,
+        tenant_id,
+    )
+
+    return {"conectado": True, "phone_number_id": datos.phone_number_id}
 
 
 # ============================================================

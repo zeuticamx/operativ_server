@@ -115,6 +115,18 @@ class ActivarCanalesIn(BaseModel):
     page_ids: list[str] = Field(min_length=1)
 
 
+class ConectarWhatsAppIn(BaseModel):
+    """
+    Alta del número de WhatsApp Business de un tenant.
+
+    Mientras el proveedor sea Kontesta (WHATSAPP_PROVIDER=kontesta) la cuenta
+    de Kontesta es una sola —la de OperativAI— y cada negocio es una línea
+    dentro de ella, así que lo único que hay por tenant es el id de esa
+    línea: no existe un secreto por tenant que cifrar.
+    """
+    phone_number_id: str = Field(min_length=1, max_length=100)
+
+
 # ============================================================
 # HERRAMIENTAS
 # ============================================================
