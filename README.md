@@ -403,12 +403,16 @@ no mezclarlas:
 | Alcance | **su** tenant | todos los tenants |
 | Para qué | configurar su negocio | administrar el servicio |
 
-El alta sigue siendo manual por SQL (no hay endpoint todavía):
+La **primera** persona se da de alta por SQL (no hay nadie que pueda
+hacerlo desde el panel todavía); de ahí en adelante, desde `/gerencia/equipo`:
 
 ```sql
 INSERT INTO gerencia_users (email, full_name, cargo)
 VALUES ('alguien@operativai.com.mx', 'Nombre Apellido', 'Operaciones');
 ```
+
+Nadie puede quitarse el nivel a sí mismo, así que la tabla nunca queda
+vacía desde el panel.
 
 Se resuelve por `LOWER(email)` contra el `portal_users` de la sesión, así
 que quien entra sigue autenticándose con su cuenta de siempre (o con
@@ -427,6 +431,41 @@ JOIN en cada request.
 | POST | `/gerencia/tenants/{id}/creditos` | Ajuste manual de saldo (positivo suma, negativo resta) |
 | GET | `/gerencia/consumo?dias=&tenant_id=` | Serie diaria de tokens y desglose por modelo |
 | GET | `/gerencia/auditoria?tenant_id=&accion=&limite=` | Bitácora, solo lectura |
+| GET | `/gerencia/salud` | Problemas operativos de ahora + alertas de plataforma abiertas |
+| PATCH | `/gerencia/alertas/{id}/revisar` | Cierra una alerta de plataforma |
+| GET/POST | `/gerencia/usuarios` | Equipo de plataforma (`gerencia_users`) |
+| DELETE | `/gerencia/usuarios/{id}` | Quita el nivel (nunca a uno mismo) |
+| GET | `/gerencia/cohortes?meses=` | Retención mensual por mes de alta |
+| POST | `/gerencia/tenants/{id}/impersonar` | Token de "ver como el negocio", solo lectura |
+| GET/POST | `/gerencia/planes` | Catálogo de planes (activos e inactivos) |
+| PATCH | `/gerencia/planes/{nombre}` | Edita un plan (no se puede renombrar) |
+
+`orden=margen` ordena del peor margen al mejor.
+
+`TenantGerenciaOut.email` es el correo de un solo portal_user del negocio
+(owner primero, después superadmin, después el resto por antigüedad — mismo
+criterio de prioridad que `/impersonar`), no una lista completa. `None` si
+el negocio no tiene ningún usuario activo.
+
+### Catálogo de planes
+
+`/gerencia/planes` administra la misma tabla `planes` que lee
+`GET /api/pagos/catalogo` para la pantalla de suscripción del portal.
+Aquel filtra `WHERE activo`; esto no, porque gerencia necesita ver también
+los planes apagados.
+
+`nombre` es el identificador de la URL (`PATCH /gerencia/planes/{nombre}`),
+no `id`: es UNIQUE en la tabla y es lo único que el resto del sistema usa
+para referenciar un plan — `tenant_subscriptions.plan` lo guarda como texto
+plano, sin FK. Por eso **no se puede renombrar un plan** desde el endpoint
+de update: haría huérfanas las suscripciones que ya lo referencian sin que
+nada avise. Para "renombrar", dar de alta uno nuevo y apagar el viejo
+(`activo=false`) — apagarlo no toca a quien ya lo tiene contratado.
+
+`PlanActualizarIn` es parcial: un campo en `null` significa "no tocar", no
+"borrar el valor" — mismo criterio que `CambiarServiciosTenantIn`. No hay
+forma de vaciar `precio_annual` una vez puesto desde el endpoint; es SQL
+directo para ese caso raro.
 
 Las tres acciones que cambian algo escriben en `gerencia_auditoria` **dentro
 de la misma transacción** que el cambio.
@@ -448,6 +487,67 @@ una consulta por fila. Duplica la regla de `services/acceso_pagos.py`, que
 sigue siendo la fuente de verdad. `tests/test_gerencia.py` compara las dos
 implementaciones sobre una matriz de casos justamente para que no se
 separen en silencio; si cambias una, cambia la otra.
+
+### Ver como el negocio (impersonación)
+
+`POST /gerencia/tenants/{id}/impersonar` con `{"motivo": "..."}` devuelve un
+access token para ver el portal como lo ve el dueño del negocio. Es la única
+pieza del panel que da acceso a datos de un cliente con otra identidad, así
+que cada garantía vive en un lugar concreto:
+
+| Garantía | Dónde |
+|---|---|
+| Solo lectura: todo lo que no sea GET/HEAD/OPTIONS → 403 | `deps._validar_impersonacion`, dentro de `usuario_actual` (lo usan todos los endpoints; no hay lista de permitidos que olvidar) |
+| Si sacan al gerente de `gerencia_users`, muere en la siguiente petición | la misma función relee la tabla |
+| Desde el "ver como" no se entra a `/gerencia` | `es_gerencia_plataforma` forzado a `False` |
+| Dura `IMPERSONACION_MINUTOS` (30) y no se estira | sin refresh token; `/auth/refresh` solo acepta `type: refresh` |
+| No marca alertas leídas por el socket | `realtime.marcar_leida` ignora sids de solo lectura |
+| Queda registrado con motivo | `gerencia_auditoria`, acción `impersonacion` |
+
+Entra como el `owner` (si no hay, `superadmin` o `member`), nunca como
+`vendedor`. En el portal el token va a `sessionStorage`: solo afecta a esa
+pestaña y la sesión del gerente en `localStorage` no se toca.
+
+### Salud y alertas de plataforma
+
+`/gerencia/salud` corre los detectores de `services/gerencia_salud.py`
+(agente bloqueado por pago, consumo anómalo, token de Meta por vencer,
+suscripción vencida sin pausar, cobros fallidos, pagos trabados en
+pendiente, canales silenciosos). Un detector que falla no tumba la
+pantalla: aparece como `detector_fallido`.
+
+El consumo anómalo además tiene job propio (`jobs/gerencia_background.py`,
+cada `CONSUMO_ANOMALO_INTERVALO_HORAS`): abre una alerta en
+`gerencia_alertas` y avisa por correo a todo `gerencia_users`. Anómalo =
+tokens de las últimas 24 h ≥ `CONSUMO_ANOMALO_FACTOR` × el promedio diario
+de los 7 días previos, con ese promedio nunca por debajo de
+`CONSUMO_ANOMALO_PISO_TOKENS`. Hay una sola alerta abierta por negocio (índice
+único parcial), así que un pico que dura todo el día manda un correo, no 24.
+
+### Margen por negocio
+
+El costo de modelos está en USD y los planes se cobran en la moneda de la
+pasarela (`STRIPE_CURRENCY`, MXN por defecto). Hace falta un tipo de
+cambio para restarlos. `services/banxico.py` decide la fuente, en orden:
+
+1. La moneda de cobro ya es USD → 1, sin llamar a nadie.
+2. La moneda de cobro es MXN y hay `BANXICO_TOKEN` → el FIX oficial del
+   día (SIE API de Banxico, serie `SF43718`), cacheado 6 h en memoria. Si
+   Banxico falla, se sirve el último valor cacheado aunque esté vencido
+   antes de rendirse.
+3. `TIPO_CAMBIO_USD` manual, si está configurado.
+4. Ninguno de los anteriores → `margen` y `costo_moneda` salen `null` en
+   vez de calcularse con un número inventado.
+
+La respuesta trae `tipo_cambio_fuente` (`moneda_usd` | `banxico` | `manual`
+| `ninguno`) para que el panel muestre de dónde salió el número, no solo
+si hay uno. El token se pide gratis en
+`https://www.banxico.org.mx/SieAPIRest/service/v1/token`.
+
+Ingreso del período = suscripción activa prorrateada a la ventana
+(`precio_monthly × días / 30`) + créditos cobrados en la ventana. Es una
+estimación a propósito: lo cobrado real cae a saltos (un plan anual entra
+entero un día) y en ventanas cortas daría márgenes absurdos.
 
 ### Consumo de tokens (lo escribe n8n)
 

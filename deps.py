@@ -2,10 +2,11 @@
 
 import secrets
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from uuid import UUID
 
 import jwt
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from config import settings
@@ -24,6 +25,11 @@ ROLES_GERENCIA = frozenset({"owner", "superadmin"})
 # admitirlo no necesitó migración.
 ROL_VENDEDOR = "vendedor"
 
+# Lo único que puede hacer una sesión de "ver como" (impersonación de
+# plataforma). Todo lo demás es una escritura sobre los datos de un cliente
+# hecha por alguien que no es el cliente.
+METODOS_SOLO_LECTURA = frozenset({"GET", "HEAD", "OPTIONS"})
+
 
 @dataclass
 class UsuarioActual:
@@ -32,13 +38,58 @@ class UsuarioActual:
     email: str
     role: str
     es_gerencia_plataforma: bool = False
+    # Solo en sesiones de "ver como": el correo del gerente que está
+    # mirando y cuándo vence el token. None en una sesión normal.
+    impersonado_por: str | None = None
+    impersonacion_expira: datetime | None = None
 
     @property
     def es_superadmin(self) -> bool:
         return self.role == "superadmin"
 
 
+async def _validar_impersonacion(payload: dict, request: Request) -> str:
+    """
+    Revalida una sesión de "ver como" y devuelve el correo del gerente.
+
+    Dos controles, en este orden:
+
+    1. El gerente sigue siendo gerente. El token dura poco, pero si a
+       alguien lo sacan de gerencia_users a mitad de una impersonación, la
+       sesión tiene que morir en la siguiente petición — mismo criterio que
+       usuario_actual aplica a todo lo demás.
+    2. Solo lectura. Se bloquea acá, en la dependencia que usan todos los
+       endpoints del portal, y no endpoint por endpoint: una lista de
+       permitidos que alguien olvida actualizar es una escritura que se
+       cuela. 403 y no 401: el token es válido, lo que falta es el permiso,
+       y un 401 haría que el portal intentara refrescar en vano.
+    """
+    gerente = await fetch_one(
+        """
+        SELECT pu.email
+        FROM portal_users pu
+        JOIN gerencia_users gu ON LOWER(gu.email) = LOWER(pu.email)
+        WHERE pu.id = $1 AND pu.is_active
+        """,
+        UUID(payload["imp"]),
+    )
+    if gerente is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="La sesión de 'ver como' ya no es válida",
+        )
+
+    if request.method not in METODOS_SOLO_LECTURA:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Modo solo lectura: estás viendo el portal como este negocio",
+        )
+
+    return gerente["email"]
+
+
 async def usuario_actual(
+    request: Request,
     cred: HTTPAuthorizationCredentials | None = Depends(bearer),
 ) -> UsuarioActual:
     if cred is None:
@@ -84,6 +135,21 @@ async def usuario_actual(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Usuario no encontrado o inactivo",
+        )
+
+    if "imp" in payload:
+        impersonado_por = await _validar_impersonacion(payload, request)
+        return UsuarioActual(
+            id=fila["id"],
+            tenant_id=fila["tenant_id"],
+            email=fila["email"],
+            role=fila["role"],
+            # Nunca, aunque el dueño que se está mirando fuera gerencia: la
+            # sesión es la del negocio, no la de la plataforma. Sin esto,
+            # desde el "ver como" se podría volver a entrar a /gerencia.
+            es_gerencia_plataforma=False,
+            impersonado_por=impersonado_por,
+            impersonacion_expira=datetime.fromtimestamp(payload["exp"], tz=timezone.utc),
         )
 
     return UsuarioActual(

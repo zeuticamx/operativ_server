@@ -64,6 +64,41 @@ def crear_access_token(user_id: UUID, tenant_id: UUID | None, role: str) -> str:
     )
 
 
+def crear_token_impersonacion(
+    user_id: UUID,
+    tenant_id: UUID,
+    role: str,
+    gerente_id: UUID,
+    minutos: int,
+) -> tuple[str, datetime]:
+    """
+    Access token para que alguien del nivel gerencia vea el portal como lo
+    ve `user_id`, en solo lectura.
+
+    Es un access token normal (`type: access`) con dos claims extra:
+    `imp` (quién está mirando de verdad) y `ro`. Que sea de tipo access y no
+    uno nuevo es a propósito: así pasa por el mismo deps.usuario_actual que
+    todo lo demás, y es ahí — en un solo lugar — donde se revalida al
+    gerente y se bloquea cualquier método que no sea de lectura.
+
+    No hay refresh token que lo acompañe: al vencer, se terminó. /refresh
+    solo acepta tokens `type: refresh`, así que este no se puede estirar.
+    """
+    expira_en = timedelta(minutes=minutos)
+    token = _crear_token(
+        {
+            "sub": str(user_id),
+            "tenant_id": str(tenant_id),
+            "role": role,
+            "type": "access",
+            "imp": str(gerente_id),
+            "ro": True,
+        },
+        expira_en,
+    )
+    return token, datetime.now(timezone.utc) + expira_en
+
+
 def crear_refresh_token(user_id: UUID) -> str:
     return _crear_token(
         {"sub": str(user_id), "type": "refresh"},

@@ -49,6 +49,8 @@ sio = socketio.AsyncServer(
 # sid -> tenant_id. Hace falta en `disconnect`, donde socket.io ya no dice
 # de qué room salía el cliente.
 _conexiones: dict[str, UUID] = {}
+# sids de sesiones "ver como": reciben alertas, no pueden marcarlas leídas.
+_solo_lectura: set[str] = set()
 
 
 def _sala(tenant_id: UUID) -> str:
@@ -88,7 +90,11 @@ async def _usuario_desde_token(token: str) -> Optional[dict]:
     if fila is None or not fila["is_active"] or fila["tenant_id"] is None:
         return None
 
-    return dict(fila)
+    # Sesión de "ver como" de plataforma: puede escuchar las alertas del
+    # negocio, pero no marcarlas leídas (ver marcar_leida). La revalidación
+    # del gerente la hace deps.usuario_actual en cada petición HTTP; acá
+    # alcanza con que el token siga vigente, que dura IMPERSONACION_MINUTOS.
+    return {**dict(fila), "solo_lectura": "imp" in payload}
 
 
 def _serializar(fila) -> dict[str, Any]:
@@ -118,6 +124,8 @@ async def connect(sid: str, environ: dict, auth: Optional[dict] = None) -> None:
 
     tenant_id = usuario["tenant_id"]
     _conexiones[sid] = tenant_id
+    if usuario["solo_lectura"]:
+        _solo_lectura.add(sid)
     await sio.enter_room(sid, _sala(tenant_id))
     logger.info("WS conectado: sid=%s tenant=%s role=%s", sid, tenant_id, usuario["role"])
 
@@ -139,6 +147,7 @@ async def connect(sid: str, environ: dict, auth: Optional[dict] = None) -> None:
 @sio.event
 async def disconnect(sid: str) -> None:
     tenant_id = _conexiones.pop(sid, None)
+    _solo_lectura.discard(sid)
     logger.info("WS desconectado: sid=%s tenant=%s", sid, tenant_id)
 
 
@@ -151,7 +160,7 @@ async def marcar_leida(sid: str, data: Optional[dict]) -> None:
     autenticada, nunca del payload del evento.
     """
     tenant_id = _conexiones.get(sid)
-    if tenant_id is None:
+    if tenant_id is None or sid in _solo_lectura:
         return
 
     alerta_id = (data or {}).get("alerta_id")

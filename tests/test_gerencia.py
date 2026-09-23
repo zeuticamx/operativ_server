@@ -122,6 +122,58 @@ async def test_gerencia_ve_el_listado_completo(http_client, gerente, tenant_id):
     assert any(t["tenant_id"] == str(tenant_id) for t in cuerpo["items"])
 
 
+@pytest.mark.asyncio
+async def test_un_tenant_sin_portal_users_tiene_email_null(http_client, gerente, tenant_id):
+    """El fixture `tenant_id` no crea ningún portal_user: no hay a quién mostrar."""
+    r = await http_client.get(f"/api/gerencia/tenants/{tenant_id}", headers=gerente["headers"])
+    assert r.status_code == 200
+    assert r.json()["email"] is None
+
+
+@pytest.mark.asyncio
+async def test_el_correo_mostrado_prioriza_al_owner(http_client, gerente, tenant_id):
+    """
+    Con varios portal_users, se muestra el owner aunque no sea el más
+    viejo: mismo criterio de prioridad que /impersonar (ver
+    routers/gerencia._sql_fichas).
+    """
+    async def _crear(email: str, role: str) -> None:
+        await execute(
+            """
+            INSERT INTO portal_users (tenant_id, email, password_hash, role, is_active)
+            VALUES ($1, $2, $3, $4, true)
+            """,
+            tenant_id,
+            email,
+            hash_password("x" * 12),
+            role,
+        )
+
+    # El member se crea primero (más antiguo) pero no tiene que ganar.
+    await _crear("member@ejemplo.com", "member")
+    await _crear("owner@ejemplo.com", "owner")
+
+    r = await http_client.get(f"/api/gerencia/tenants/{tenant_id}", headers=gerente["headers"])
+    assert r.json()["email"] == "owner@ejemplo.com"
+
+
+@pytest.mark.asyncio
+async def test_un_portal_user_desactivado_no_cuenta_para_el_correo(
+    http_client, gerente, tenant_id
+):
+    await execute(
+        """
+        INSERT INTO portal_users (tenant_id, email, password_hash, role, is_active)
+        VALUES ($1, 'baja@ejemplo.com', $2, 'owner', false)
+        """,
+        tenant_id,
+        hash_password("x" * 12),
+    )
+
+    r = await http_client.get(f"/api/gerencia/tenants/{tenant_id}", headers=gerente["headers"])
+    assert r.json()["email"] is None
+
+
 # ------------------------------------------------------------
 # 2. La suspensión tiene dientes
 # ------------------------------------------------------------
@@ -604,11 +656,9 @@ async def test_se_puede_buscar_por_nombre_y_por_uuid(http_client, gerente, tenan
     sin_coincidencias = await http_client.get(
         "/api/gerencia/tenants?q=zzz-no-existe-zzz", headers=gerente["headers"]
     )
-    assert sin_coincidencias.json() == {
-        "total": 0,
-        "dias": 30,
-        "items": [],
-    }
+    cuerpo = sin_coincidencias.json()
+    assert cuerpo["total"] == 0
+    assert cuerpo["items"] == []
 
 
 @pytest.mark.asyncio

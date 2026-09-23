@@ -4,3 +4,4 @@ _pycache_
 .pytest_cache
 __pycache__/
 *.pyc
+insert_gerencia_user.py

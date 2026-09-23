@@ -29,6 +29,29 @@ DIAS_POR_DEFECTO = 30
 DIAS_MAXIMO = 366
 
 
+# El gate de pagos escrito en SQL, para poder resolverlo de una sola vez
+# para toda la página en vez de una consulta por fila.
+#
+# OJO: es un espejo de services/acceso_pagos.py, que sigue siendo la
+# fuente de verdad (es la que responde n8n en /api/eventos). Si cambia la
+# regla allá, hay que cambiarla acá — tests/test_gerencia.py compara las
+# dos implementaciones justamente para que no se separen en silencio.
+#
+# IS NOT DISTINCT FROM y no `= 'activa'`: un tenant sin suscripción tiene
+# estado_suscripcion NULL, y `NULL = 'activa'` da NULL, no FALSE. Ese NULL
+# se propaga por el OR y el resultado entero sale NULL — que en JSON viaja
+# como `null` y rompe el booleano del schema.
+SQL_AGENTE_OPERANDO = """
+    g.agente_ia_activo
+    AND g.estado NOT IN ('suspendido', 'baja')
+    AND (
+        (g.estado_suscripcion IS NULL AND cr.creditos_disponibles IS NULL)
+        OR g.estado_suscripcion IS NOT DISTINCT FROM 'activa'
+        OR COALESCE(cr.creditos_disponibles, 0) > 0
+    )
+"""
+
+
 @dataclass
 class Rango:
     desde: datetime

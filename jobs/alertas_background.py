@@ -21,6 +21,8 @@ from config import settings
 from deps import ROLES_GERENCIA
 from jobs.pagos_background import job_pausar_suscripciones_vencidas
 from jobs.pagos_background import JOB_ID as JOB_ID_PAGOS
+from jobs.gerencia_background import JOB_ID as JOB_ID_CONSUMO
+from jobs.gerencia_background import job_consumo_anomalo
 from realtime import broadcast_alerta
 from services.correo import ErrorEnvioCorreo, enviar_resumen_alertas
 from services.pipeline_estados import ESTADOS_CERRADOS
@@ -217,6 +219,17 @@ def iniciar_scheduler() -> AsyncIOScheduler:
         hours=settings.SUSCRIPCION_REVISION_INTERVALO_HORAS,
         id=JOB_ID_PAGOS,
         name="Pausar suscripciones vencidas",
+        max_instances=1,
+        coalesce=True,
+    )
+    # Consumo anómalo de IA, para el equipo de plataforma. Mismo motivo que
+    # el de pagos para vivir en este scheduler.
+    scheduler.add_job(
+        job_consumo_anomalo,
+        "interval",
+        hours=settings.CONSUMO_ANOMALO_INTERVALO_HORAS,
+        id=JOB_ID_CONSUMO,
+        name="Detectar consumo anómalo de IA",
         max_instances=1,
         coalesce=True,
     )

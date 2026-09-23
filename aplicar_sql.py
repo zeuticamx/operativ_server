@@ -48,6 +48,7 @@ TABLAS = [
     ("tenant_estado_plataforma", "portal"),
     ("tenant_token_usage", "portal"),
     ("gerencia_auditoria", "portal"),
+    ("gerencia_alertas", "portal"),
 ]
 
 FUNCIONES = [

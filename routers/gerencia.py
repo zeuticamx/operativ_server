@@ -18,7 +18,9 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from config import settings
 from deps import UsuarioActual, gerencia_plataforma_actual
+from services.banxico import obtener_tipo_cambio
 from schemas import (
     AjusteCreditosIn,
     AjusteCreditosOut,
@@ -38,6 +40,7 @@ from schemas import (
 from services.gerencia import (
     DIAS_MAXIMO,
     DIAS_POR_DEFECTO,
+    SQL_AGENTE_OPERANDO,
     Consumo,
     consumo_global,
     consumo_por_dia,
@@ -67,29 +70,11 @@ ORDENES = {
     "nombre": "nombre ASC",
     "actividad": "ultimo_mensaje DESC NULLS LAST",
     "ingreso": "precio_monthly DESC NULLS LAST, nombre ASC",
+    # Peor primero: lo que se busca al ordenar por margen es quién cuesta
+    # más de lo que paga. NULLS LAST porque sin tipo de cambio no hay
+    # margen, y esas filas no pueden taparle la vista a las que sí.
+    "margen": "margen ASC NULLS LAST, nombre ASC",
 }
-
-# El gate de pagos escrito en SQL, para poder resolverlo de una sola vez
-# para toda la página en vez de una consulta por fila.
-#
-# OJO: es un espejo de services/acceso_pagos.py, que sigue siendo la
-# fuente de verdad (es la que responde n8n en /api/eventos). Si cambia la
-# regla allá, hay que cambiarla acá — tests/test_gerencia.py compara las
-# dos implementaciones justamente para que no se separen en silencio.
-#
-# IS NOT DISTINCT FROM y no `= 'activa'`: un tenant sin suscripción tiene
-# estado_suscripcion NULL, y `NULL = 'activa'` da NULL, no FALSE. Ese NULL
-# se propaga por el OR y el resultado entero sale NULL — que en JSON viaja
-# como `null` y rompe el booleano del schema.
-SQL_AGENTE_OPERANDO = """
-    g.agente_ia_activo
-    AND g.estado NOT IN ('suspendido', 'baja')
-    AND (
-        (g.estado_suscripcion IS NULL AND cr.creditos_disponibles IS NULL)
-        OR g.estado_suscripcion IS NOT DISTINCT FROM 'activa'
-        OR COALESCE(cr.creditos_disponibles, 0) > 0
-    )
-"""
 
 
 def _filtros(*, p_estado: int, p_patron: int) -> str:
@@ -182,13 +167,17 @@ async def resumen(
               )
         ),
         ingresos AS (
-            SELECT COALESCE(SUM(monto), 0) AS cobrado
+            SELECT
+                COALESCE(SUM(monto), 0) AS cobrado,
+                COALESCE(SUM(monto) FILTER (WHERE tipo = 'credit_purchase'), 0)
+                    AS creditos_cobrados
             FROM tenant_transactions
             WHERE estado_pago = 'aprobado'
               AND created_at >= $1::timestamptz
               AND created_at < $2::timestamptz
         )
-        SELECT e.*, a.con_actividad, a.mensajes, ri.n AS en_riesgo, i.cobrado
+        SELECT e.*, a.con_actividad, a.mensajes, ri.n AS en_riesgo,
+               i.cobrado, i.creditos_cobrados
         FROM estados e, actividad a, riesgo ri, ingresos i
         """,
         r.desde,
@@ -196,6 +185,16 @@ async def resumen(
     )
 
     consumo = await consumo_global(r)
+
+    # Mismo criterio que _sql_fichas, para que la suma de los márgenes de
+    # la tabla y el de la portada cuenten la misma historia.
+    centavos = Decimal("0.01")
+    ingreso_estimado = (
+        fila["mrr"] * Decimal(r.dias) / 30 + fila["creditos_cobrados"]
+    ).quantize(centavos)
+    tipo_cambio = await obtener_tipo_cambio()
+    tc = tipo_cambio.valor
+    costo_moneda = (consumo.costo_usd * tc).quantize(centavos) if tc is not None else None
 
     return ResumenGerenciaOut(
         dias=r.dias,
@@ -212,12 +211,107 @@ async def resumen(
         mensajes=fila["mensajes"],
         consumo=_consumo_out(consumo),
         ingresos_periodo=fila["cobrado"],
+        moneda=settings.moneda_cobro,
+        ingreso_estimado=ingreso_estimado,
+        costo_moneda=costo_moneda,
+        margen=ingreso_estimado - costo_moneda if costo_moneda is not None else None,
+        tipo_cambio_fuente=tipo_cambio.fuente,
     )
 
 
 # ============================================================
-# Listado de tenants
+# Ficha de negocio (listado y detalle comparten la consulta)
 # ============================================================
+def _sql_fichas(filtro: str, orden: str, limite: str = "") -> str:
+    """
+    La consulta de las fichas, con el WHERE, el ORDER BY y el LIMIT que le
+    toquen. Listado y detalle salen de acá para que el margen, el consumo y
+    `agente_operando` no se calculen de dos maneras distintas.
+
+    Parámetros fijos: $1 desde, $2 hasta, $3 tipo de cambio (numeric o
+    NULL), $4 días de la ventana. Lo que filtra empieza en $5.
+
+    El ingreso del período es una estimación, no lo cobrado:
+      - la suscripción activa prorrateada a los días de la ventana
+        (precio_monthly * dias / 30). Lo cobrado de verdad es a saltos —
+        un plan anual cae entero un solo día — y en una ventana de 7 días
+        daría márgenes absurdos para arriba o para abajo;
+      - más los créditos sueltos que sí se cobraron dentro de la ventana,
+        que son consumo variable y no tienen nada que prorratear.
+
+    `costo_moneda` y `margen` salen NULL si no hay tipo de cambio ($3):
+    NULL * número es NULL en SQL, que es exactamente lo que se quiere.
+    """
+    return f"""
+        WITH consumo AS (
+            SELECT
+                tenant_id,
+                SUM(tokens_entrada) AS tokens_entrada,
+                SUM(tokens_salida)  AS tokens_salida,
+                SUM(tokens_total)   AS tokens_total,
+                SUM(costo_usd)      AS costo_usd,
+                COUNT(*)            AS llamadas
+            FROM tenant_token_usage
+            WHERE created_at >= $1 AND created_at < $2
+            GROUP BY tenant_id
+        ),
+        creditos_cobrados AS (
+            SELECT tenant_id, SUM(monto) AS monto
+            FROM tenant_transactions
+            WHERE estado_pago = 'aprobado'
+              AND tipo = 'credit_purchase'
+              AND created_at >= $1 AND created_at < $2
+            GROUP BY tenant_id
+        ),
+        base AS (
+            SELECT
+                g.*,
+                ({SQL_AGENTE_OPERANDO}) AS agente_operando,
+                COALESCE(co.tokens_entrada, 0) AS tokens_entrada,
+                COALESCE(co.tokens_salida, 0)  AS tokens_salida,
+                COALESCE(co.tokens_total, 0)   AS tokens_total,
+                COALESCE(co.costo_usd, 0)      AS costo_usd,
+                COALESCE(co.llamadas, 0)       AS llamadas,
+                ROUND(
+                    CASE WHEN g.estado_suscripcion = 'activa'
+                         THEN COALESCE(g.precio_monthly, 0) * $4::numeric / 30
+                         ELSE 0 END
+                    + COALESCE(cc.monto, 0),
+                    2
+                ) AS ingreso_periodo,
+                -- Un tenant puede tener varios portal_users; se muestra uno
+                -- solo (owner primero, después superadmin, después el resto
+                -- por antigüedad) — mismo criterio de prioridad que usa
+                -- /impersonar para elegir a quién ver como. No es un dato
+                -- exhaustivo, es "con quién hablar de este negocio".
+                (
+                    SELECT pu.email FROM portal_users pu
+                    WHERE pu.tenant_id = g.tenant_id AND pu.is_active
+                    ORDER BY CASE pu.role
+                                 WHEN 'owner' THEN 0
+                                 WHEN 'superadmin' THEN 1
+                                 WHEN 'member' THEN 2
+                                 ELSE 3
+                             END,
+                             pu.created_at
+                    LIMIT 1
+                ) AS email
+            FROM v_gerencia_tenants g
+            LEFT JOIN consumo           co ON co.tenant_id = g.tenant_id
+            LEFT JOIN tenant_credits    cr ON cr.tenant_id = g.tenant_id
+            LEFT JOIN creditos_cobrados cc ON cc.tenant_id = g.tenant_id
+            {filtro}
+        )
+        SELECT
+            base.*,
+            ROUND(costo_usd * $3::numeric, 2)                   AS costo_moneda,
+            ROUND(ingreso_periodo - costo_usd * $3::numeric, 2) AS margen
+        FROM base
+        ORDER BY {orden}
+        {limite}
+    """
+
+
 @router.get("/tenants", response_model=TenantsGerenciaOut)
 async def listar_tenants(
     dias: int = Query(DIAS_POR_DEFECTO, ge=1, le=DIAS_MAXIMO),
@@ -228,8 +322,8 @@ async def listar_tenants(
     offset: int = Query(0, ge=0),
 ):
     """
-    Todos los negocios de la plataforma, con su estado, su plan y lo que
-    consumieron en la ventana.
+    Todos los negocios de la plataforma, con su estado, su plan, lo que
+    consumieron en la ventana y cuánto dejan.
 
     El consumo se agrega en un CTE aparte y se une por LEFT JOIN: un tenant
     que no consumió nada tiene que aparecer igual (en cero), porque "alta
@@ -242,46 +336,24 @@ async def listar_tenants(
         )
 
     r = await rango_dias(dias)
+    tipo_cambio = await obtener_tipo_cambio()
+    tc = tipo_cambio.valor
     patron = f"%{q.strip()}%" if q and q.strip() else None
 
     # El mismo WHERE para la página y para el total, pero las dos consultas
-    # numeran sus parámetros distinto (la de la página gasta $1/$2 en el
-    # rango de fechas). De ahí que el bloque se arme con los números como
-    # argumento en vez de estar escrito dos veces y quedar desincronizado.
-    filtros = _filtros(p_estado=3, p_patron=4)
-    filtros_count = _filtros(p_estado=1, p_patron=2)
-
+    # numeran sus parámetros distinto (la de la página gasta $1-$4 en el
+    # rango y la conversión). De ahí que el bloque se arme con los números
+    # como argumento en vez de estar escrito dos veces.
     filas = await fetch_all(
-        f"""
-        WITH consumo AS (
-            SELECT
-                tenant_id,
-                SUM(tokens_entrada) AS tokens_entrada,
-                SUM(tokens_salida)  AS tokens_salida,
-                SUM(tokens_total)   AS tokens_total,
-                SUM(costo_usd)      AS costo_usd,
-                COUNT(*)            AS llamadas
-            FROM tenant_token_usage
-            WHERE created_at >= $1 AND created_at < $2
-            GROUP BY tenant_id
-        )
-        SELECT
-            g.*,
-            ({SQL_AGENTE_OPERANDO}) AS agente_operando,
-            COALESCE(co.tokens_entrada, 0) AS tokens_entrada,
-            COALESCE(co.tokens_salida, 0)  AS tokens_salida,
-            COALESCE(co.tokens_total, 0)   AS tokens_total,
-            COALESCE(co.costo_usd, 0)      AS costo_usd,
-            COALESCE(co.llamadas, 0)       AS llamadas
-        FROM v_gerencia_tenants g
-        LEFT JOIN consumo        co ON co.tenant_id = g.tenant_id
-        LEFT JOIN tenant_credits cr ON cr.tenant_id = g.tenant_id
-        {filtros}
-        ORDER BY {ORDENES[orden]}
-        LIMIT $5 OFFSET $6
-        """,
+        _sql_fichas(
+            _filtros(p_estado=5, p_patron=6),
+            ORDENES[orden],
+            "LIMIT $7 OFFSET $8",
+        ),
         r.desde,
         r.hasta,
+        tc,
+        Decimal(r.dias),
         estado,
         patron,
         limite,
@@ -292,7 +364,7 @@ async def listar_tenants(
         f"""
         SELECT COUNT(*) AS n
         FROM v_gerencia_tenants g
-        {filtros_count}
+        {_filtros(p_estado=1, p_patron=2)}
         """,
         estado,
         patron,
@@ -301,14 +373,18 @@ async def listar_tenants(
     return TenantsGerenciaOut(
         total=total["n"],
         dias=r.dias,
-        items=[_tenant_out(f) for f in filas],
+        moneda=settings.moneda_cobro,
+        tipo_cambio_configurado=tc is not None,
+        tipo_cambio_fuente=tipo_cambio.fuente,
+        items=[_tenant_out(f, tipo_cambio.fuente) for f in filas],
     )
 
 
-def _tenant_out(f) -> TenantGerenciaOut:
+def _tenant_out(f, fuente) -> TenantGerenciaOut:
     return TenantGerenciaOut(
         tenant_id=f["tenant_id"],
         nombre=f["nombre"],
+        email=f["email"],
         alta=f["alta"],
         estado=f["estado"],
         estado_motivo=f["estado_motivo"],
@@ -334,39 +410,23 @@ def _tenant_out(f) -> TenantGerenciaOut:
             costo_usd=f["costo_usd"],
             llamadas=f["llamadas"],
         ),
+        ingreso_periodo=f["ingreso_periodo"],
+        costo_moneda=f["costo_moneda"],
+        margen=f["margen"],
+        tipo_cambio_fuente=fuente,
     )
 
 
 async def _traer_tenant(tenant_id: UUID, dias: int) -> TenantGerenciaOut:
     r = await rango_dias(dias)
+    tipo_cambio = await obtener_tipo_cambio()
     fila = await fetch_one(
-        f"""
-        WITH consumo AS (
-            SELECT
-                SUM(tokens_entrada) AS tokens_entrada,
-                SUM(tokens_salida)  AS tokens_salida,
-                SUM(tokens_total)   AS tokens_total,
-                SUM(costo_usd)      AS costo_usd,
-                COUNT(*)            AS llamadas
-            FROM tenant_token_usage
-            WHERE tenant_id = $1 AND created_at >= $2 AND created_at < $3
-        )
-        SELECT
-            g.*,
-            ({SQL_AGENTE_OPERANDO}) AS agente_operando,
-            COALESCE(co.tokens_entrada, 0) AS tokens_entrada,
-            COALESCE(co.tokens_salida, 0)  AS tokens_salida,
-            COALESCE(co.tokens_total, 0)   AS tokens_total,
-            COALESCE(co.costo_usd, 0)      AS costo_usd,
-            COALESCE(co.llamadas, 0)       AS llamadas
-        FROM v_gerencia_tenants g
-        LEFT JOIN tenant_credits cr ON cr.tenant_id = g.tenant_id
-        CROSS JOIN consumo co
-        WHERE g.tenant_id = $1
-        """,
-        tenant_id,
+        _sql_fichas("WHERE g.tenant_id = $5", "nombre ASC"),
         r.desde,
         r.hasta,
+        tipo_cambio.valor,
+        Decimal(r.dias),
+        tenant_id,
     )
 
     if fila is None:
@@ -375,7 +435,7 @@ async def _traer_tenant(tenant_id: UUID, dias: int) -> TenantGerenciaOut:
             detail="Negocio no encontrado",
         )
 
-    return _tenant_out(fila)
+    return _tenant_out(fila, tipo_cambio.fuente)
 
 
 @router.get("/tenants/{tenant_id}", response_model=TenantGerenciaOut)

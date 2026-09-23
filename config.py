@@ -2,6 +2,7 @@
 
 import logging
 import os
+from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from dotenv import load_dotenv
 
@@ -163,6 +164,46 @@ class Settings:
     # (ngrok o similar).
     BASE_URL_BACKEND: str = os.getenv("BASE_URL_BACKEND", "http://localhost:8000").rstrip("/")
 
+    # ---- Panel de plataforma (nivel gerencia) ----
+    # Cuántas unidades de la moneda de cobro vale un dólar. El costo de los
+    # modelos llega en USD (tenant_token_usage.costo_usd) y los planes se
+    # cobran en STRIPE_CURRENCY / MERCADOPAGO_CURRENCY, así que el margen
+    # por negocio necesita esta conversión.
+    #
+    # Es el respaldo manual: si BANXICO_TOKEN está configurado y la moneda
+    # de cobro es MXN, services/banxico.py usa el FIX oficial y este valor
+    # solo entra si Banxico falla y nunca hubo un valor en caché (ver
+    # services/banxico.obtener_tipo_cambio, que decide la fuente final).
+    #
+    # Sin default a propósito: un tipo de cambio inventado da márgenes que
+    # parecen datos. Vacío = el panel muestra el costo en USD y deja el
+    # margen en null en vez de calcularlo mal. Si la moneda de cobro ya es
+    # USD, se asume 1 (esa regla vive en obtener_tipo_cambio, no acá).
+    TIPO_CAMBIO_USD: str = os.getenv("TIPO_CAMBIO_USD", "").strip()
+
+    # Token del SIE API de Banxico (se pide gratis en
+    # https://www.banxico.org.mx/SieAPIRest/service/v1/token). Con esto
+    # configurado, el margen usa el tipo de cambio FIX del día en vez del
+    # valor manual de arriba. Solo aplica si la moneda de cobro es MXN: el
+    # FIX es pesos por dólar y no significa nada para otra moneda.
+    BANXICO_TOKEN: str = os.getenv("BANXICO_TOKEN", "").strip()
+
+    # Consumo anómalo: un tenant cuyo consumo de las últimas 24 h supera
+    # FACTOR veces su promedio diario de los 7 días previos. El PISO es el
+    # promedio mínimo que se asume, para que un negocio nuevo (promedio 0)
+    # no dispare una alerta con sus primeras diez respuestas: con 5 y
+    # 20 000, hacen falta 100 000 tokens en un día para que suene.
+    CONSUMO_ANOMALO_FACTOR: float = float(os.getenv("CONSUMO_ANOMALO_FACTOR", "5"))
+    CONSUMO_ANOMALO_PISO_TOKENS: int = int(os.getenv("CONSUMO_ANOMALO_PISO_TOKENS", "20000"))
+    CONSUMO_ANOMALO_INTERVALO_HORAS: int = int(
+        os.getenv("CONSUMO_ANOMALO_INTERVALO_HORAS", "1")
+    )
+
+    # Vida del token de "ver como el negocio". Corto a propósito: no hay
+    # refresh, así que al vencer el gerente vuelve a su propia sesión y
+    # tiene que pedir otro (con otro motivo, que queda en la bitácora).
+    IMPERSONACION_MINUTOS: int = int(os.getenv("IMPERSONACION_MINUTOS", "30"))
+
     # ---- CORS ----
     FRONTEND_ORIGINS: list[str] = [
         o.strip()
@@ -201,6 +242,36 @@ class Settings:
     def kontesta_configurado(self) -> bool:
         """Sin API key no se puede autenticar ninguna llamada a Kontesta."""
         return bool(self.KONTESTA_API_KEY)
+
+    @property
+    def moneda_cobro(self) -> str:
+        """Moneda en la que se cobran los planes, según la pasarela activa."""
+        if self.mercadopago_activo:
+            return self.MERCADOPAGO_CURRENCY.lower()
+        return self.STRIPE_CURRENCY
+
+    @property
+    def tipo_cambio_usd_manual(self) -> Decimal | None:
+        """
+        TIPO_CAMBIO_USD ya parseado, o None si está vacío o no es un número
+        válido. Un valor mal escrito cuenta como no configurado: mejor sin
+        margen que con uno calculado sobre un número que no es.
+
+        Es el respaldo, no la fuente preferida — ver
+        services/banxico.obtener_tipo_cambio, que decide entre esto y el
+        FIX de Banxico. El atajo de "moneda de cobro ya es USD" también
+        vive allá, no acá: esta propiedad es solo el parseo del valor manual.
+        """
+        try:
+            valor = Decimal(self.TIPO_CAMBIO_USD)
+        except (InvalidOperation, ValueError):
+            return None
+        return valor if valor > 0 else None
+
+    @property
+    def banxico_configurado(self) -> bool:
+        """Sin token no hay llamada; con moneda distinta de MXN, el FIX no aplica."""
+        return bool(self.BANXICO_TOKEN) and self.moneda_cobro == "mxn"
 
     @property
     def google_login_configurado(self) -> bool:

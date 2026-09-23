@@ -24,6 +24,8 @@ from routers import (
     conversaciones,
     eventos,
     gerencia,
+    gerencia_operacion,
+    gerencia_planes,
     herramientas,
     pagos,
     pagos_stripe,
@@ -96,6 +98,8 @@ app.include_router(reportes.router, prefix="/api")
 # Panel de plataforma: nivel gerencia (tabla gerencia_users), no el rol
 # owner de un tenant. Ve todos los negocios, así que no filtra por tenant.
 app.include_router(gerencia.router, prefix="/api")
+app.include_router(gerencia_operacion.router, prefix="/api")
+app.include_router(gerencia_planes.router, prefix="/api")
 
 # Lo llama n8n con X-Internal-Token, no el frontend.
 app.include_router(eventos.router, prefix="/api")

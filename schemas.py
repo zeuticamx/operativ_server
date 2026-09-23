@@ -67,6 +67,11 @@ class UsuarioOut(BaseModel):
     tenant_id: UUID | None
     nombre_negocio: str | None = None
     es_gerencia_plataforma: bool = False
+    # Solo cuando la sesión es un "ver como" de plataforma: correo del
+    # gerente que está mirando y cuándo vence. El portal los usa para el
+    # aviso permanente de modo solo lectura.
+    impersonado_por: str | None = None
+    impersonacion_expira: datetime | None = None
 
 
 # ============================================================
@@ -900,6 +905,8 @@ class SuscripcionOut(BaseModel):
 # Nada de esta sección se filtra por tenant — el punto es ver todos.
 
 EstadoTenantPlataforma = Literal["activo", "prueba", "suspendido", "baja"]
+# Espejo de services.banxico.FuenteTipoCambio.
+FuenteTipoCambio = Literal["moneda_usd", "banxico", "manual", "ninguno"]
 OrigenTokens = Literal["agente", "herramienta", "resumen", "otro"]
 
 
@@ -942,6 +949,11 @@ class ConsumoTenantOut(BaseModel):
 class TenantGerenciaOut(BaseModel):
     tenant_id: UUID
     nombre: str
+    # Owner primero, después superadmin, después el resto por antigüedad —
+    # no es exhaustivo (un negocio puede tener varios portal_users), es
+    # "con quién hablar de este negocio". None si no tiene ningún usuario
+    # activo (alta sin terminar, o todos desactivados).
+    email: str | None
     alta: datetime | None
 
     estado: EstadoTenantPlataforma
@@ -970,10 +982,32 @@ class TenantGerenciaOut(BaseModel):
 
     consumo: ConsumoTenantOut
 
+    # Margen del período, en la moneda de cobro. `ingreso_periodo` es la
+    # suscripción prorrateada más los créditos cobrados en la ventana (ver
+    # routers/gerencia._sql_fichas). `costo_moneda` y `margen` son None si
+    # no hay tipo de cambio: sin conversión no hay margen honesto.
+    ingreso_periodo: Decimal
+    costo_moneda: Decimal | None
+    margen: Decimal | None
+    # De dónde salió el tipo de cambio de esta ficha (ver FuenteTipoCambio
+    # más abajo). Repetido en cada ficha —y no solo en TenantsGerenciaOut—
+    # para que GET /gerencia/tenants/{id}, que devuelve una sola de estas
+    # sin el envoltorio de la lista, también pueda mostrarlo.
+    tipo_cambio_fuente: FuenteTipoCambio
+
 
 class TenantsGerenciaOut(BaseModel):
     total: int
     dias: int
+    # Moneda de ingreso_periodo / costo_moneda / margen ('mxn', 'usd'...).
+    moneda: str
+    tipo_cambio_configurado: bool
+    # De dónde salió el tipo de cambio usado en esta respuesta. Ver
+    # services/banxico.obtener_tipo_cambio: "banxico" es el FIX oficial del
+    # día (con caché), "manual" es TIPO_CAMBIO_USD, "moneda_usd" es cuando
+    # la moneda de cobro ya es USD (no hace falta convertir) y "ninguno" es
+    # cuando no hay ninguna fuente disponible.
+    tipo_cambio_fuente: FuenteTipoCambio
     items: list[TenantGerenciaOut]
 
 
@@ -1027,6 +1061,15 @@ class ResumenGerenciaOut(BaseModel):
     consumo: ConsumoTenantOut
     # Ingreso cobrado (transacciones aprobadas) dentro de la ventana.
     ingresos_periodo: Decimal
+
+    # Mismo criterio que la ficha de cada negocio: MRR prorrateado más
+    # créditos cobrados, contra el costo de modelos convertido. None sin
+    # TIPO_CAMBIO_USD.
+    moneda: str
+    ingreso_estimado: Decimal
+    costo_moneda: Decimal | None
+    margen: Decimal | None
+    tipo_cambio_fuente: FuenteTipoCambio
 
 
 class CambiarEstadoTenantIn(BaseModel):
@@ -1084,3 +1127,183 @@ class EntradaAuditoriaOut(BaseModel):
     tenant_nombre: str | None
     detalle: dict
     creado_en: datetime
+
+
+
+# ------------------------------------------------------------
+# Salud operativa
+# ------------------------------------------------------------
+SeveridadSalud = Literal["alta", "media", "baja"]
+
+
+class ProblemaSaludOut(BaseModel):
+    """
+    Un problema operativo concreto de un negocio. Forma genérica a
+    propósito: cada detector aporta filas del mismo tipo y la pantalla las
+    agrupa por `tipo`, así que sumar un detector no toca el frontend.
+    """
+
+    tipo: str
+    severidad: SeveridadSalud
+    tenant_id: UUID | None
+    tenant_nombre: str | None
+    detalle: str
+    fecha: datetime | None
+    datos: dict = Field(default_factory=dict)
+
+
+class AlertaGerenciaOut(BaseModel):
+    id: UUID
+    tipo: str
+    tenant_id: UUID | None
+    tenant_nombre: str | None
+    titulo: str
+    detalle: dict
+    creada_en: datetime
+    revisada_en: datetime | None
+    revisada_por: str | None
+
+
+class SaludOut(BaseModel):
+    generado_en: datetime
+    problemas: list[ProblemaSaludOut]
+    alertas_abiertas: list[AlertaGerenciaOut]
+
+
+# ------------------------------------------------------------
+# Equipo de plataforma (gerencia_users)
+# ------------------------------------------------------------
+class GerenciaUsuarioIn(BaseModel):
+    email: EmailStr
+    full_name: str = Field(min_length=2, max_length=255)
+    cargo: str = Field(min_length=2, max_length=100)
+
+
+class GerenciaUsuarioOut(BaseModel):
+    id: UUID
+    email: str
+    full_name: str
+    cargo: str
+    creado_en: datetime
+    # El nivel se engancha por correo con portal_users: si no hay cuenta
+    # con ese correo, el alta existe pero nadie puede usarla todavía.
+    tiene_cuenta_portal: bool
+    ultimo_acceso: datetime | None
+    es_yo: bool
+
+
+# ------------------------------------------------------------
+# Retención por cohortes
+# ------------------------------------------------------------
+class CohorteOut(BaseModel):
+    """
+    Negocios dados de alta en un mismo mes, y qué porcentaje siguió con
+    actividad (al menos un mensaje) cada mes después. `retencion[0]` es el
+    propio mes de alta; la lista termina en el mes actual, así que las
+    cohortes recientes traen menos columnas.
+    """
+
+    mes: date
+    tamano: int
+    activos: list[int]
+    retencion: list[float]
+
+
+class CohortesOut(BaseModel):
+    meses: int
+    cohortes: list[CohorteOut]
+
+
+# ------------------------------------------------------------
+# Ver como el negocio (impersonación de solo lectura)
+# ------------------------------------------------------------
+class ImpersonarIn(BaseModel):
+    # Obligatorio: entrar a mirar los datos de un cliente sin dejar dicho
+    # por qué no tiene que ser posible.
+    motivo: str = Field(min_length=5, max_length=500)
+
+
+class ImpersonarOut(BaseModel):
+    access_token: str
+    expira_en: datetime
+    # A quién se está viendo: el dueño del negocio, que es la cuenta cuyo
+    # portal se reproduce.
+    email_usuario: str
+    tenant_nombre: str
+
+
+# ------------------------------------------------------------
+# Catálogo de planes (tabla `planes`), administrado desde plataforma
+# ------------------------------------------------------------
+# `PlanOut` (arriba) es lo que ve un tenant contratando — sin `activo` ni
+# `orden`, y filtrado a `WHERE activo` antes de llegar ahí (ver
+# routers/pagos.catalogo). Estos son para routers/gerencia_planes.py, que
+# necesita ver y tocar también los planes apagados.
+class PlanGerenciaOut(BaseModel):
+    nombre: str
+    descripcion: str | None
+    precio_monthly: Decimal
+    precio_annual: Decimal | None
+    max_vendedores: int | None
+    max_leads_mensuales: int | None
+    creditos_incluidos_mensual: Decimal
+    agente_ia_activo: bool
+    gestion_vendedores_activo: bool
+    activo: bool
+    orden: int
+    creado_en: datetime
+    actualizado_en: datetime
+
+
+class PlanCrearIn(BaseModel):
+    # Identificador estable: `tenant_subscriptions.plan` lo guarda como
+    # texto plano (no hay FK a `planes`), así que este valor no se puede
+    # cambiar después sin dejar huérfanas las suscripciones que ya lo
+    # referencian — ver PlanActualizarIn.
+    nombre: str = Field(min_length=2, max_length=100)
+    descripcion: str | None = Field(default=None, max_length=2000)
+    precio_monthly: Decimal = Field(ge=0, max_digits=10, decimal_places=2)
+    precio_annual: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
+    # None = sin tope (plan tipo enterprise).
+    max_vendedores: int | None = Field(default=None, ge=0, le=32767)
+    max_leads_mensuales: int | None = Field(default=None, ge=0)
+    creditos_incluidos_mensual: Decimal = Field(
+        default=Decimal(100), ge=0, max_digits=12, decimal_places=2
+    )
+    agente_ia_activo: bool = True
+    gestion_vendedores_activo: bool = True
+    activo: bool = True
+    orden: int = Field(default=0, ge=0, le=32767)
+
+
+class PlanActualizarIn(BaseModel):
+    """
+    Parcial: lo que no venga (o venga en null) se deja como está — mismo
+    criterio que CambiarServiciosTenantIn. `nombre` no está acá a propósito
+    (ver el comentario en PlanCrearIn); para "renombrar" hay que dar de
+    alta un plan nuevo y apagar el viejo con `activo=false`.
+
+    Con este esquema no hay forma de BORRAR un `precio_annual` que ya
+    existía (mandar null significa "no tocar", no "poner en null"). Es una
+    limitación conocida y aceptada: es un caso raro, y para eso está SQL
+    directo.
+    """
+
+    descripcion: str | None = Field(default=None, max_length=2000)
+    precio_monthly: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
+    precio_annual: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
+    max_vendedores: int | None = Field(default=None, ge=0, le=32767)
+    max_leads_mensuales: int | None = Field(default=None, ge=0)
+    creditos_incluidos_mensual: Decimal | None = Field(
+        default=None, ge=0, max_digits=12, decimal_places=2
+    )
+    agente_ia_activo: bool | None = None
+    gestion_vendedores_activo: bool | None = None
+    activo: bool | None = None
+    orden: int | None = Field(default=None, ge=0, le=32767)
+
+    @model_validator(mode="after")
+    def al_menos_uno(self):
+        if all(v is None for v in self.model_dump().values()):
+            raise ValueError("Hay que indicar al menos un campo para actualizar")
+        return self
