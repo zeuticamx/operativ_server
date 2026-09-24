@@ -14,16 +14,32 @@ de que n8n resuelve el tenant.
 import logging
 from typing import Any, Optional
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
 from services.acceso_pagos import acceso_pagos
 from services.asignacion import asignar_vendedor_automatico
 from deps import llamada_interna
+from realtime import broadcast_alerta
+from services import calendario
+from services.calendario import actor_desde_chat, verificar_calendario_activo
 from services.gerencia import registrar_uso_tokens
 from services.notificaciones import notificar_vendedor_nuevo_lead
 from services.pipeline import asignar_vendedor, get_or_create_pipeline, get_tenant_servicios
-from schemas import MensajeEntranteIn, MensajeEntranteOut, UsoTokensIn, UsoTokensOut
+from schemas import (
+    CancelarReservaEventoIn,
+    ConsultarDisponibilidadIn,
+    ConsultarDisponibilidadOut,
+    CrearReservaEventoIn,
+    CrearReservaEventoOut,
+    MensajeEntranteIn,
+    MensajeEntranteOut,
+    ReservaOut,
+    SlotDisponibleOut,
+    UsoTokensIn,
+    UsoTokensOut,
+)
 from session import transaccion
 
 log = logging.getLogger("operativai.eventos")
@@ -158,3 +174,110 @@ async def uso_tokens(datos: UsoTokensIn):
         idempotency_key=datos.idempotency_key,
     )
     return UsoTokensOut(registrado=registrado, duplicado=not registrado)
+
+
+# ============================================================
+# Calendarios: disponibilidad y reservas para el agente de n8n
+# ============================================================
+@router.post("/calendario/disponibilidad", response_model=ConsultarDisponibilidadOut)
+async def calendario_disponibilidad(datos: ConsultarDisponibilidadIn):
+    """
+    Slots libres para que n8n se los ofrezca al cliente por chat.
+
+    Igual que el resto de este router, `tenant_id` viaja en el body (n8n no
+    tiene sesión de portal para ponerlo en la ruta).
+    """
+    await verificar_calendario_activo(datos.tenant_id)
+    slots = await calendario.consultar_disponibilidad(
+        datos.tenant_id,
+        datos.servicio_id,
+        datos.proveedor_id,
+        datos.fecha_desde,
+        datos.fecha_hasta,
+    )
+    return ConsultarDisponibilidadOut(
+        calendario_activo=True,
+        slots=[SlotDisponibleOut(**s) for s in slots],
+    )
+
+
+@router.post("/calendario/reservas", response_model=CrearReservaEventoOut)
+async def calendario_crear_reserva(datos: CrearReservaEventoIn):
+    """
+    Crea una cita desde el chat. Idempotente: un reintento de n8n con el
+    mismo `idempotency_key` no crea una segunda reserva, devuelve
+    `duplicado=true` con la reserva que ya existía.
+    """
+    await verificar_calendario_activo(datos.tenant_id)
+
+    reserva, motivo = await calendario.crear_reserva(
+        datos.tenant_id,
+        datos.proveedor_id,
+        datos.servicio_id,
+        datos.hora_inicio,
+        user_id=datos.user_id,
+        cliente_nombre=datos.cliente_nombre,
+        cliente_telefono=datos.cliente_telefono,
+        notas=datos.notas,
+        actor=actor_desde_chat(datos.user_id, datos.cliente_nombre),
+        idempotency_key=datos.idempotency_key,
+    )
+
+    if reserva is None:
+        return CrearReservaEventoOut(creado=False, motivo_rechazo=motivo)
+
+    if motivo == "duplicado":
+        return CrearReservaEventoOut(creado=True, duplicado=True, reserva=ReservaOut(**vars(reserva)))
+
+    # Fuera de la conexión que usó crear_reserva, y solo para el caso
+    # realmente nuevo: un reintento duplicado no debe generar una segunda
+    # alerta ni un segundo aviso por WebSocket.
+    #
+    # Este es el único punto que dispara "reserva_creada": una reserva
+    # creada por el propio negocio desde el portal (walk-in/teléfono,
+    # routers/calendario.py::crear_reserva_manual) no notifica a gerencia
+    # de sí misma -- la alerta es para avisar de reservas que llegaron
+    # solas por el chat, no para confirmar lo que gerencia ya sabe que hizo.
+    servicio = await calendario.servicio_del_tenant(datos.servicio_id, datos.tenant_id)
+    tenant_servicios = await get_tenant_servicios(datos.tenant_id)
+    hora_local = reserva.hora_inicio.astimezone(ZoneInfo(tenant_servicios.zona_horaria))
+
+    detalle = [f"{reserva.cliente_nombre or 'Cliente'} reservó {reserva.servicio_nombre} con {reserva.proveedor_nombre}"]
+    detalle.append(f"el {hora_local.strftime('%d/%m')} a las {hora_local.strftime('%H:%M')}")
+    if reserva.cliente_telefono:
+        detalle.append(f"({reserva.cliente_telefono})")
+    if servicio and servicio.precio is not None:
+        detalle.append(f"— ${servicio.precio:.2f}")
+
+    await broadcast_alerta(
+        datos.tenant_id,
+        "reserva_creada",
+        "Nueva reserva",
+        " ".join(detalle),
+        datos={
+            "reserva_id": str(reserva.id),
+            "proveedor_id": str(reserva.proveedor_id),
+            "hora_inicio": reserva.hora_inicio.isoformat(),
+        },
+    )
+    return CrearReservaEventoOut(creado=True, reserva=ReservaOut(**vars(reserva)))
+
+
+@router.post("/calendario/reservas/cancelar", response_model=ReservaOut)
+async def calendario_cancelar_reserva(datos: CancelarReservaEventoIn):
+    await verificar_calendario_activo(datos.tenant_id)
+
+    reserva = await calendario.cancelar_reserva(
+        datos.reserva_id, datos.tenant_id, datos.motivo, actor_desde_chat(None, None)
+    )
+    if reserva is None:
+        raise HTTPException(status_code=404, detail="Reserva no encontrada")
+
+    await broadcast_alerta(
+        datos.tenant_id,
+        "reserva_cancelada",
+        "Reserva cancelada",
+        f"Se canceló la cita de {reserva.cliente_nombre or 'un cliente'} con {reserva.proveedor_nombre}",
+        datos={"reserva_id": str(reserva.id)},
+    )
+    return ReservaOut(**vars(reserva))

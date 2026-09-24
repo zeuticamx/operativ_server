@@ -31,6 +31,11 @@ class Servicios:
     tenant_id: UUID
     agente_ia_activo: bool
     gestion_vendedores_activo: bool
+    # Con default: código y tests existentes que construyen Servicios(...)
+    # de antes de este módulo no necesitan tocarse. Mismos valores que usa
+    # el fallback de get_tenant_servicios para un tenant sin fila.
+    calendario_activo: bool = False
+    zona_horaria: str = "America/Mexico_City"
 
 
 @dataclass(frozen=True)
@@ -75,7 +80,8 @@ async def get_tenant_servicios(
     romperse por eso a mitad de un mensaje entrante.
     """
     sql = """
-        SELECT tenant_id, agente_ia_activo, gestion_vendedores_activo
+        SELECT tenant_id, agente_ia_activo, gestion_vendedores_activo,
+               calendario_activo, zona_horaria
         FROM tenant_servicios
         WHERE tenant_id = $1
     """
@@ -91,12 +97,16 @@ async def get_tenant_servicios(
             tenant_id=tenant_id,
             agente_ia_activo=True,
             gestion_vendedores_activo=False,
+            calendario_activo=False,
+            zona_horaria="America/Mexico_City",
         )
 
     return Servicios(
         tenant_id=fila["tenant_id"],
         agente_ia_activo=fila["agente_ia_activo"],
         gestion_vendedores_activo=fila["gestion_vendedores_activo"],
+        calendario_activo=fila["calendario_activo"],
+        zona_horaria=fila["zona_horaria"],
     )
 
 
@@ -104,29 +114,42 @@ async def set_tenant_servicios(
     tenant_id: UUID,
     agente_ia_activo: Optional[bool],
     gestion_vendedores_activo: Optional[bool],
+    calendario_activo: Optional[bool] = None,
+    zona_horaria: Optional[str] = None,
 ) -> Servicios:
     """Actualización parcial: lo que llegue como None se deja como estaba."""
     async with conexion() as conn:
         fila = await conn.fetchrow(
             """
             INSERT INTO tenant_servicios
-                (tenant_id, agente_ia_activo, gestion_vendedores_activo, actualizado_en)
-            VALUES ($1, COALESCE($2, true), COALESCE($3, false), NOW())
+                (tenant_id, agente_ia_activo, gestion_vendedores_activo,
+                 calendario_activo, zona_horaria, actualizado_en)
+            VALUES (
+                $1, COALESCE($2, true), COALESCE($3, false),
+                COALESCE($4, false), COALESCE($5, 'America/Mexico_City'), NOW()
+            )
             ON CONFLICT (tenant_id) DO UPDATE SET
                 agente_ia_activo          = COALESCE($2, tenant_servicios.agente_ia_activo),
                 gestion_vendedores_activo = COALESCE($3, tenant_servicios.gestion_vendedores_activo),
+                calendario_activo         = COALESCE($4, tenant_servicios.calendario_activo),
+                zona_horaria              = COALESCE($5, tenant_servicios.zona_horaria),
                 actualizado_en            = NOW()
-            RETURNING tenant_id, agente_ia_activo, gestion_vendedores_activo
+            RETURNING tenant_id, agente_ia_activo, gestion_vendedores_activo,
+                      calendario_activo, zona_horaria
             """,
             tenant_id,
             agente_ia_activo,
             gestion_vendedores_activo,
+            calendario_activo,
+            zona_horaria,
         )
 
     return Servicios(
         tenant_id=fila["tenant_id"],
         agente_ia_activo=fila["agente_ia_activo"],
         gestion_vendedores_activo=fila["gestion_vendedores_activo"],
+        calendario_activo=fila["calendario_activo"],
+        zona_horaria=fila["zona_horaria"],
     )
 
 

@@ -198,6 +198,8 @@ async def actualizar_servicios(
         tenant_id,
         datos.agente_ia_activo,
         datos.gestion_vendedores_activo,
+        datos.calendario_activo,
+        datos.zona_horaria,
     )
     return ServiciosOut(**vars(servicios))
 

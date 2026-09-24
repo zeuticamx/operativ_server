@@ -1,6 +1,6 @@
 """Schemas de entrada y salida de la API."""
 
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Literal
 from uuid import UUID
@@ -244,12 +244,16 @@ class ServiciosOut(BaseModel):
     tenant_id: UUID
     agente_ia_activo: bool
     gestion_vendedores_activo: bool
+    calendario_activo: bool
+    zona_horaria: str
 
 
 class ServiciosIn(BaseModel):
     """Parcial: lo que no venga se deja como está."""
     agente_ia_activo: bool | None = None
     gestion_vendedores_activo: bool | None = None
+    calendario_activo: bool | None = None
+    zona_horaria: str | None = None
 
 
 # ============================================================
@@ -766,6 +770,8 @@ class TipoAlerta(str, Enum):
     sin_actividad = "sin_actividad"
     cuota_excedida = "cuota_excedida"
     cierre = "cierre"
+    reserva_creada = "reserva_creada"
+    reserva_cancelada = "reserva_cancelada"
 
 class AlertaOut(BaseModel):
     id: UUID
@@ -1307,3 +1313,341 @@ class PlanActualizarIn(BaseModel):
         if all(v is None for v in self.model_dump().values()):
             raise ValueError("Hay que indicar al menos un campo para actualizar")
         return self
+
+
+# ============================================================
+# CALENDARIOS
+# ============================================================
+EstadoReserva = Literal["confirmada", "cancelada", "completada", "no_asistio"]
+
+
+class ProveedorCrearIn(BaseModel):
+    nombre: str = Field(min_length=2, max_length=255)
+    color: str = Field(default="#6366f1", pattern=r"^#[0-9a-fA-F]{6}$")
+    orden: int = Field(default=0, ge=0, le=32767)
+
+
+class ProveedorActualizarIn(BaseModel):
+    nombre: str | None = Field(default=None, min_length=2, max_length=255)
+    color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
+    activo: bool | None = None
+    orden: int | None = Field(default=None, ge=0, le=32767)
+
+    @model_validator(mode="after")
+    def al_menos_uno(self):
+        if all(v is None for v in self.model_dump().values()):
+            raise ValueError("Hay que indicar al menos un campo para actualizar")
+        return self
+
+
+class ProveedorOut(BaseModel):
+    id: UUID
+    tenant_id: UUID
+    nombre: str
+    color: str
+    activo: bool
+    orden: int
+    creado_en: datetime
+
+
+class ServicioCrearIn(BaseModel):
+    nombre: str = Field(min_length=2, max_length=255)
+    duracion_minutos: int = Field(ge=5, le=480)
+    precio: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
+
+
+class ServicioActualizarIn(BaseModel):
+    nombre: str | None = Field(default=None, min_length=2, max_length=255)
+    duracion_minutos: int | None = Field(default=None, ge=5, le=480)
+    precio: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
+    activo: bool | None = None
+
+    @model_validator(mode="after")
+    def al_menos_uno(self):
+        if all(v is None for v in self.model_dump().values()):
+            raise ValueError("Hay que indicar al menos un campo para actualizar")
+        return self
+
+
+class ServicioOut(BaseModel):
+    id: UUID
+    tenant_id: UUID
+    nombre: str
+    duracion_minutos: int
+    precio: Decimal | None
+    activo: bool
+    creado_en: datetime
+
+
+class HorarioSemanalIn(BaseModel):
+    """0=lunes … 6=domingo, igual que Python date.weekday()."""
+
+    dia_semana: int = Field(ge=0, le=6)
+    hora_inicio: time
+    hora_fin: time
+
+    @model_validator(mode="after")
+    def rango_valido(self):
+        if self.hora_fin <= self.hora_inicio:
+            raise ValueError("hora_fin debe ser posterior a hora_inicio")
+        return self
+
+
+class ReemplazarHorariosIn(BaseModel):
+    """PUT completo: reemplaza toda la semana del proveedor de una vez."""
+
+    bloques: list[HorarioSemanalIn] = Field(default_factory=list)
+
+
+class HorarioSemanalOut(BaseModel):
+    id: UUID
+    proveedor_id: UUID
+    dia_semana: int
+    hora_inicio: time
+    hora_fin: time
+
+
+class ExcepcionCrearIn(BaseModel):
+    fecha: date
+    disponible: bool = False
+    hora_inicio: time | None = None
+    hora_fin: time | None = None
+
+    @model_validator(mode="after")
+    def horario_coherente(self):
+        if self.disponible and (self.hora_inicio is None or self.hora_fin is None):
+            raise ValueError("Si el día está disponible hay que dar hora_inicio y hora_fin")
+        if not self.disponible and (self.hora_inicio is not None or self.hora_fin is not None):
+            raise ValueError("Un día no disponible no lleva horario")
+        if self.hora_inicio and self.hora_fin and self.hora_fin <= self.hora_inicio:
+            raise ValueError("hora_fin debe ser posterior a hora_inicio")
+        return self
+
+
+class ExcepcionOut(BaseModel):
+    id: UUID
+    proveedor_id: UUID
+    fecha: date
+    disponible: bool
+    hora_inicio: time | None
+    hora_fin: time | None
+
+
+class DescansoCrearIn(BaseModel):
+    """
+    Exactamente uno de dia_semana/fecha: recurrente (todos los lunes,
+    p.ej.) o puntual (una fecha concreta) — nunca ambos ni ninguno. A
+    diferencia de ExcepcionCrearIn, un descanso nunca reemplaza la jornada:
+    siempre la recorta.
+    """
+
+    dia_semana: int | None = Field(default=None, ge=0, le=6)
+    fecha: date | None = None
+    hora_inicio: time
+    hora_fin: time
+    etiqueta: str | None = Field(default=None, max_length=100)
+
+    @model_validator(mode="after")
+    def dia_o_fecha(self):
+        if (self.dia_semana is None) == (self.fecha is None):
+            raise ValueError("Hay que indicar dia_semana o fecha, pero no ambos ni ninguno")
+        if self.hora_fin <= self.hora_inicio:
+            raise ValueError("hora_fin debe ser posterior a hora_inicio")
+        return self
+
+
+class DescansoOut(BaseModel):
+    id: UUID
+    proveedor_id: UUID
+    dia_semana: int | None
+    fecha: date | None
+    hora_inicio: time
+    hora_fin: time
+    etiqueta: str | None
+
+
+class ReservaCrearIn(BaseModel):
+    """Alta manual desde el portal (walk-in o telefónico)."""
+
+    proveedor_id: UUID
+    servicio_id: UUID
+    hora_inicio: datetime
+    user_id: UUID | None = None
+    cliente_nombre: str | None = Field(default=None, max_length=255)
+    cliente_telefono: str | None = Field(default=None, max_length=50)
+    notas: str | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def identifica_al_cliente(self):
+        if self.user_id is None and not self.cliente_nombre:
+            raise ValueError("Falta user_id o cliente_nombre para identificar al cliente")
+        return self
+
+
+class ReprogramarReservaIn(BaseModel):
+    hora_inicio: datetime
+
+
+class CancelarReservaIn(BaseModel):
+    motivo: str | None = Field(default=None, max_length=500)
+
+
+MetodoPago = Literal["efectivo", "tarjeta", "transferencia"]
+
+
+class CambiarEstadoReservaIn(BaseModel):
+    estado: Literal["completada", "no_asistio"]
+    # Snapshot del cobro, no el precio de catálogo: obligatorios al
+    # completar (el corte de caja diario necesita saber qué se cobró de
+    # verdad), prohibidos en 'no_asistio' (no hubo nada que cobrar).
+    precio_cobrado: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
+    metodo_pago: MetodoPago | None = None
+
+    @model_validator(mode="after")
+    def cobro_coherente_con_el_estado(self):
+        if self.estado == "completada":
+            if self.precio_cobrado is None or self.metodo_pago is None:
+                raise ValueError(
+                    "Para marcar una cita como completada hay que indicar precio_cobrado y metodo_pago"
+                )
+        elif self.precio_cobrado is not None or self.metodo_pago is not None:
+            raise ValueError("precio_cobrado y metodo_pago solo aplican al completar la cita")
+        return self
+
+
+class ReservaOut(BaseModel):
+    id: UUID
+    tenant_id: UUID
+    proveedor_id: UUID
+    proveedor_nombre: str
+    proveedor_color: str
+    servicio_id: UUID
+    servicio_nombre: str
+    hora_inicio: datetime
+    hora_fin: datetime
+    estado: EstadoReserva
+    user_id: UUID | None
+    cliente_nombre: str | None
+    cliente_telefono: str | None
+    notas: str | None
+    precio_cobrado: Decimal | None
+    metodo_pago: MetodoPago | None
+    creado_en: datetime
+
+
+class CorteDiarioOut(BaseModel):
+    """
+    Resumen de caja de un día: cuántos servicios se completaron y cuánto se
+    cobró en total. Solo lectura — se arma en el momento a partir de
+    `reservas`, no hay tabla propia que se pueda desalinear con ella.
+    """
+
+    fecha: date
+    total_servicios: int
+    total_cobrado: Decimal
+    servicios: list[ReservaOut]
+
+
+class ReasignarReservaIn(BaseModel):
+    """Cambia el barbero de una cita ya agendada, sin tocar su horario."""
+
+    proveedor_id: UUID
+
+
+EventoAuditoria = Literal[
+    "creada", "reprogramada", "cambio_barbero", "cancelada", "completada", "no_asistio"
+]
+
+
+class ReservaAuditoriaOut(BaseModel):
+    """
+    Una fila de la bitácora de una reserva. Solo lectura: no hay
+    ReservaAuditoriaIn ni endpoint de escritura manual — cada fila la genera
+    el propio backend cuando procesa el evento correspondiente.
+    """
+
+    id: UUID
+    tenant_id: UUID
+    reserva_id: UUID
+    evento: EventoAuditoria
+    estado_anterior: EstadoReserva | None
+    estado_nuevo: EstadoReserva
+    motivo: str | None
+    datos_anteriores: dict | None
+    datos_nuevos: dict | None
+    origen: Literal["portal", "n8n"]
+    actor: str
+    actor_portal_user_id: UUID | None
+    actor_user_id: UUID | None
+    proveedor_nombre: str
+    servicio_nombre: str
+    cliente_nombre: str | None
+    creado_en: datetime
+
+
+class ReemplazarHorariosOut(BaseModel):
+    """
+    `reservas_en_conflicto` no se cancela ni se toca: son citas futuras que
+    quedaron fuera del horario nuevo. Guardar el horario nunca falla por
+    esto — se avisa para que gerencia decida (avisar al cliente,
+    reprogramar a mano, o revertir el cambio), no se decide por ella.
+    """
+
+    horarios: list[HorarioSemanalOut]
+    reservas_en_conflicto: list[ReservaOut]
+
+
+# ---- Calendarios: llamadas de n8n (routers/eventos.py) ----
+class ConsultarDisponibilidadIn(BaseModel):
+    tenant_id: UUID
+    servicio_id: UUID
+    proveedor_id: UUID | None = None
+    fecha_desde: date
+    fecha_hasta: date
+
+
+class SlotDisponibleOut(BaseModel):
+    proveedor_id: UUID
+    proveedor_nombre: str
+    hora_inicio: datetime
+    hora_fin: datetime
+
+
+class ConsultarDisponibilidadOut(BaseModel):
+    calendario_activo: bool
+    slots: list[SlotDisponibleOut]
+
+
+class CrearReservaEventoIn(BaseModel):
+    tenant_id: UUID
+    proveedor_id: UUID
+    servicio_id: UUID
+    hora_inicio: datetime
+    user_id: UUID | None = None
+    cliente_nombre: str | None = Field(default=None, max_length=255)
+    cliente_telefono: str | None = Field(default=None, max_length=50)
+    notas: str | None = Field(default=None, max_length=1000)
+    # Reintentos de n8n no deben crear una segunda reserva: mismo criterio
+    # que UsoTokensIn.idempotency_key.
+    idempotency_key: str | None = Field(default=None, max_length=120)
+
+    @model_validator(mode="after")
+    def identifica_al_cliente(self):
+        if self.user_id is None and not self.cliente_nombre:
+            raise ValueError("Falta user_id o cliente_nombre para identificar al cliente")
+        return self
+
+
+class CrearReservaEventoOut(BaseModel):
+    creado: bool
+    duplicado: bool = False
+    reserva: ReservaOut | None = None
+    # 'horario_ocupado' | 'fuera_de_horario' | 'proveedor_invalido' |
+    # 'servicio_invalido' | None
+    motivo_rechazo: str | None = None
+
+
+class CancelarReservaEventoIn(BaseModel):
+    tenant_id: UUID
+    reserva_id: UUID
+    motivo: str | None = Field(default=None, max_length=500)

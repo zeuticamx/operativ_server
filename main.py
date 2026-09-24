@@ -19,6 +19,7 @@ from routers import (
     agente,
     alertas,
     auth,
+    calendario,
     canales,
     clientes,
     conversaciones,
@@ -94,6 +95,11 @@ app.include_router(clientes.router, prefix="/api")
 app.include_router(visitas.router, prefix="/api")
 app.include_router(tareas.router, prefix="/api")
 app.include_router(reportes.router, prefix="/api")
+
+# Módulo de calendarios: reservas para barberías/salones. Independiente de
+# los dos módulos de arriba, aunque comparte el mismo patrón de flag en
+# tenant_servicios.
+app.include_router(calendario.router_calendario, prefix="/api")
 
 # Panel de plataforma: nivel gerencia (tabla gerencia_users), no el rol
 # owner de un tenant. Ve todos los negocios, así que no filtra por tenant.
