@@ -207,6 +207,20 @@ class MensajeOut(BaseModel):
     role: str
     content: str
     created_at: datetime
+    # Solo para role='human' (respuesta manual desde el portal): nombre o
+    # correo de quien la mandó. None para 'user'/'assistant'.
+    enviado_por: str | None = None
+
+
+class EnviarMensajeIn(BaseModel):
+    """Body de POST .../conversaciones/{id}/mensajes (respuesta manual)."""
+    texto: str = Field(min_length=1, max_length=4000)
+
+
+class ConversacionEstadoOut(BaseModel):
+    """Respuesta de POST .../conversaciones/{id}/volver-a-ia."""
+    id: UUID
+    status: str
 
 
 class ConversacionDetalleOut(BaseModel):
@@ -1651,3 +1665,24 @@ class CancelarReservaEventoIn(BaseModel):
     tenant_id: UUID
     reserva_id: UUID
     motivo: str | None = Field(default=None, max_length=500)
+
+
+class ConversacionTransferidaIn(BaseModel):
+    """
+    n8n llama esto justo después de que la herramienta `escalar_humano`
+    marca la conversación como 'transferred' en Postgres. Ese UPDATE por sí
+    solo no llega al portal en vivo -- el WebSocket lo dispara este proceso
+    (ver realtime.broadcast_alerta) -- así que sin esta llamada gerencia no
+    se entera hasta que entra a filtrar conversaciones por estado.
+    """
+
+    tenant_id: UUID
+    conversation_id: UUID
+    canal: str = Field(max_length=20)
+    motivo: str | None = Field(default=None, max_length=500)
+    cliente_nombre: str | None = Field(default=None, max_length=200)
+    cliente_telefono: str | None = Field(default=None, max_length=50)
+
+
+class ConversacionTransferidaOut(BaseModel):
+    registrado: bool

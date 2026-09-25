@@ -20,18 +20,25 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from config import settings
 from deps import UsuarioActual, gerencia_plataforma_actual
+from realtime import emit_conversacion_estado, emit_mensaje
 from schemas import (
     AlertaGerenciaOut,
     CohorteOut,
     CohortesOut,
+    ConversacionDetalleOut,
+    ConversacionEstadoOut,
+    ConversacionOut,
+    EnviarMensajeIn,
     GerenciaUsuarioIn,
     GerenciaUsuarioOut,
     ImpersonarIn,
     ImpersonarOut,
+    MensajeOut,
     ProblemaSaludOut,
     SaludOut,
 )
 from security import crear_token_impersonacion
+from services import conversaciones as conversaciones_svc
 from services.gerencia import registrar_auditoria
 from services.gerencia_salud import problemas_de_salud
 from session import fetch_all, fetch_value, transaccion
@@ -429,3 +436,97 @@ async def impersonar(
         email_usuario=usuario["email"],
         tenant_nombre=tenant_nombre,
     )
+
+
+# ============================================================
+# Conversaciones de un tenant (handoff humano)
+# ============================================================
+# Mismo servicio que routers/conversaciones.py, pero con el tenant_id
+# explícito en la ruta en vez de tomarlo de tenant_actual — es lo que le
+# permite a gerencia de plataforma "filtrar por tenant_id" sin pasar por la
+# impersonación de solo lectura (que además bloquea cualquier POST).
+@router.get(
+    "/tenants/{tenant_id}/conversaciones",
+    response_model=list[ConversacionOut],
+)
+async def listar_conversaciones_tenant(
+    tenant_id: UUID,
+    canal: str | None = Query(None),
+    estado: str | None = Query(None),
+    buscar: str | None = Query(None, max_length=100),
+    limite: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    filas = await conversaciones_svc.listar(tenant_id, canal, estado, buscar, limite, offset)
+    return [ConversacionOut(**dict(f)) for f in filas]
+
+
+@router.get(
+    "/tenants/{tenant_id}/conversaciones/{conversacion_id}",
+    response_model=ConversacionDetalleOut,
+)
+async def detalle_conversacion_tenant(tenant_id: UUID, conversacion_id: UUID):
+    cab, mensajes = await conversaciones_svc.detalle(tenant_id, conversacion_id)
+    if cab is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversación no encontrada",
+        )
+    return ConversacionDetalleOut(
+        **dict(cab),
+        mensajes=[MensajeOut(**dict(m)) for m in mensajes],
+    )
+
+
+@router.post(
+    "/tenants/{tenant_id}/conversaciones/{conversacion_id}/mensajes",
+    response_model=MensajeOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def enviar_mensaje_conversacion_tenant(
+    tenant_id: UUID,
+    conversacion_id: UUID,
+    datos: EnviarMensajeIn,
+    gerente: UsuarioActual = Depends(gerencia_plataforma_actual),
+):
+    # Sin transaccion() compartida a propósito: enviar_mensaje_humano ya le
+    # pega a la API de Meta (un efecto que no se puede revertir con un
+    # ROLLBACK), así que envolver esto en una sola transacción de BD no
+    # daría atomicidad de verdad. registrar_auditoria queda como constancia
+    # de que el envío ya ocurrió, no como parte de "la misma operación".
+    fila = await conversaciones_svc.enviar_mensaje_humano(
+        tenant_id, conversacion_id, datos.texto, gerente.id
+    )
+    await registrar_auditoria(
+        actor_email=gerente.email,
+        actor_portal_user_id=gerente.id,
+        accion="mensaje_manual_gerencia",
+        tenant_id=tenant_id,
+        detalle={"conversation_id": str(conversacion_id)},
+    )
+
+    mensaje = MensajeOut(**dict(fila), enviado_por=gerente.email)
+    await emit_mensaje(tenant_id, conversacion_id, mensaje.model_dump(mode="json"))
+    return mensaje
+
+
+@router.post(
+    "/tenants/{tenant_id}/conversaciones/{conversacion_id}/volver-a-ia",
+    response_model=ConversacionEstadoOut,
+)
+async def volver_a_ia_conversacion_tenant(
+    tenant_id: UUID,
+    conversacion_id: UUID,
+    gerente: UsuarioActual = Depends(gerencia_plataforma_actual),
+):
+    fila = await conversaciones_svc.volver_a_ia(tenant_id, conversacion_id)
+    await registrar_auditoria(
+        actor_email=gerente.email,
+        actor_portal_user_id=gerente.id,
+        accion="volver_a_ia_gerencia",
+        tenant_id=tenant_id,
+        detalle={"conversation_id": str(conversacion_id)},
+    )
+
+    await emit_conversacion_estado(tenant_id, conversacion_id, fila["status"])
+    return ConversacionEstadoOut(**dict(fila))

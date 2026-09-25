@@ -331,6 +331,24 @@ async def proveedores_activos(
     return [Proveedor.desde_fila(f) for f in filas]
 
 
+async def servicios_activos(
+    tenant_id: UUID, conn: Optional[asyncpg.Connection] = None
+) -> list[Servicio]:
+    """
+    Catálogo que el agente de n8n puede ofrecer por chat -- mismo criterio
+    que proveedores_activos: solo lo que hoy se puede reservar, nunca lo
+    desactivado (gerencia lo apagó a propósito, ver ServicioActualizarIn).
+    """
+    sql = """
+        SELECT id, tenant_id, nombre, duracion_minutos, precio, activo, creado_en
+        FROM servicios
+        WHERE tenant_id = $1 AND activo = true
+        ORDER BY nombre
+    """
+    filas = await (conn.fetch(sql, tenant_id) if conn is not None else fetch_all(sql, tenant_id))
+    return [Servicio.desde_fila(f) for f in filas]
+
+
 # ============================================================
 # Disponibilidad
 # ============================================================

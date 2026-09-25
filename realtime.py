@@ -51,6 +51,10 @@ sio = socketio.AsyncServer(
 _conexiones: dict[str, UUID] = {}
 # sids de sesiones "ver como": reciben alertas, no pueden marcarlas leídas.
 _solo_lectura: set[str] = set()
+# sids de gerencia de plataforma (tabla gerencia_users): son los únicos que
+# pueden pedir, con `ver_tenant`, sumarse a la room de un tenant que no es
+# el suyo — ver el panel de /gerencia/conversaciones.
+_gerencia_plataforma: set[str] = set()
 
 
 def _sala(tenant_id: UUID) -> str:
@@ -84,10 +88,23 @@ async def _usuario_desde_token(token: str) -> Optional[dict]:
         return None
 
     fila = await fetch_one(
-        "SELECT id, tenant_id, role, is_active FROM portal_users WHERE id = $1",
+        """
+        SELECT pu.id, pu.tenant_id, pu.role, pu.is_active,
+               (gu.id IS NOT NULL) AS es_gerencia_plataforma
+        FROM portal_users pu
+        LEFT JOIN gerencia_users gu ON LOWER(gu.email) = LOWER(pu.email)
+        WHERE pu.id = $1
+        """,
         UUID(payload["sub"]),
     )
-    if fila is None or not fila["is_active"] or fila["tenant_id"] is None:
+    # tenant_id nulo se acepta solo para gerencia de plataforma (staff de
+    # OperativAI sin negocio propio en el portal): no tienen room de origen,
+    # pero igual necesitan la conexión para pedir `ver_tenant` sobre el
+    # negocio que estén mirando. Para cualquier otro caso (alta sin
+    # terminar), sin tenant no hay nada que escuchar.
+    if fila is None or not fila["is_active"]:
+        return None
+    if fila["tenant_id"] is None and not fila["es_gerencia_plataforma"]:
         return None
 
     # Sesión de "ver como" de plataforma: puede escuchar las alertas del
@@ -123,9 +140,19 @@ async def connect(sid: str, environ: dict, auth: Optional[dict] = None) -> None:
         raise socketio.exceptions.ConnectionRefusedError("Token inválido o usuario inactivo")
 
     tenant_id = usuario["tenant_id"]
-    _conexiones[sid] = tenant_id
     if usuario["solo_lectura"]:
         _solo_lectura.add(sid)
+    if usuario["es_gerencia_plataforma"]:
+        _gerencia_plataforma.add(sid)
+
+    # Gerencia de plataforma sin negocio propio (tenant_id nulo): la
+    # conexión se acepta igual, pero no hay room de origen a la que sumarse
+    # ni alertas propias que mandarle — se queda esperando un `ver_tenant`.
+    if tenant_id is None:
+        logger.info("WS conectado: sid=%s (gerencia de plataforma, sin tenant propio)", sid)
+        return
+
+    _conexiones[sid] = tenant_id
     await sio.enter_room(sid, _sala(tenant_id))
     logger.info("WS conectado: sid=%s tenant=%s role=%s", sid, tenant_id, usuario["role"])
 
@@ -148,7 +175,37 @@ async def connect(sid: str, environ: dict, auth: Optional[dict] = None) -> None:
 async def disconnect(sid: str) -> None:
     tenant_id = _conexiones.pop(sid, None)
     _solo_lectura.discard(sid)
+    _gerencia_plataforma.discard(sid)
     logger.info("WS desconectado: sid=%s tenant=%s", sid, tenant_id)
+
+
+@sio.event
+async def ver_tenant(sid: str, data: Optional[dict]) -> None:
+    """
+    Gerencia de plataforma pidiendo sumarse a la room de un tenant que no
+    es el suyo, para ver en vivo la conversación que está mirando en
+    /gerencia/conversaciones. Se ignora para cualquier sid que no haya
+    quedado marcado como gerencia de plataforma en `connect` — la
+    membresía a una room ajena no depende de lo que mande el cliente, sino
+    de lo que ya validó el JWT.
+    """
+    if sid not in _gerencia_plataforma:
+        return
+    tenant_id = (data or {}).get("tenant_id")
+    if not tenant_id:
+        return
+    await sio.enter_room(sid, _sala(UUID(tenant_id)))
+
+
+@sio.event
+async def dejar_tenant(sid: str, data: Optional[dict]) -> None:
+    """Contraparte de `ver_tenant`, al cerrar esa conversación."""
+    if sid not in _gerencia_plataforma:
+        return
+    tenant_id = (data or {}).get("tenant_id")
+    if not tenant_id:
+        return
+    await sio.leave_room(sid, _sala(UUID(tenant_id)))
 
 
 @sio.event
@@ -202,5 +259,28 @@ async def broadcast_alerta(
             "leido": alerta.leido,
             "creado_en": alerta.creado_en.isoformat(),
         },
+        room=_sala(tenant_id),
+    )
+
+
+async def emit_mensaje(tenant_id: UUID, conversation_id: UUID, mensaje: dict[str, Any]) -> None:
+    """
+    Empuja un mensaje nuevo (respuesta manual de handoff) a quien tenga
+    abierta esa conversación. A diferencia de `broadcast_alerta`, esto no
+    toca la tabla `alertas`: es un evento de UI en vivo, no una notificación
+    persistente que alguien tenga que marcar leída.
+    """
+    await sio.emit(
+        "mensaje_nuevo",
+        {"conversation_id": str(conversation_id), **mensaje},
+        room=_sala(tenant_id),
+    )
+
+
+async def emit_conversacion_estado(tenant_id: UUID, conversation_id: UUID, status: str) -> None:
+    """Avisa que una conversación pasó de/a 'transferred' (handoff)."""
+    await sio.emit(
+        "conversacion_actualizada",
+        {"conversation_id": str(conversation_id), "status": status},
         room=_sala(tenant_id),
     )

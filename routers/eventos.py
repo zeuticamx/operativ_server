@@ -16,7 +16,7 @@ from typing import Any, Optional
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from services.acceso_pagos import acceso_pagos
 from services.asignacion import asignar_vendedor_automatico
@@ -31,11 +31,15 @@ from schemas import (
     CancelarReservaEventoIn,
     ConsultarDisponibilidadIn,
     ConsultarDisponibilidadOut,
+    ConversacionTransferidaIn,
+    ConversacionTransferidaOut,
     CrearReservaEventoIn,
     CrearReservaEventoOut,
     MensajeEntranteIn,
     MensajeEntranteOut,
+    ProveedorOut,
     ReservaOut,
+    ServicioOut,
     SlotDisponibleOut,
     UsoTokensIn,
     UsoTokensOut,
@@ -177,8 +181,58 @@ async def uso_tokens(datos: UsoTokensIn):
 
 
 # ============================================================
-# Calendarios: disponibilidad y reservas para el agente de n8n
+# Handoff a humano
 # ============================================================
+@router.post("/conversacion-transferida", response_model=ConversacionTransferidaOut)
+async def conversacion_transferida(datos: ConversacionTransferidaIn):
+    """
+    n8n llama esto justo después de que `escalar_humano` marca la
+    conversación como 'transferred' en Postgres (workflow escalar-humano).
+
+    Ese UPDATE por sí solo es invisible para gerencia: el WebSocket en vivo
+    solo lo dispara este proceso corriendo (ver realtime.broadcast_alerta),
+    así que sin esta llamada nadie se entera hasta que alguien entra al
+    portal a filtrar conversaciones por estado a mano.
+    """
+    detalle = [f"{datos.cliente_nombre or 'Un cliente'} pidió hablar con alguien del equipo por {datos.canal}"]
+    if datos.motivo:
+        detalle.append(f"— {datos.motivo}")
+
+    await broadcast_alerta(
+        datos.tenant_id,
+        "conversacion_transferida",
+        "Cliente esperando atención humana",
+        " ".join(detalle),
+        datos={
+            "conversation_id": str(datos.conversation_id),
+            "canal": datos.canal,
+        },
+    )
+    return ConversacionTransferidaOut(registrado=True)
+
+
+# ============================================================
+# Calendarios: catálogo, disponibilidad y reservas para el agente de n8n
+# ============================================================
+@router.get("/calendario/servicios", response_model=list[ServicioOut])
+async def calendario_servicios(tenant_id: UUID = Query(...)):
+    """
+    Catálogo de servicios que el agente puede ofrecer por chat. Solo
+    activos -- mismo criterio que /calendario/proveedores.
+    """
+    await verificar_calendario_activo(tenant_id)
+    servicios = await calendario.servicios_activos(tenant_id)
+    return [ServicioOut(**vars(s)) for s in servicios]
+
+
+@router.get("/calendario/proveedores", response_model=list[ProveedorOut])
+async def calendario_proveedores(tenant_id: UUID = Query(...)):
+    """Proveedores (barberos/estilistas) activos, para que el agente ofrezca a cuál agendar."""
+    await verificar_calendario_activo(tenant_id)
+    proveedores = await calendario.proveedores_activos(tenant_id)
+    return [ProveedorOut(**vars(p)) for p in proveedores]
+
+
 @router.post("/calendario/disponibilidad", response_model=ConsultarDisponibilidadOut)
 async def calendario_disponibilidad(datos: ConsultarDisponibilidadIn):
     """

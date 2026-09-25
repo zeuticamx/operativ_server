@@ -2,15 +2,17 @@
 Envío de WhatsApp, agnóstico de proveedor (patrón Adapter/Strategy).
 
 Hoy el proveedor activo es Kontesta (`KontestaProvider`), porque la app de
-Meta todavía no tiene Acceso Avanzado aprobado en App Review. `MetaProvider`
-es el destino final: un stub vacío, listo para completarse el día que se
-apruebe, sin que routers ni jobs tengan que cambiar una sola línea — solo
-`WHATSAPP_PROVIDER=meta` en el entorno.
+Meta todavía no tiene Acceso Avanzado aprobado en App Review. `NeuroApiProvider`
+es una alternativa lista para usar contra NeuroAPI/NeuroChat (WhatsApp Cloud
+API oficial vía BSP). `MetaProvider` es el destino final: un stub vacío,
+listo para completarse el día que se apruebe Acceso Avanzado, sin que
+routers ni jobs tengan que cambiar una sola línea — solo `WHATSAPP_PROVIDER`
+en el entorno.
 
 Todo el código de negocio debe depender únicamente de `ProveedorWhatsApp`
-(vía `obtener_proveedor()`), nunca de `KontestaProvider` ni de `httpx`
-directamente. Eso es lo que hace que cambiar de proveedor sea un cambio de
-variable de entorno y no una migración de código.
+(vía `obtener_proveedor()`), nunca de `KontestaProvider`, `NeuroApiProvider`
+ni de `httpx` directamente. Eso es lo que hace que cambiar de proveedor sea
+un cambio de variable de entorno y no una migración de código.
 """
 
 from __future__ import annotations
@@ -263,6 +265,146 @@ class KontestaProvider(ProveedorWhatsApp):
 
 
 # ============================================================
+# NeuroAPI (NeuroChat) — BSP sobre WhatsApp Cloud API oficial
+# ============================================================
+class NeuroApiProvider(ProveedorWhatsApp):
+    """
+    Implementación contra la API REST de NeuroAPI (NeuroChat), un BSP sobre
+    la WhatsApp Cloud API oficial de Meta.
+
+    A diferencia de Kontesta, NeuroAPI no expone un endpoint por
+    conversación: todo se manda a un único `POST /messaging/send` con el
+    teléfono destino (`to`) y un `type` ("text" | "template" | ...). Por eso
+    `enviar_mensaje` recibe en `conversation_id` directamente el teléfono
+    del contacto en formato E.164 (sin '+'), no un id de conversación del
+    proveedor — es la única implementación de `ProveedorWhatsApp` donde ese
+    parámetro no es un id propio del proveedor, precisamente porque NeuroAPI
+    no tiene ese concepto.
+
+    Aplica la misma regla de Meta que documenta el resto del código: texto
+    libre solo dentro de la ventana de 24h desde el último mensaje del
+    cliente; fuera de ella, Meta exige `enviar_plantilla` con una plantilla
+    aprobada (si no, responde 500 NEUROAPI_SEND_ERROR / error 131047 de
+    Graph API).
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        webhook_secret: str,
+        base_url: str,
+        phone_number_id: str = "",
+    ):
+        self._api_key = api_key
+        self._webhook_secret = webhook_secret
+        self._base_url = base_url.rstrip("/")
+        self._phone_number_id = phone_number_id
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "x-api-key": self._api_key,
+            "Content-Type": "application/json",
+        }
+
+    async def _post(self, cuerpo: dict[str, Any]) -> dict[str, Any]:
+        if not self._api_key:
+            raise ProveedorWhatsAppError(
+                "NEUROAPI_API_KEY sin configurar", status_code=None
+            )
+        if self._phone_number_id:
+            cuerpo = {**cuerpo, "from_phone_number_id": self._phone_number_id}
+
+        url = f"{self._base_url}/neuroapi/messaging/send"
+        async with httpx.AsyncClient(timeout=20) as cliente:
+            try:
+                r = await cliente.post(url, json=cuerpo, headers=self._headers())
+            except httpx.RequestError as e:
+                raise ProveedorWhatsAppError(f"No se pudo contactar a NeuroAPI: {e}") from e
+
+        if r.status_code >= 400:
+            log.warning("NeuroAPI messaging/send -> %s: %s", r.status_code, r.text[:500])
+            raise ProveedorWhatsAppError(
+                f"NeuroAPI respondió {r.status_code}", status_code=r.status_code
+            )
+        try:
+            return r.json()
+        except ValueError:
+            return {}
+
+    @staticmethod
+    def _a_resultado(data: dict[str, Any]) -> ResultadoEnvio:
+        # Contrato documentado: {"success": true, "data": {"message_id": ...,
+        # "status": ...}}. Se cae a la raíz del payload si algún día cambia
+        # la forma, en vez de reventar con un KeyError.
+        cuerpo = data.get("data") if isinstance(data.get("data"), dict) else data
+        return ResultadoEnvio(
+            id_mensaje=str(cuerpo.get("message_id") or cuerpo.get("id") or ""),
+            estado=cuerpo.get("status"),
+            crudo=data,
+        )
+
+    async def enviar_mensaje(self, conversation_id: str, texto: str) -> ResultadoEnvio:
+        # Ver docstring de la clase: acá `conversation_id` es el teléfono
+        # E.164 del contacto, no un id de conversación de NeuroAPI.
+        data = await self._post(
+            {
+                "to": conversation_id,
+                "type": "text",
+                "text": {"body": texto, "preview_url": False},
+            }
+        )
+        return self._a_resultado(data)
+
+    async def enviar_plantilla(
+        self,
+        destinatario: str,
+        plantilla: str,
+        idioma: str = "es",
+        parametros: list[str] | None = None,
+    ) -> ResultadoEnvio:
+        cuerpo: dict[str, Any] = {
+            "to": destinatario,
+            "type": "template",
+            "template": {
+                "name": plantilla,
+                "language": {"code": idioma},
+            },
+        }
+        if parametros:
+            cuerpo["template"]["components"] = [
+                {
+                    "type": "body",
+                    "parameters": [{"type": "text", "text": p} for p in parametros],
+                }
+            ]
+
+        data = await self._post(cuerpo)
+        return self._a_resultado(data)
+
+    def verificar_webhook(self, cuerpo_crudo: bytes, headers: dict[str, str]) -> bool:
+        """
+        Firma esperada: cabecera `X-Hub-Signature-256: sha256=<hex>`, HMAC
+        sobre el cuerpo crudo del POST (antes de json.loads). Mismo esquema
+        que usa Meta directamente para sus webhooks.
+        """
+        if not self._webhook_secret:
+            log.warning("NEUROAPI_WEBHOOK_SECRET sin configurar: webhook rechazado")
+            return False
+
+        firma = headers.get("x-hub-signature-256") or headers.get("X-Hub-Signature-256")
+        if not firma or not firma.startswith("sha256="):
+            return False
+
+        recibido = firma[len("sha256=") :]
+        esperado = hmac.new(
+            self._webhook_secret.encode(), cuerpo_crudo, hashlib.sha256
+        ).hexdigest()
+
+        # compare_digest y no ==: comparación en tiempo constante.
+        return hmac.compare_digest(esperado, recibido)
+
+
+# ============================================================
 # Meta (stub — destino final, hoy sin usar)
 # ============================================================
 class MetaProvider(ProveedorWhatsApp):
@@ -302,6 +444,12 @@ _PROVEEDORES = {
         api_key=settings.KONTESTA_API_KEY,
         webhook_secret=settings.KONTESTA_WEBHOOK_SECRET,
         base_url=settings.KONTESTA_API_BASE_URL,
+    ),
+    "neuroapi": lambda: NeuroApiProvider(
+        api_key=settings.NEUROAPI_API_KEY,
+        webhook_secret=settings.NEUROAPI_WEBHOOK_SECRET,
+        base_url=settings.NEUROAPI_API_BASE_URL,
+        phone_number_id=settings.NEUROAPI_PHONE_NUMBER_ID,
     ),
     "meta": MetaProvider,
 }

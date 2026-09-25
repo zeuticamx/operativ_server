@@ -40,9 +40,11 @@ class Settings:
     META_REDIRECT_URI: str = os.getenv("META_REDIRECT_URI", "")
 
     # ---- WhatsApp (envío de mensajes, ver services/whatsapp.py) ----
-    # Proveedor activo detrás de ProveedorWhatsApp. Hoy "kontesta", mientras
-    # la app de Meta no tiene Acceso Avanzado aprobado en App Review; el día
-    # que se apruebe, pasar esto a "meta" no debería tocar ningún router.
+    # Proveedor activo detrás de ProveedorWhatsApp: "kontesta" | "neuroapi" |
+    # "meta". Hoy "kontesta", mientras la app de Meta no tiene Acceso
+    # Avanzado aprobado en App Review; "neuroapi" es una alternativa de BSP
+    # ya lista (NeuroApiProvider); el día que se apruebe Acceso Avanzado,
+    # pasar esto a "meta" no debería tocar ningún router.
     WHATSAPP_PROVIDER: str = os.getenv("WHATSAPP_PROVIDER", "kontesta")
 
     # ---- Kontesta ----
@@ -54,6 +56,23 @@ class Settings:
     # (X-Kontesta-Signature). Vacío = verificar_webhook() rechaza todo.
     # Mismo criterio de fallar cerrado que MERCADOPAGO_WEBHOOK_SECRET.
     KONTESTA_WEBHOOK_SECRET: str = os.getenv("KONTESTA_WEBHOOK_SECRET", "")
+
+    # ---- NeuroAPI (NeuroChat) ----
+    # API key generada en https://neurochat.com.ec/neuroapi/api-keys con el
+    # scope "whatsapp_cloud_api" activo. Va en la cabecera x-api-key de cada
+    # request server-to-server.
+    NEUROAPI_API_KEY: str = os.getenv("NEUROAPI_API_KEY", "")
+    NEUROAPI_API_BASE_URL: str = os.getenv(
+        "NEUROAPI_API_BASE_URL", "https://api.neurochat.com.ec/api/v1"
+    ).rstrip("/")
+    # Secreto para validar la firma HMAC-SHA256 de los webhooks entrantes
+    # (cabecera X-Hub-Signature-256: "sha256=..."). Vacío = verificar_webhook()
+    # rechaza todo.
+    NEUROAPI_WEBHOOK_SECRET: str = os.getenv("NEUROAPI_WEBHOOK_SECRET", "")
+    # phone_number_id de Meta a usar como remitente en cuentas multi-número.
+    # Opcional: si queda vacío, NeuroAPI usa el primer número activo de la
+    # cuenta.
+    NEUROAPI_PHONE_NUMBER_ID: str = os.getenv("NEUROAPI_PHONE_NUMBER_ID", "")
 
     # ---- Google (cuenta de servicio compartida, para Sheets/Docs) ----
     GOOGLE_SERVICE_ACCOUNT_JSON: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
@@ -244,6 +263,11 @@ class Settings:
         return bool(self.KONTESTA_API_KEY)
 
     @property
+    def neuroapi_configurado(self) -> bool:
+        """Sin API key no se puede autenticar ninguna llamada a NeuroAPI."""
+        return bool(self.NEUROAPI_API_KEY)
+
+    @property
     def moneda_cobro(self) -> str:
         """Moneda en la que se cobran los planes, según la pasarela activa."""
         if self.mercadopago_activo:
@@ -361,6 +385,18 @@ class Settings:
                     "KONTESTA_WEBHOOK_SECRET sin configurar: "
                     "verificar_webhook() va a rechazar todos los webhooks "
                     "entrantes de Kontesta."
+                )
+
+        if self.WHATSAPP_PROVIDER == "neuroapi" and not self.neuroapi_configurado:
+            logging.getLogger("operativai.config").warning(
+                "NEUROAPI_API_KEY sin configurar: los envíos de WhatsApp vía "
+                "NeuroAPI van a fallar."
+            )
+            if not self.NEUROAPI_WEBHOOK_SECRET:
+                logging.getLogger("operativai.config").warning(
+                    "NEUROAPI_WEBHOOK_SECRET sin configurar: "
+                    "verificar_webhook() va a rechazar todos los webhooks "
+                    "entrantes de NeuroAPI."
                 )
 
         # Tampoco se exige: el alta y el login con correo siguen funcionando

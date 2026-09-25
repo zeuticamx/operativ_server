@@ -1,0 +1,16 @@
+-- ------------------------------------------------------------
+-- Handoff humano: respuesta manual + volver a IA.
+--
+-- `messages` es propiedad de n8n (lo escribe entrada-canal-universal), así
+-- que esta migración es deliberadamente la mínima posible: una sola columna
+-- aditiva y nullable, sin CHECK constraints sobre columnas que n8n ya
+-- escribe en producción (agregar una validación retroactiva ahí podría
+-- rechazar un INSERT en vivo con un valor que hoy nadie contempló).
+--
+-- sender_portal_user_id identifica qué portal_user mandó un mensaje
+-- role='human' (respuesta manual desde el portal, ver
+-- services/conversaciones.py::enviar_mensaje_humano). Queda NULL para los
+-- mensajes de siempre ('user'/'assistant'). n8n nunca la ve: sus queries a
+-- `messages` listan columnas explícitas, no `SELECT *`.
+-- ------------------------------------------------------------
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_portal_user_id UUID REFERENCES portal_users(id);

@@ -168,7 +168,32 @@ GET    /api/agente/modelos   Lista blanca de modelos
 GET    /api/conversaciones                Listado con filtros
 GET    /api/conversaciones/metricas
 GET    /api/conversaciones/{id}           Detalle con mensajes
+POST   /api/conversaciones/{id}/mensajes       Respuesta manual (handoff humano)
+POST   /api/conversaciones/{id}/volver-a-ia    Le devuelve el control a la IA
 ```
+
+Gerencia de plataforma tiene los mismos dos últimos (más los dos GET) bajo
+`/api/gerencia/tenants/{tenant_id}/conversaciones/...`, con el `tenant_id`
+explícito en la ruta en vez de salir del JWT de quien llama — es lo que le
+permite "filtrar por tenant_id" sin pasar por la impersonación de solo
+lectura (`/gerencia/tenants/{id}/impersonar`), que bloquea cualquier POST a
+propósito.
+
+**Excepción deliberada a la regla del CLAUDE.md raíz** ("el backend solo
+posee sus propias tablas; nunca toca directamente tablas propiedad de
+n8n"): `enviar_mensaje_humano` y `volver_a_ia` (`services/conversaciones.py`)
+sí escriben en
+`conversations`/`messages`. Es segura porque `entrada-canal-universal`
+(el workflow que de verdad conversa con el cliente) ya relee
+`conversations.status` en cada mensaje entrante y ya suprime la IA
+mientras vale `'transferred'` — el backend solo pone ese valor en
+`'active'` otra vez; no hace falta coordinar nada más con n8n. El envío
+real al cliente (WhatsApp/Instagram/Facebook) replica el mismo mecanismo
+que usa ese workflow (`get_channel_credentials` + Graph API directo), no
+`services/whatsapp.py` (Kontesta): ese proveedor no es el que de verdad
+entrega los mensajes de la conversación con IA, así que una respuesta
+manual que lo usara le llegaría al cliente por un canal distinto al que
+ya tiene abierto.
 
 ### Gestión de vendedores (mini-CRM)
 
@@ -639,4 +664,7 @@ Se puede desarrollar y probar todo hoy con las páginas propias.
   cierre del todo la carrera que hoy solo cubre un SELECT previo — es tabla
   del lado de n8n, así que le toca a quien sea dueño de ese esquema. El
   alta nativa de Meta (Embedded Signup) sigue siendo otro flujo, para
-  cuando se migre a `MetaProvider`.
+  cuando se migre a `MetaProvider`. `WHATSAPP_PROVIDER=neuroapi`
+  (`NeuroApiProvider`) es una tercera opción ya implementada contra el BSP
+  NeuroAPI/NeuroChat, con el mismo alcance y las mismas limitaciones que
+  Kontesta hasta que se decida cuál usar en producción.

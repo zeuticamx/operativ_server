@@ -119,4 +119,5 @@ async def salud():
 # FastAPI: /socket.io/* lo atiende python-socketio, todo lo demás sigue
 # yendo a `app` sin cambios. Ver realtime.py para la autenticación y los
 # eventos.
+
 socket_app = socketio.ASGIApp(sio, other_asgi_app=app, socketio_path="socket.io")

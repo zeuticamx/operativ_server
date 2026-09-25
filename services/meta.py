@@ -195,6 +195,30 @@ async def desuscribir_app_de_pagina(page_id: str, page_token: str) -> None:
         _revisar_error(data)
 
 
+# ============================================================
+# Envío de mensajes (handoff humano)
+# ============================================================
+async def enviar_texto(url: str, access_token: str, body: dict[str, Any]) -> dict:
+    """
+    POST genérico contra la Graph API para mandar un mensaje.
+
+    Mismo endpoint (`/{id}/messages`) y mismo shape de body que ya arma el
+    nodo "Prepara envio" de entrada-canal-universal para whatsapp/facebook/
+    instagram — quien llama a esto arma `url`/`body` igual que ese nodo, acá
+    solo se centraliza el POST + manejo de error, igual que ya existe para
+    los GET de este módulo.
+    """
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(
+            url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            json=body,
+        )
+        data = r.json()
+        _revisar_error(data)
+    return data
+
+
 def expira_en(segundos: int | None) -> datetime | None:
     if not segundos:
         return None
