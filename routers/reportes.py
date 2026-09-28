@@ -8,11 +8,16 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from deps import requiere_herramienta
 from services.crm import AccesoCRM, exigir_gerencia_crm
 from schemas import ActividadVendedorOut, ReporteActividadOut
 from session import fetch_all
 
-router = APIRouter(prefix="/reportes", tags=["crm"])
+router = APIRouter(
+    prefix="/reportes",
+    tags=["crm"],
+    dependencies=[Depends(requiere_herramienta("crm_campo"))],
+)
 
 # Ventana por defecto si no se pide un rango.
 DIAS_POR_DEFECTO = 30

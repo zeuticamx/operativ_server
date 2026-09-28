@@ -14,23 +14,31 @@ WhatsApp (hoy vía Kontesta, ver services/whatsapp.py):
   POST /canales/whatsapp/conectar solo registra qué línea es de qué tenant.
 """
 
+import logging
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from config import settings
-from deps import tenant_actual
+from deps import requiere_herramienta, tenant_actual
 from session import execute, fetch_all, fetch_one
 from schemas import (
     ActivarCanalesIn,
     CanalOut,
     ConectarMetaIn,
     ConectarWhatsAppIn,
+    IniciarNeuroApiConnectOut,
     PaginaDisponible,
 )
-from services import meta
+from services import meta, neuroapi_connect
 
-router = APIRouter(prefix="/canales", tags=["canales"])
+log = logging.getLogger("operativai.canales")
+
+router = APIRouter(
+    prefix="/canales",
+    tags=["canales"],
+    dependencies=[Depends(requiere_herramienta("agente"))],
+)
 
 
 # ============================================================
@@ -284,6 +292,46 @@ async def conectar_whatsapp(
     )
 
     return {"conectado": True, "phone_number_id": datos.phone_number_id}
+
+
+# ============================================================
+# WhatsApp (vía NeuroAPI Connect Sessions — Embedded Signup)
+# ============================================================
+@router.post("/whatsapp/neuroapi/iniciar", response_model=IniciarNeuroApiConnectOut)
+async def iniciar_neuroapi_connect(tenant_id: UUID = Depends(tenant_actual)):
+    """
+    Crea una NeuroAPI Connect Session y devuelve la URL a la que el frontend
+    debe redirigir para que el negocio autorice su propia cuenta de WhatsApp
+    Business (Embedded Signup de Meta, mediado por NeuroAPI). El resultado
+    real de la vinculación llega después, por el webhook de
+    /whatsapp/neuroapi/webhook — acá solo se abre el trámite.
+    """
+    if not settings.neuroapi_connect_configurado:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="La vinculación automática de WhatsApp no está configurada",
+        )
+
+    datos = await neuroapi_connect.crear_connect_session(tenant_id)
+    connect_url = datos.get("url") or datos.get("connect_url")
+    session_id = datos.get("session_id") or datos.get("id")
+    if not connect_url or not session_id:
+        log.error(
+            "Respuesta de NeuroAPI sin los campos esperados (tenant=%s): %s",
+            tenant_id, datos,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="NeuroAPI no devolvió una sesión válida",
+        )
+
+    await execute(
+        "INSERT INTO neuroapi_connect_sessions (tenant_id, session_id) VALUES ($1, $2)",
+        tenant_id,
+        session_id,
+    )
+
+    return IniciarNeuroApiConnectOut(connect_url=connect_url)
 
 
 # ============================================================

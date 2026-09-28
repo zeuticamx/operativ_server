@@ -21,6 +21,7 @@ from routers import (
     auth,
     calendario,
     canales,
+    canales_neuroapi_webhook,
     clientes,
     conversaciones,
     eventos,
@@ -68,6 +69,10 @@ app.add_middleware(
 
 app.include_router(auth.router, prefix="/api")
 app.include_router(canales.router, prefix="/api")
+# Alta de WhatsApp vía NeuroAPI Connect Sessions: el único endpoint del
+# módulo de canales sin JWT, autenticado por firma HMAC (ver comentario del
+# bloque de cobros más abajo, mismo criterio).
+app.include_router(canales_neuroapi_webhook.router, prefix="/api")
 app.include_router(agente.router, prefix="/api")
 app.include_router(conversaciones.router, prefix="/api")
 app.include_router(herramientas.router, prefix="/api")

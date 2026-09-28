@@ -220,7 +220,7 @@ async def calendario_servicios(tenant_id: UUID = Query(...)):
     Catálogo de servicios que el agente puede ofrecer por chat. Solo
     activos -- mismo criterio que /calendario/proveedores.
     """
-    await verificar_calendario_activo(tenant_id)
+    await verificar_calendario_activo(tenant_id, desde_chat=True)
     servicios = await calendario.servicios_activos(tenant_id)
     return [ServicioOut(**vars(s)) for s in servicios]
 
@@ -228,7 +228,7 @@ async def calendario_servicios(tenant_id: UUID = Query(...)):
 @router.get("/calendario/proveedores", response_model=list[ProveedorOut])
 async def calendario_proveedores(tenant_id: UUID = Query(...)):
     """Proveedores (barberos/estilistas) activos, para que el agente ofrezca a cuál agendar."""
-    await verificar_calendario_activo(tenant_id)
+    await verificar_calendario_activo(tenant_id, desde_chat=True)
     proveedores = await calendario.proveedores_activos(tenant_id)
     return [ProveedorOut(**vars(p)) for p in proveedores]
 
@@ -241,7 +241,7 @@ async def calendario_disponibilidad(datos: ConsultarDisponibilidadIn):
     Igual que el resto de este router, `tenant_id` viaja en el body (n8n no
     tiene sesión de portal para ponerlo en la ruta).
     """
-    await verificar_calendario_activo(datos.tenant_id)
+    await verificar_calendario_activo(datos.tenant_id, desde_chat=True)
     slots = await calendario.consultar_disponibilidad(
         datos.tenant_id,
         datos.servicio_id,
@@ -262,7 +262,7 @@ async def calendario_crear_reserva(datos: CrearReservaEventoIn):
     mismo `idempotency_key` no crea una segunda reserva, devuelve
     `duplicado=true` con la reserva que ya existía.
     """
-    await verificar_calendario_activo(datos.tenant_id)
+    await verificar_calendario_activo(datos.tenant_id, desde_chat=True)
 
     reserva, motivo = await calendario.crear_reserva(
         datos.tenant_id,
@@ -319,7 +319,7 @@ async def calendario_crear_reserva(datos: CrearReservaEventoIn):
 
 @router.post("/calendario/reservas/cancelar", response_model=ReservaOut)
 async def calendario_cancelar_reserva(datos: CancelarReservaEventoIn):
-    await verificar_calendario_activo(datos.tenant_id)
+    await verificar_calendario_activo(datos.tenant_id, desde_chat=True)
 
     reserva = await calendario.cancelar_reserva(
         datos.reserva_id, datos.tenant_id, datos.motivo, actor_desde_chat(None, None)

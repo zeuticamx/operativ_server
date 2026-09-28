@@ -481,11 +481,32 @@ los planes apagados.
 
 `nombre` es el identificador de la URL (`PATCH /gerencia/planes/{nombre}`),
 no `id`: es UNIQUE en la tabla y es lo único que el resto del sistema usa
-para referenciar un plan — `tenant_subscriptions.plan` lo guarda como texto
-plano, sin FK. Por eso **no se puede renombrar un plan** desde el endpoint
-de update: haría huérfanas las suscripciones que ya lo referencian sin que
-nada avise. Para "renombrar", dar de alta uno nuevo y apagar el viejo
-(`activo=false`) — apagarlo no toca a quien ya lo tiene contratado.
+para referenciar un plan — `tenant_subscriptions.plan` es **FK a
+`planes(nombre)`** desde `25_planes_herramientas.sql`. Antes era un `CHECK`
+con los tres nombres de fábrica, así que un plan creado desde el panel no se
+podía contratar; ahora cualquier plan dado de alta se puede contratar, y uno
+inexistente no. El nombre va de 2 a 50 caracteres (el largo de
+`tenant_subscriptions.plan`). El endpoint de update sigue sin permitir
+renombrar; para "renombrar", dar de alta uno nuevo y apagar el viejo
+(`activo=false`) — apagarlo no toca a quien ya lo tiene contratado, y la FK
+impide borrar un plan que alguien tiene.
+
+Cada plan dice además **qué herramientas del portal incluye** (ver "Control
+de acceso por plan" abajo): `agente_ia_activo`, `gestion_vendedores_activo`,
+`herramientas_activo`, `crm_campo_activo`, `calendario_activo`.
+
+**`precio_monthly`/`precio_annual` son sin IVA.** Es lo que se guarda, lo
+que se muestra en `/gerencia/planes` y en las tarjetas de `/suscripcion`, y
+lo que queda en `tenant_subscriptions.precio_monthly` al activar un plan
+(`activar_suscripcion`) — ese campo refleja el precio de catálogo, no lo que
+se cobró. El IVA (`config.settings.iva_tasa`, `IVA_TASA` en el entorno, 16%
+por defecto) se suma una sola vez, en `services/pagos.con_iva`, justo antes
+de cotizar una suscripción (`cotizar`) — ahí es donde nace el monto que ve
+`tenant_transactions.monto` y el que de verdad se le manda a la pasarela. Un
+paquete de créditos no pasa por `con_iva`: su precio se cobra tal cual.
+`GET /api/pagos/catalogo` manda `iva_tasa` junto con los planes para que el
+portal arme la leyenda "más IVA (16%)" con el número real, no un texto fijo
+que se pueda desincronizar de lo que se cobra.
 
 `PlanActualizarIn` es parcial: un campo en `null` significa "no tocar", no
 "borrar el valor" — mismo criterio que `CambiarServiciosTenantIn`. No hay
@@ -505,6 +526,57 @@ bloquea nada.
 `tenants` es de n8n, así que el estado vive en su propia tabla del portal
 (`tenant_estado_plataforma`) en vez de como columna — mismo criterio que
 `tenant_servicios`.
+
+### Control de acceso por plan
+
+`services/acceso_plan.py` decide qué **herramientas del portal** puede usar
+un negocio. No reemplaza a `acceso_pagos.py`: ese sigue decidiendo si el
+agente de n8n contesta (modelo híbrido, con créditos alcanza) y no cambió.
+
+| Herramienta | APIs | starter | pro | enterprise |
+|---|---|---|---|---|
+| `agente` | `/agente`, `/conversaciones`, `/canales` | ✓ | ✓ | ✓ |
+| `vendedores` | `/vendedores`, `/pipeline`, `/tenants/{id}/pipeline…`, `pipeline-config` | ✓ | ✓ | ✓ |
+| `herramientas` | `/herramientas` | — | ✓ | ✓ |
+| `crm_campo` | `/clientes`, `/visitas`, `/tareas`, `/reportes` | — | ✓ | ✓ |
+| `calendario` | `/tenants/{id}/calendario/…` | — | ✓ | ✓ |
+
+La matriz vive en la tabla `planes` y se edita desde `/gerencia/planes`.
+
+| Estado de la cuenta | Qué puede usar |
+|---|---|
+| suscripción `activa` | lo que incluya su plan |
+| `pausada` / `cancelada` / nunca contrató | nada — los créditos **no** dan herramientas |
+| `tenant_estado_plataforma = 'prueba'` | todo (piloto, demos, desarrollo) |
+| `suspendido` / `baja` | nada, aunque el plan esté al día |
+
+Un tenant que nunca contrató **queda bloqueado en el portal** (el agente de
+n8n sigue contestando igual). Para un negocio de demo o desarrollo, ponerlo
+en `prueba` desde `/gerencia/tenants/{id}/estado`.
+
+Todo rechazo es **402** con `detail` estructurado — `codigo`
+(`plan_insuficiente` | `plan_requerido` | `cuenta_suspendida`),
+`herramienta`, `estado`, `plan_actual`, `planes_que_la_incluyen`, `mensaje`.
+No 403, que ya significa "tu rol no puede". Dónde se aplica:
+
+- `deps.requiere_herramienta(...)` como dependency de router (agente,
+  conversaciones, canales, herramientas, CRM de campo). `conversaciones`
+  lleva `lectura_sin_plan=True`: con el plan vencido los GET pasan (el
+  historial es del negocio); contestar o devolver a la IA, no.
+- `_exigir_modulo` (vendedores) y `verificar_calendario_activo`: el **409**
+  de módulo apagado sigue yendo antes que el 402. Las rutas de calendario
+  de n8n (`/eventos/calendario/*`) usan `desde_chat=True` y conservan el gate
+  de pagos de siempre.
+- `PATCH /tenants/{id}/servicios`: el dueño no puede **encender** un módulo
+  que su plan no incluye (apagarlo siempre puede). El de plataforma
+  (`/gerencia/tenants/{id}/servicios`) no pasa por acá.
+
+`GET /pagos/acceso` (nunca 402) devuelve el estado, las herramientas
+permitidas y la matriz de los planes contratables; con eso el portal pone el
+candado en el menú y la vista de mejora de plan.
+
+Los tests de módulos que no prueban el cobro (calendario, reportes, canales)
+activan el fixture `plan_enterprise` de `conftest.py`.
 
 **Ojo con `SQL_AGENTE_OPERANDO`** (routers/gerencia.py): es el gate de
 pagos escrito en SQL para resolver la página entera de una vez en lugar de

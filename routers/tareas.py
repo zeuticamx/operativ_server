@@ -11,11 +11,16 @@ from uuid import UUID
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from deps import requiere_herramienta
 from services.crm import AccesoCRM, acceso_crm, cargar_cliente, vendedor_del_tenant
 from schemas import TareaActualizarIn, TareaCrearIn, TareaOut
 from session import conexion, fetch_all, transaccion
 
-router = APIRouter(prefix="/tareas", tags=["crm"])
+router = APIRouter(
+    prefix="/tareas",
+    tags=["crm"],
+    dependencies=[Depends(requiere_herramienta("crm_campo"))],
+)
 
 SELECT_TAREA = """
     SELECT

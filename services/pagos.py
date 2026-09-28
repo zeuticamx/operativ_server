@@ -22,12 +22,13 @@ Dos reglas que valen para todo el módulo:
 
 import logging
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from uuid import UUID
 
 import asyncpg
 from fastapi import HTTPException, status
 
+from config import settings
 from schemas import CrearPagoIn
 from session import execute, fetch_one, transaccion
 
@@ -39,11 +40,31 @@ log = logging.getLogger("operativai.pagos")
 DIAS_CICLO = 30
 
 
+def con_iva(monto: Decimal) -> Decimal:
+    """
+    Suma el IVA (config.settings.iva_tasa, 16% por defecto) y redondea a
+    centavos. ROUND_HALF_UP y no el bankers' rounding de Decimal por
+    defecto: es como se redondean los cobros, no un cálculo contable.
+
+    `planes.precio_monthly`/`precio_annual` se guardan y se muestran SIN
+    IVA (ver PlanOut y la leyenda "más IVA (16%)" en /suscripcion); esto es
+    lo único que lo agrega, justo antes de cotizar lo que se le manda a la
+    pasarela. `tenant_subscriptions.precio_monthly` (activar_suscripcion)
+    sigue guardando el precio de catálogo, sin IVA — es el precio del plan,
+    no el cobro.
+    """
+    return (monto * (1 + settings.iva_tasa)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
 async def cotizar(datos: CrearPagoIn) -> tuple[Decimal, str]:
     """
     Traduce "qué quiere comprar" a (monto, concepto), leyendo el precio de
     la base. Un plan o un paquete que no exista (o esté dado de baja) es un
     404 y no un cobro por un monto inventado.
+
+    Solo la suscripción lleva IVA acá: es lo único que el catálogo muestra
+    sin él (ver con_iva). Los créditos se cotizan y se muestran al mismo
+    precio, sin ese ajuste.
     """
     if datos.tipo == "subscription":
         fila = await fetch_one(
@@ -55,7 +76,7 @@ async def cotizar(datos: CrearPagoIn) -> tuple[Decimal, str]:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Ese plan no existe o no está disponible",
             )
-        return fila["precio_monthly"], f"Suscripción {datos.plan}"
+        return con_iva(fila["precio_monthly"]), f"Suscripción {datos.plan}"
 
     fila = await fetch_one(
         "SELECT precio FROM paquetes_creditos WHERE creditos = $1 AND activo",

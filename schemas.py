@@ -2,7 +2,7 @@
 
 from datetime import date, datetime, time
 from decimal import Decimal
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, model_validator
@@ -135,6 +135,11 @@ class ConectarWhatsAppIn(BaseModel):
     línea: no existe un secreto por tenant que cifrar.
     """
     phone_number_id: str = Field(min_length=1, max_length=100)
+
+
+class IniciarNeuroApiConnectOut(BaseModel):
+    """POST /api/canales/whatsapp/neuroapi/iniciar — a dónde redirigir para el Embedded Signup."""
+    connect_url: str
 
 
 # ============================================================
@@ -810,7 +815,11 @@ class AlertaOut(BaseModel):
 TipoPago = Literal["subscription", "credit_purchase"]
 EstadoPago = Literal["pendiente", "aprobado", "rechazado", "cancelado", "reembolsado"]
 EstadoSuscripcion = Literal["activa", "pausada", "cancelada"]
-NombrePlan = Literal["starter", "pro", "enterprise"]
+# Texto y no Literal: los planes se dan de alta desde /gerencia/planes, y
+# tenant_subscriptions.plan es FK a planes(nombre) (25_planes_herramientas.sql).
+# Si el plan existe y está activo lo decide la base (pagos.cotizar), no el
+# esquema.
+NombrePlan = Annotated[str, Field(min_length=2, max_length=50)]
 ProveedorPago = Literal["stripe", "mercadopago"]
 
 
@@ -867,6 +876,9 @@ class PlanOut(BaseModel):
     creditos_incluidos_mensual: Decimal
     agente_ia_activo: bool
     gestion_vendedores_activo: bool
+    herramientas_activo: bool
+    crm_campo_activo: bool
+    calendario_activo: bool
 
 
 class PaqueteCreditosOut(BaseModel):
@@ -879,6 +891,12 @@ class CatalogoPagosOut(BaseModel):
 
     planes: list[PlanOut]
     paquetes: list[PaqueteCreditosOut]
+    # config.settings.iva_tasa (0.16 = 16%). Los precios de `planes` no lo
+    # incluyen (services.pagos.con_iva lo suma recién al cotizar), así que
+    # el portal la usa para la leyenda "más IVA (16%)" — viaja acá y no
+    # como texto fijo en el frontend para que nunca se desincronice de lo
+    # que de verdad se cobra.
+    iva_tasa: Decimal
 
 
 class TransaccionOut(BaseModel):
@@ -915,6 +933,30 @@ class SuscripcionOut(BaseModel):
     precio_monthly: Decimal | None
     creditos_disponibles: Decimal
     creditos_gastados: Decimal
+
+
+Herramienta = Literal["agente", "vendedores", "herramientas", "crm_campo", "calendario"]
+EstadoCuenta = Literal["vigente", "vencido", "cancelado", "sin_plan", "prueba", "suspendido"]
+
+
+class PlanHerramientasOut(BaseModel):
+    nombre: str
+    herramientas: list[Herramienta]
+
+
+class AccesoPlanOut(BaseModel):
+    """
+    Qué puede usar el negocio ahora mismo (services/acceso_plan.py). El
+    portal lo lee al entrar para bloquear pantallas y mostrar el candado,
+    sin esperar a que un endpoint le responda 402.
+    """
+
+    estado: EstadoCuenta
+    plan: str | None
+    herramientas: list[Herramienta]
+    # Planes contratables, cada uno con lo que incluye: con esto la vista
+    # de bloqueo dice "está en el plan Pro" y enlaza a ese plan.
+    planes: list[PlanHerramientasOut]
 
 
 # ============================================================
@@ -1269,6 +1311,9 @@ class PlanGerenciaOut(BaseModel):
     creditos_incluidos_mensual: Decimal
     agente_ia_activo: bool
     gestion_vendedores_activo: bool
+    herramientas_activo: bool
+    crm_campo_activo: bool
+    calendario_activo: bool
     activo: bool
     orden: int
     creado_en: datetime
@@ -1276,11 +1321,11 @@ class PlanGerenciaOut(BaseModel):
 
 
 class PlanCrearIn(BaseModel):
-    # Identificador estable: `tenant_subscriptions.plan` lo guarda como
-    # texto plano (no hay FK a `planes`), así que este valor no se puede
-    # cambiar después sin dejar huérfanas las suscripciones que ya lo
-    # referencian — ver PlanActualizarIn.
-    nombre: str = Field(min_length=2, max_length=100)
+    # Identificador estable: es lo que guarda `tenant_subscriptions.plan`
+    # (FK a planes.nombre) y lo que va en la URL de PATCH. 50 y no 100 (el
+    # largo de la columna de `planes`) porque tenant_subscriptions.plan es
+    # VARCHAR(50) — ver 25_planes_herramientas.sql.
+    nombre: NombrePlan
     descripcion: str | None = Field(default=None, max_length=2000)
     precio_monthly: Decimal = Field(ge=0, max_digits=10, decimal_places=2)
     precio_annual: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
@@ -1290,8 +1335,12 @@ class PlanCrearIn(BaseModel):
     creditos_incluidos_mensual: Decimal = Field(
         default=Decimal(100), ge=0, max_digits=12, decimal_places=2
     )
+    # Qué herramientas del portal incluye (services/acceso_plan.py).
     agente_ia_activo: bool = True
     gestion_vendedores_activo: bool = True
+    herramientas_activo: bool = True
+    crm_campo_activo: bool = True
+    calendario_activo: bool = True
     activo: bool = True
     orden: int = Field(default=0, ge=0, le=32767)
 
@@ -1319,6 +1368,9 @@ class PlanActualizarIn(BaseModel):
     )
     agente_ia_activo: bool | None = None
     gestion_vendedores_activo: bool | None = None
+    herramientas_activo: bool | None = None
+    crm_campo_activo: bool | None = None
+    calendario_activo: bool | None = None
     activo: bool | None = None
     orden: int | None = Field(default=None, ge=0, le=32767)
 

@@ -119,3 +119,24 @@ async def clean_alertas(db, tenant_y_usuario):
     yield
     # Limpiar después del test también
     await execute("DELETE FROM alertas WHERE tenant_id = $1", tenant_id)
+
+
+@pytest.fixture
+async def plan_enterprise(tenant_y_usuario):
+    """
+    Suscripción 'activa' al plan enterprise (incluye todas las herramientas).
+
+    Los tests de un módulo (calendario, reportes, canales...) prueban su
+    lógica, no el cobro: sin plan vigente, services/acceso_plan.py les
+    respondería 402 antes de llegar a lo que quieren probar. Los tests del
+    gate por plan (test_bloqueo_plan.py) NO lo usan: arman cada caso a mano.
+    Se activa por archivo con `pytestmark = pytest.mark.usefixtures(...)`.
+    """
+    await execute(
+        """
+        INSERT INTO tenant_subscriptions (tenant_id, plan, estado, precio_monthly)
+        VALUES ($1, 'enterprise', 'activa', 299.99)
+        """,
+        tenant_y_usuario["tenant_id"],
+    )
+    return tenant_y_usuario

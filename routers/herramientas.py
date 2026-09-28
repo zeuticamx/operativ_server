@@ -9,7 +9,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.concurrency import run_in_threadpool
 
-from deps import UsuarioActual, tenant_actual, usuario_actual
+from deps import UsuarioActual, requiere_herramienta, tenant_actual, usuario_actual
 from session import execute, fetch_all, fetch_one
 from schemas import (
     ActualizarHerramientaIn,
@@ -20,7 +20,11 @@ from schemas import (
 )
 from services import google_tools
 
-router = APIRouter(prefix="/herramientas", tags=["herramientas"])
+router = APIRouter(
+    prefix="/herramientas",
+    tags=["herramientas"],
+    dependencies=[Depends(requiere_herramienta("herramientas"))],
+)
 
 
 @router.get("/info", response_model=HerramientaInfoOut)

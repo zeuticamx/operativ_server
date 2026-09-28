@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from services import geo
 from services.crm import AccesoCRM, acceso_crm, cargar_cliente
-from deps import VendedorActual, vendedor_actual
+from deps import VendedorActual, requiere_herramienta, vendedor_actual
 from schemas import (
     CheckinIn,
     CheckinOut,
@@ -28,7 +28,11 @@ from schemas import (
 )
 from session import conexion, fetch_all, transaccion
 
-router = APIRouter(prefix="/visitas", tags=["crm"])
+router = APIRouter(
+    prefix="/visitas",
+    tags=["crm"],
+    dependencies=[Depends(requiere_herramienta("crm_campo"))],
+)
 
 SELECT_VISITA = """
     SELECT

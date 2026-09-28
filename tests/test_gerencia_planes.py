@@ -59,7 +59,7 @@ async def gerente(db):
 @pytest.fixture
 async def nombre_plan(db):
     """Nombre único por test; el teardown lo borra pase lo que pase."""
-    nombre = f"plan-de-prueba-{uuid4()}"
+    nombre = f"plan-prueba-{uuid4().hex[:16]}"
     yield nombre
     await execute("DELETE FROM planes WHERE nombre = $1", nombre)
 
@@ -168,6 +168,40 @@ async def test_actualizar_solo_toca_los_campos_enviados(http_client, gerente, no
     # No se tocaron: siguen igual que al crear.
     assert d["descripcion"] == "original"
     assert d["orden"] == 5
+
+
+@pytest.mark.asyncio
+async def test_la_matriz_de_herramientas_se_crea_y_se_edita(http_client, gerente, nombre_plan):
+    r = await _crear(
+        http_client,
+        gerente["headers"],
+        nombre=nombre_plan,
+        calendario_activo=False,
+        crm_campo_activo=False,
+    )
+    assert r.status_code == 201
+    d = r.json()
+    assert d["calendario_activo"] is False
+    assert d["crm_campo_activo"] is False
+    assert d["herramientas_activo"] is True  # default
+
+    r = await http_client.patch(
+        f"/api/gerencia/planes/{nombre_plan}",
+        json={"calendario_activo": True},
+        headers=gerente["headers"],
+    )
+    assert r.status_code == 200
+    d = r.json()
+    assert d["calendario_activo"] is True
+    # Lo que no se mandó queda como estaba.
+    assert d["crm_campo_activo"] is False
+
+
+@pytest.mark.asyncio
+async def test_nombre_de_plan_mas_largo_que_la_suscripcion_se_rechaza(http_client, gerente):
+    """tenant_subscriptions.plan es VARCHAR(50): un nombre más largo no se podría contratar."""
+    r = await _crear(http_client, gerente["headers"], nombre="x" * 51)
+    assert r.status_code == 422
 
 
 @pytest.mark.asyncio

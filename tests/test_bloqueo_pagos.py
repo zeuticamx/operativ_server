@@ -2,9 +2,14 @@
 Tests de integración HTTP del bloqueo por pagos sobre el CRM de vendedores.
 
 _exigir_modulo (routers/vendedores.py) es el choke point que ya usaban
-modulo_actual/modulo_en_ruta para el 409 de "módulo apagado"; ahí mismo se
-sumó el 402 de "no se puede pagar". Cubre routers/vendedores.py Y
+modulo_actual/modulo_en_ruta para el 409 de "módulo apagado"; ahí mismo va
+el 402 de services/acceso_plan.py. Cubre routers/vendedores.py Y
 routers/pipeline_config.py, porque los dos importan la misma función.
+
+Desde el control por plan, en el portal manda la suscripción: sin plan
+vigente no hay CRM, tenga o no créditos (los créditos siguen manteniendo al
+agente de n8n contestando — eso lo prueba test_acceso_pagos.py). La matriz
+completa por plan está en test_acceso_plan.py y test_bloqueo_plan.py.
 
 Se prueba contra GET /api/tenants/{id}/pipeline: cualquier otro endpoint
 gateado por modulo_actual/modulo_en_ruta pasa por el mismo camino.
@@ -46,8 +51,8 @@ async def _creditos(tenant_id, cantidad: Decimal) -> None:
 
 
 @pytest.mark.asyncio
-async def test_sin_haber_pagado_nunca_el_crm_funciona(http_client, tenant_y_usuario):
-    """Un tenant que nunca tocó /api/pagos no queda bloqueado de entrada."""
+async def test_sin_haber_pagado_nunca_el_crm_pide_plan(http_client, tenant_y_usuario):
+    """Sin suscripción no hay herramientas: 402 con la invitación a elegir plan."""
     tenant_id = tenant_y_usuario["tenant_id"]
     await _encender_modulo(tenant_id)
 
@@ -55,7 +60,9 @@ async def test_sin_haber_pagado_nunca_el_crm_funciona(http_client, tenant_y_usua
         RUTA_PIPELINE.format(tenant_id=tenant_id),
         headers={"Authorization": f"Bearer {tenant_y_usuario['token']}"},
     )
-    assert respuesta.status_code == 200
+    assert respuesta.status_code == 402
+    assert respuesta.json()["detail"]["codigo"] == "plan_requerido"
+    assert respuesta.json()["detail"]["estado"] == "sin_plan"
 
 
 @pytest.mark.asyncio
@@ -72,13 +79,17 @@ async def test_suscripcion_vencida_y_sin_creditos_bloquea_con_402(
         headers={"Authorization": f"Bearer {tenant_y_usuario['token']}"},
     )
     assert respuesta.status_code == 402
-    assert "créditos" in respuesta.json()["detail"] or "suscripción" in respuesta.json()["detail"]
+    detalle = respuesta.json()["detail"]
+    assert detalle["codigo"] == "plan_requerido"
+    assert detalle["estado"] == "vencido"
+    assert detalle["mensaje"]
 
 
 @pytest.mark.asyncio
-async def test_con_creditos_disponibles_no_bloquea_aunque_la_suscripcion_este_pausada(
+async def test_los_creditos_no_reemplazan_al_plan_en_el_portal(
     http_client, tenant_y_usuario
 ):
+    """Antes los créditos alcanzaban; ahora son consumo, no un derecho a herramientas."""
     tenant_id = tenant_y_usuario["tenant_id"]
     await _encender_modulo(tenant_id)
     await _suscripcion(tenant_id, "pausada")
@@ -88,7 +99,8 @@ async def test_con_creditos_disponibles_no_bloquea_aunque_la_suscripcion_este_pa
         RUTA_PIPELINE.format(tenant_id=tenant_id),
         headers={"Authorization": f"Bearer {tenant_y_usuario['token']}"},
     )
-    assert respuesta.status_code == 200
+    assert respuesta.status_code == 402
+    assert respuesta.json()["detail"]["codigo"] == "plan_requerido"
 
 
 @pytest.mark.asyncio

@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from realtime import broadcast_alerta
 from services import pipeline_estados
-from services.acceso_pagos import acceso_pagos
+from services.acceso_plan import acceso_plan, exigir_herramienta
 from services.asignacion import asignar_vendedor_automatico, leer_config
 from deps import (
     UsuarioActual,
@@ -113,7 +113,7 @@ def _a_pipeline_out(fila) -> PipelineOut:
 async def _exigir_modulo(tenant_id: UUID) -> UUID:
     """
     409 si el negocio no tiene el módulo encendido; 402 si lo tiene
-    encendido pero no puede pagarlo.
+    encendido pero su plan no lo incluye o no está vigente.
 
     Se comprueban las dos cosas en cada endpoint y no una sola vez al
     entrar: el flag se puede apagar (o la suscripción vencer) mientras
@@ -121,7 +121,9 @@ async def _exigir_modulo(tenant_id: UUID) -> UUID:
 
     Ojo con el orden: el 409 va primero porque es la decisión del propio
     dueño (el módulo está apagado a propósito) y no depende de pagos; el
-    402 es "está prendido, pero no se puede seguir usando gratis".
+    402 es "está prendido, pero el plan no alcanza". El 402 sale de
+    services/acceso_plan.py con un detail estructurado (`codigo`, planes que
+    lo incluyen) para que el portal muestre la vista de mejora de plan.
     """
     servicios = await get_tenant_servicios(tenant_id)
     if not servicios.gestion_vendedores_activo:
@@ -133,17 +135,7 @@ async def _exigir_modulo(tenant_id: UUID) -> UUID:
             ),
         )
 
-    acceso = await acceso_pagos(tenant_id)
-    if not acceso.permitido:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=(
-                "La suscripción venció y no quedan créditos disponibles. "
-                "Renueva el plan o compra créditos en /pagos/crear-pago para "
-                "seguir usando el CRM de vendedores."
-            ),
-        )
-
+    await exigir_herramienta(tenant_id, "vendedores")
     return tenant_id
 
 
@@ -194,6 +186,26 @@ async def actualizar_servicios(
     usuario: UsuarioActual = Depends(gerencia_actual),
 ):
     verificar_acceso_tenant(usuario, tenant_id)
+
+    # Encender un módulo que el plan no incluye era la forma de saltarse el
+    # plan. Apagar siempre se puede: es la decisión del dueño. El panel de
+    # plataforma tiene su propio endpoint (/gerencia/tenants/{id}/servicios)
+    # y no pasa por acá.
+    encendiendo = [
+        herramienta
+        for herramienta, valor in (
+            ("agente", datos.agente_ia_activo),
+            ("vendedores", datos.gestion_vendedores_activo),
+            ("calendario", datos.calendario_activo),
+        )
+        if valor is True
+    ]
+    if encendiendo:
+        acceso = await acceso_plan(tenant_id)
+        for herramienta in encendiendo:
+            if not acceso.permite(herramienta):
+                await exigir_herramienta(tenant_id, herramienta)
+
     servicios = await set_tenant_servicios(
         tenant_id,
         datos.agente_ia_activo,

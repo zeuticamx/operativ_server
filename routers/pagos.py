@@ -31,15 +31,18 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, 
 from config import settings
 from deps import UsuarioActual, gerencia_actual, tenant_actual
 from schemas import (
+    AccesoPlanOut,
     CatalogoPagosOut,
     CheckoutEstadoOut,
     CrearPagoIn,
     CrearPagoOut,
     PaqueteCreditosOut,
+    PlanHerramientasOut,
     PlanOut,
     SuscripcionOut,
     TransaccionOut,
 )
+from services.acceso_plan import HERRAMIENTAS, acceso_plan, herramientas_por_plan
 from services.pagos import (
     cotizar,
     marcar_cancelada,
@@ -111,7 +114,8 @@ async def catalogo(_tenant_id: UUID = Depends(tenant_actual)) -> CatalogoPagosOu
         """
         SELECT nombre, descripcion, precio_monthly, precio_annual,
                max_vendedores, max_leads_mensuales, creditos_incluidos_mensual,
-               agente_ia_activo, gestion_vendedores_activo
+               agente_ia_activo, gestion_vendedores_activo,
+               herramientas_activo, crm_campo_activo, calendario_activo
         FROM planes
         WHERE activo
         ORDER BY orden, precio_monthly
@@ -129,6 +133,7 @@ async def catalogo(_tenant_id: UUID = Depends(tenant_actual)) -> CatalogoPagosOu
     return CatalogoPagosOut(
         planes=[PlanOut(**dict(f)) for f in filas_planes],
         paquetes=[PaqueteCreditosOut(**dict(f)) for f in filas_paquetes],
+        iva_tasa=settings.iva_tasa,
     )
 
 
@@ -510,6 +515,30 @@ async def suscripcion(tenant_id: UUID = Depends(tenant_actual)) -> SuscripcionOu
         )
 
     return SuscripcionOut(**dict(fila))
+
+
+@router.get("/acceso", response_model=AccesoPlanOut)
+async def acceso(tenant_id: UUID = Depends(tenant_actual)) -> AccesoPlanOut:
+    """
+    Qué herramientas del portal puede usar el negocio ahora (ver
+    services/acceso_plan.py). Nunca responde 402: es justo lo que el portal
+    consulta para explicar un bloqueo, así que tiene que contestar siempre.
+    """
+    actual = await acceso_plan(tenant_id)
+    catalogo = await herramientas_por_plan()
+
+    def ordenadas(incluidas: frozenset[str]) -> list[str]:
+        return [h for h in HERRAMIENTAS if h in incluidas]
+
+    return AccesoPlanOut(
+        estado=actual.estado,
+        plan=actual.plan,
+        herramientas=ordenadas(actual.herramientas),
+        planes=[
+            PlanHerramientasOut(nombre=nombre, herramientas=ordenadas(incluidas))
+            for nombre, incluidas in catalogo
+        ],
+    )
 
 
 @router.get("/historial", response_model=list[TransaccionOut])

@@ -27,6 +27,7 @@ import pytest
 
 from config import settings
 from services import stripe_pagos
+from services.pagos import con_iva
 from services.stripe_pagos import a_unidad_minima, firma_valida
 from session import execute, fetch_one, fetch_value
 
@@ -246,7 +247,7 @@ async def test_crear_pago_guarda_la_transaccion_con_el_precio_de_la_base(
     assert datos["referencia"] == "cs_test_123"
     assert datos["checkout_url"] == "https://checkout.stripe.com/c/abc"
 
-    precio_real = await fetch_value("SELECT precio_monthly FROM planes WHERE nombre = 'pro'")
+    precio_base = await fetch_value("SELECT precio_monthly FROM planes WHERE nombre = 'pro'")
     fila = await fetch_one(
         """
         SELECT tipo, monto, estado_pago, plan_nombre, stripe_session_id
@@ -255,15 +256,17 @@ async def test_crear_pago_guarda_la_transaccion_con_el_precio_de_la_base(
         datos["transaccion_id"],
     )
     assert fila["tipo"] == "subscription"
-    assert fila["monto"] == precio_real
+    # Lo que se cobra de verdad lleva IVA encima del precio de catálogo.
+    assert fila["monto"] == con_iva(precio_base)
     # Nace pendiente: lo que la aprueba es el webhook, no esta llamada.
     assert fila["estado_pago"] == "pendiente"
     assert fila["plan_nombre"] == "pro"
     assert fila["stripe_session_id"] == "cs_test_123"
 
-    # El monto que se le manda a Stripe sale de la base, no del cliente.
+    # El monto que se le manda a Stripe sale de la base (con IVA sumado),
+    # no del cliente.
     assert _ClienteFalso.ultimo_payload["line_items[0][price_data][unit_amount]"] == str(
-        int(precio_real * 100)
+        a_unidad_minima(con_iva(precio_base), settings.STRIPE_CURRENCY)
     )
 
 

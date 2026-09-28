@@ -29,7 +29,7 @@ from pydantic import ValidationError
 from config import settings
 from routers import pagos
 from schemas import CrearPagoIn
-from services.pagos import acreditar_creditos, activar_suscripcion, cotizar
+from services.pagos import acreditar_creditos, activar_suscripcion, con_iva, cotizar
 from session import execute, fetch_one, fetch_value
 
 SECRETO = "secreto-de-prueba"
@@ -175,11 +175,12 @@ def test_con_https_en_base_url_frontend_si_manda_auto_return(monkeypatch):
 # Cotización: el precio siempre sale de la base
 # ============================================================
 @pytest.mark.asyncio
-async def test_cotizar_plan_devuelve_el_precio_de_la_tabla(db):
-    esperado = await fetch_value("SELECT precio_monthly FROM planes WHERE nombre = 'pro'")
+async def test_cotizar_plan_devuelve_el_precio_de_la_tabla_con_iva(db):
+    """El catálogo muestra el precio sin IVA; cotizar es donde se le suma."""
+    base = await fetch_value("SELECT precio_monthly FROM planes WHERE nombre = 'pro'")
     monto, concepto = await cotizar(CrearPagoIn(tipo="subscription", plan="pro"))
 
-    assert monto == esperado
+    assert monto == con_iva(base)
     assert "pro" in concepto
 
 
@@ -198,6 +199,68 @@ async def test_un_paquete_inventado_da_404(db):
     with pytest.raises(HTTPException) as exc:
         await cotizar(CrearPagoIn(tipo="credit_purchase", creditos=Decimal(7)))
     assert exc.value.status_code == 404
+
+
+# ============================================================
+# IVA: se suma al cotizar una suscripción, nunca en el catálogo
+# ============================================================
+def test_con_iva_suma_la_tasa_configurada_y_redondea_a_centavos():
+    assert con_iva(Decimal("100")) == Decimal("116.00")
+    # 0.145 redondea hacia arriba (ROUND_HALF_UP), no al par más cercano.
+    assert con_iva(Decimal("0.125")) == Decimal("0.15")
+
+
+def test_con_iva_respeta_una_tasa_distinta(monkeypatch):
+    monkeypatch.setattr(settings, "IVA_TASA", "0.08")
+    assert con_iva(Decimal("100")) == Decimal("108.00")
+
+
+def test_con_iva_con_variable_de_entorno_invalida_cae_al_16_por_ciento(monkeypatch):
+    monkeypatch.setattr(settings, "IVA_TASA", "no-es-un-numero")
+    assert con_iva(Decimal("100")) == Decimal("116.00")
+
+
+@pytest.mark.asyncio
+async def test_cotizar_creditos_no_lleva_iva(db):
+    """Solo la suscripción se muestra sin IVA en el catálogo; los créditos, no."""
+    esperado = await fetch_value("SELECT precio FROM paquetes_creditos WHERE creditos = 500")
+    monto, _ = await cotizar(CrearPagoIn(tipo="credit_purchase", creditos=Decimal(500)))
+    assert monto == esperado
+
+
+@pytest.mark.asyncio
+async def test_activar_suscripcion_guarda_el_precio_de_catalogo_sin_iva(db, tenant_y_usuario):
+    """
+    tenant_subscriptions.precio_monthly es el precio del plan (lo que
+    muestra /pagos/catalogo), no lo que se cobró — ese vive en
+    tenant_transactions.monto, con IVA ya sumado por cotizar().
+    """
+    tenant_id = tenant_y_usuario["tenant_id"]
+    base = await fetch_value("SELECT precio_monthly FROM planes WHERE nombre = 'pro'")
+
+    await activar_suscripcion(tenant_id, "pro")
+
+    guardado = await fetch_value(
+        "SELECT precio_monthly FROM tenant_subscriptions WHERE tenant_id = $1", tenant_id
+    )
+    assert guardado == base
+
+
+@pytest.mark.asyncio
+async def test_el_catalogo_expone_la_tasa_de_iva(http_client, tenant_y_usuario, monkeypatch):
+    monkeypatch.setattr(settings, "IVA_TASA", "0.16")
+
+    respuesta = await http_client.get(
+        "/api/pagos/catalogo",
+        headers={"Authorization": f"Bearer {tenant_y_usuario['token']}"},
+    )
+
+    assert respuesta.status_code == 200
+    assert Decimal(respuesta.json()["iva_tasa"]) == Decimal("0.16")
+    # Los precios del catálogo siguen siendo los de la tabla, sin IVA.
+    precios = {p["nombre"]: Decimal(p["precio_monthly"]) for p in respuesta.json()["planes"]}
+    base = await fetch_value("SELECT precio_monthly FROM planes WHERE nombre = 'pro'")
+    assert precios["pro"] == base
 
 
 # ============================================================
@@ -530,13 +593,14 @@ async def test_crear_pago_guarda_la_transaccion_con_el_precio_de_la_base(
     assert datos["referencia"] == "pref-123"
     assert datos["checkout_url"] == "https://mp.test/checkout"
 
-    precio_real = await fetch_value("SELECT precio_monthly FROM planes WHERE nombre = 'pro'")
+    precio_base = await fetch_value("SELECT precio_monthly FROM planes WHERE nombre = 'pro'")
     fila = await fetch_one(
         "SELECT tipo, monto, estado_pago, plan_nombre, mp_preference_id FROM tenant_transactions WHERE id = $1",
         datos["transaccion_id"],
     )
     assert fila["tipo"] == "subscription"
-    assert fila["monto"] == precio_real
+    # Lo que se cobra de verdad lleva IVA encima del precio de catálogo.
+    assert fila["monto"] == con_iva(precio_base)
     # Nace pendiente: lo que la aprueba es el webhook, no esta llamada.
     assert fila["estado_pago"] == "pendiente"
     assert fila["plan_nombre"] == "pro"

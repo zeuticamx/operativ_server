@@ -25,16 +25,25 @@ from fastapi import HTTPException, status
 from schemas import ServicioActualizarIn
 from services import calendario_slots
 from services.acceso_pagos import acceso_pagos
+from services.acceso_plan import exigir_herramienta
 from services.pipeline import get_tenant_servicios
 from session import conexion, execute, fetch_all, fetch_one, transaccion
 
 
-async def verificar_calendario_activo(tenant_id: UUID) -> None:
+async def verificar_calendario_activo(tenant_id: UUID, *, desde_chat: bool = False) -> None:
     """
     409 si el negocio no tiene el módulo de calendarios encendido; 402 si lo
-    tiene encendido pero no puede pagarlo. Mismo criterio y mismo orden que
+    tiene encendido pero no puede usarlo. Mismo criterio y mismo orden que
     routers/vendedores.py::_exigir_modulo: el 409 es la decisión del propio
     dueño (apagado a propósito) y no depende de pagos.
+
+    Qué significa "no puede usarlo" depende de quién llama:
+      - portal (default): el plan tiene que incluir calendario y estar
+        vigente (services/acceso_plan.py).
+      - `desde_chat=True`, n8n reservando por WhatsApp (routers/eventos.py):
+        el gate de pagos de siempre (services/acceso_pagos.py). Es lo que
+        ve el cliente final, y ese lado sigue el modelo híbrido — con
+        créditos el agente sigue agendando aunque la suscripción venciera.
     """
     servicios = await get_tenant_servicios(tenant_id)
     if not servicios.calendario_activo:
@@ -45,6 +54,10 @@ async def verificar_calendario_activo(tenant_id: UUID) -> None:
                 "Actívalo en /tenants/{tenant_id}/servicios."
             ),
         )
+
+    if not desde_chat:
+        await exigir_herramienta(tenant_id, "calendario")
+        return
 
     acceso = await acceso_pagos(tenant_id)
     if not acceso.permitido:

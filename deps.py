@@ -11,6 +11,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from config import settings
 from security import decodificar_token
+from services.acceso_plan import exigir_herramienta
 from session import fetch_one
 
 bearer = HTTPBearer(auto_error=False)
@@ -205,6 +206,44 @@ async def tenant_en_ruta(
 ) -> UUID:
     """Para los endpoints /tenants/{tenant_id}/..."""
     return verificar_acceso_tenant(usuario, tenant_id)
+
+
+def requiere_herramienta(herramienta: str, *, lectura_sin_plan: bool = False):
+    """
+    Dependency de router: 402 si el plan del negocio no incluye
+    `herramienta` o si la cuenta no está vigente (ver services/acceso_plan.py).
+
+    Se cuelga a nivel de APIRouter (`dependencies=[...]`) y no endpoint por
+    endpoint, por lo mismo que la impersonación se valida en usuario_actual:
+    una ruta nueva que alguien agregue queda cubierta sin acordarse.
+
+    `lectura_sin_plan`: con el plan vencido/cancelado (no con la cuenta
+    suspendida) los GET siguen pasando. Es para datos que son del negocio —
+    su historial de conversaciones — y que no tiene sentido secuestrar
+    hasta que pague; lo que se corta es seguir operando (responder, etc.).
+    """
+
+    async def dependencia(
+        request: Request,
+        usuario: UsuarioActual = Depends(usuario_actual),
+    ) -> None:
+        # Sin tenant no hay plan que mirar: que falle donde ya fallaba
+        # (tenant_actual, 409), no con un 402 que no se puede resolver pagando.
+        if usuario.tenant_id is None:
+            return
+        try:
+            await exigir_herramienta(usuario.tenant_id, herramienta)
+        except HTTPException as e:
+            if (
+                lectura_sin_plan
+                and request.method in METODOS_SOLO_LECTURA
+                and isinstance(e.detail, dict)
+                and e.detail.get("codigo") == "plan_requerido"
+            ):
+                return
+            raise
+
+    return dependencia
 
 
 async def gerencia_actual(

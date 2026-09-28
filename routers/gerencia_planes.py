@@ -13,10 +13,14 @@ plan deja asiento en gerencia_auditoria dentro de la misma transacción.
 
 `nombre` es el identificador de la URL, no `id`: es UNIQUE en la tabla
 (igual que en 11_mercado_pago.sql) y es lo único que el resto del sistema
-usa para referenciar un plan — `tenant_subscriptions.plan` lo guarda como
-texto plano, no como FK. Por eso no se puede renombrar un plan desde acá
-(ver el docstring de PlanActualizarIn): haría huérfanas las suscripciones
-que ya lo referencian sin que nada avise.
+usa para referenciar un plan — `tenant_subscriptions.plan` es FK a
+planes(nombre) desde 25_planes_herramientas.sql (antes era un CHECK con los
+tres nombres de fábrica, y por eso un plan creado acá no se podía
+contratar). El renombre sigue sin exponerse (ver PlanActualizarIn), aunque
+la FK ya lo haría seguro con su ON UPDATE CASCADE.
+
+Además de precios y límites, cada plan dice qué herramientas del portal
+incluye (`*_activo`): es la matriz que evalúa services/acceso_plan.py.
 """
 
 import asyncpg
@@ -37,7 +41,8 @@ router = APIRouter(
 _COLUMNAS = """
     nombre, descripcion, precio_monthly, precio_annual,
     max_vendedores, max_leads_mensuales, creditos_incluidos_mensual,
-    agente_ia_activo, gestion_vendedores_activo, activo, orden,
+    agente_ia_activo, gestion_vendedores_activo,
+    herramientas_activo, crm_campo_activo, calendario_activo, activo, orden,
     created_at AS creado_en, updated_at AS actualizado_en
 """
 
@@ -70,8 +75,10 @@ async def crear_plan(
                 INSERT INTO planes
                     (nombre, descripcion, precio_monthly, precio_annual,
                      max_vendedores, max_leads_mensuales, creditos_incluidos_mensual,
-                     agente_ia_activo, gestion_vendedores_activo, activo, orden)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                     agente_ia_activo, gestion_vendedores_activo,
+                     herramientas_activo, crm_campo_activo, calendario_activo,
+                     activo, orden)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                 """,
                 datos.nombre,
                 datos.descripcion,
@@ -82,6 +89,9 @@ async def crear_plan(
                 datos.creditos_incluidos_mensual,
                 datos.agente_ia_activo,
                 datos.gestion_vendedores_activo,
+                datos.herramientas_activo,
+                datos.crm_campo_activo,
+                datos.calendario_activo,
                 datos.activo,
                 datos.orden,
             )
@@ -117,8 +127,9 @@ async def actualizar_plan(
 ):
     """
     Apagar un plan (`activo=false`) no toca a los negocios que ya lo
-    tienen contratado: `tenant_subscriptions` no lo referencia por FK, así
-    que una suscripción vigente sigue vigente. Solo deja de ofrecerse a
+    tienen contratado: la FK de `tenant_subscriptions` solo exige que la
+    fila exista, no que esté activa, así que una suscripción vigente sigue
+    vigente. Solo deja de ofrecerse a
     quien contrate desde cero (`/api/pagos/catalogo` filtra por `activo`).
     """
     async with transaccion() as conn:
@@ -161,6 +172,10 @@ async def actualizar_plan(
                 if datos.gestion_vendedores_activo is None
                 else datos.gestion_vendedores_activo
             ),
+            **{
+                col: anterior[col] if getattr(datos, col) is None else getattr(datos, col)
+                for col in ("herramientas_activo", "crm_campo_activo", "calendario_activo")
+            },
             "activo": anterior["activo"] if datos.activo is None else datos.activo,
             "orden": anterior["orden"] if datos.orden is None else datos.orden,
         }
@@ -176,8 +191,11 @@ async def actualizar_plan(
                 creditos_incluidos_mensual = $7,
                 agente_ia_activo = $8,
                 gestion_vendedores_activo = $9,
-                activo = $10,
-                orden = $11,
+                herramientas_activo = $10,
+                crm_campo_activo = $11,
+                calendario_activo = $12,
+                activo = $13,
+                orden = $14,
                 updated_at = NOW()
             WHERE nombre = $1
             """,
@@ -190,6 +208,9 @@ async def actualizar_plan(
             nuevo["creditos_incluidos_mensual"],
             nuevo["agente_ia_activo"],
             nuevo["gestion_vendedores_activo"],
+            nuevo["herramientas_activo"],
+            nuevo["crm_campo_activo"],
+            nuevo["calendario_activo"],
             nuevo["activo"],
             nuevo["orden"],
         )

@@ -10,6 +10,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from deps import requiere_herramienta
 from services.crm import (
     SELECT_CLIENTE,
     AccesoCRM,
@@ -21,7 +22,11 @@ from services.crm import (
 from schemas import ClienteActualizarIn, ClienteCrearIn, ClienteOut
 from session import fetch_all, fetch_one
 
-router = APIRouter(prefix="/clientes", tags=["crm"])
+router = APIRouter(
+    prefix="/clientes",
+    tags=["crm"],
+    dependencies=[Depends(requiere_herramienta("crm_campo"))],
+)
 
 
 @router.get("", response_model=list[ClienteOut])

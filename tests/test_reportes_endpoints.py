@@ -18,6 +18,10 @@ import pytest
 from session import execute, fetch_value
 from security import crear_access_token
 
+# Prueban la lógica del módulo, no el cobro: el tenant de prueba tiene plan
+# vigente con todo incluido (ver el fixture en conftest.py).
+pytestmark = pytest.mark.usefixtures("plan_enterprise")
+
 RUTA = "/api/reportes/actividad"
 
 

@@ -4,11 +4,15 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from deps import tenant_actual
+from deps import requiere_herramienta, tenant_actual
 from session import fetch_one
 from schemas import AgenteConfigIn, AgenteConfigOut
 
-router = APIRouter(prefix="/agente", tags=["agente"])
+router = APIRouter(
+    prefix="/agente",
+    tags=["agente"],
+    dependencies=[Depends(requiere_herramienta("agente"))],
+)
 
 # Lista blanca: si un tenant guarda un nombre de modelo inventado, el
 # workflow de n8n truena en ejecución con un error poco claro. Mejor

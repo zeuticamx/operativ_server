@@ -17,6 +17,10 @@ import pytest
 from services.pipeline import set_tenant_servicios
 from session import conexion, execute, fetch_one, fetch_value
 
+# Prueban la lógica del módulo, no el cobro: el tenant de prueba tiene plan
+# vigente con todo incluido (ver el fixture en conftest.py).
+pytestmark = pytest.mark.usefixtures("plan_enterprise")
+
 RUTA_PROVEEDORES = "/api/tenants/{tenant_id}/calendario/proveedores"
 RUTA_SERVICIOS = "/api/tenants/{tenant_id}/calendario/servicios"
 

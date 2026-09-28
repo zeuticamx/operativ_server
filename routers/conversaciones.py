@@ -4,7 +4,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from deps import UsuarioActual, tenant_actual, usuario_actual
+from deps import UsuarioActual, requiere_herramienta, tenant_actual, usuario_actual
 from realtime import emit_conversacion_estado, emit_mensaje
 from session import execute, fetch_one
 from schemas import (
@@ -19,7 +19,13 @@ from schemas import (
 from services import conversaciones as svc
 from services import meta
 
-router = APIRouter(prefix="/conversaciones", tags=["conversaciones"])
+# lectura_sin_plan: con el plan vencido el negocio sigue viendo su historial;
+# lo que se corta es contestar a mano o devolverle el control a la IA.
+router = APIRouter(
+    prefix="/conversaciones",
+    tags=["conversaciones"],
+    dependencies=[Depends(requiere_herramienta("agente", lectura_sin_plan=True))],
+)
 
 
 @router.get("", response_model=list[ConversacionOut])

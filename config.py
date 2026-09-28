@@ -74,6 +74,14 @@ class Settings:
     # cuenta.
     NEUROAPI_PHONE_NUMBER_ID: str = os.getenv("NEUROAPI_PHONE_NUMBER_ID", "")
 
+    # Secreto del webhook de NeuroAPI Connect Sessions (alta de la cuenta vía
+    # Embedded Signup), distinto de NEUROAPI_WEBHOOK_SECRET (que es el de los
+    # webhooks de mensajería una vez la cuenta ya está conectada). Se manda
+    # como webhook_secret al crear la sesión y NeuroAPI lo usa para firmar su
+    # callback; compartir el mismo secreto entre ambos webhooks haría que una
+    # fuga de uno comprometa el otro. Vacío = ese webhook rechaza todo.
+    NEUROAPI_CONNECT_WEBHOOK_SECRET: str = os.getenv("NEUROAPI_CONNECT_WEBHOOK_SECRET", "")
+
     # ---- Google (cuenta de servicio compartida, para Sheets/Docs) ----
     GOOGLE_SERVICE_ACCOUNT_JSON: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
@@ -159,6 +167,15 @@ class Settings:
     STRIPE_WEBHOOK_SECRET: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
     # Stripe espera el código de moneda en minúsculas (iso 4217).
     STRIPE_CURRENCY: str = os.getenv("STRIPE_CURRENCY", "mxn").strip().lower()
+
+    # ---- Impuestos ----
+    # Los precios de `planes` (precio_monthly/precio_annual) se guardan y se
+    # muestran SIN IVA — de ahí la leyenda "más IVA (16%)" en /suscripcion.
+    # Esta tasa es lo que services/pagos.cotizar suma antes de mandarle el
+    # monto a la pasarela: lo que se cobra de verdad sí lo incluye. 0.16 es
+    # la tasa general de México; configurable por si algún día se cobra
+    # desde otro país con otra tasa.
+    IVA_TASA: str = os.getenv("IVA_TASA", "0.16").strip()
 
     # ---- Mercado Pago (deshabilitado; ver PAYMENT_PROVIDER) ----
     MERCADOPAGO_ACCESS_TOKEN: str = os.getenv("MERCADOPAGO_ACCESS_TOKEN", "")
@@ -268,6 +285,15 @@ class Settings:
         return bool(self.NEUROAPI_API_KEY)
 
     @property
+    def neuroapi_connect_configurado(self) -> bool:
+        """
+        Misma API key que el envío de mensajes (services/whatsapp.py): es la
+        misma cuenta de NeuroAPI, solo que Connect Sessions es otro endpoint
+        de esa cuenta.
+        """
+        return bool(self.NEUROAPI_API_KEY)
+
+    @property
     def moneda_cobro(self) -> str:
         """Moneda en la que se cobran los planes, según la pasarela activa."""
         if self.mercadopago_activo:
@@ -291,6 +317,19 @@ class Settings:
         except (InvalidOperation, ValueError):
             return None
         return valor if valor > 0 else None
+
+    @property
+    def iva_tasa(self) -> Decimal:
+        """
+        IVA_TASA ya parseado. Un valor mal escrito cae al 16% en vez de
+        tumbar el arranque o cobrar sin impuesto por una variable de entorno
+        mal puesta a mano.
+        """
+        try:
+            valor = Decimal(self.IVA_TASA)
+        except (InvalidOperation, ValueError):
+            return Decimal("0.16")
+        return valor if valor >= 0 else Decimal("0.16")
 
     @property
     def banxico_configurado(self) -> bool:
@@ -398,6 +437,17 @@ class Settings:
                     "verificar_webhook() va a rechazar todos los webhooks "
                     "entrantes de NeuroAPI."
                 )
+
+        # Independiente de WHATSAPP_PROVIDER: Connect Sessions es el alta de
+        # la cuenta (Embedded Signup), no el envío de mensajes, así que un
+        # tenant puede usarlo aunque el proveedor activo de envío sea otro.
+        if not self.NEUROAPI_CONNECT_WEBHOOK_SECRET:
+            logging.getLogger("operativai.config").warning(
+                "NEUROAPI_CONNECT_WEBHOOK_SECRET sin configurar: "
+                "/api/canales/whatsapp/neuroapi/webhook va a rechazar todo, "
+                "así que ninguna vinculación automática de WhatsApp se "
+                "completará."
+            )
 
         # Tampoco se exige: el alta y el login con correo siguen funcionando
         # sin esto. Pero si falta, POST /auth/google responde 503 y el botón
