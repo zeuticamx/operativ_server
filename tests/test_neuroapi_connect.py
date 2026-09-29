@@ -289,6 +289,79 @@ async def test_un_status_en_ingles_tambien_activa_el_canal(
     assert canal["is_active"] is True
 
 
+@pytest.mark.parametrize(
+    "evento",
+    [
+        # Mismo sobre que la respuesta de crear la sesión.
+        {"success": True, "data": {"session_id": "sess_sobre", "status": "completed",
+                                    "phone_number_id": "5215522222222"}},
+        # Estado en el nombre del evento, sin `status`.
+        {"event": "connect_session.completed", "session_id": "sess_sobre",
+         "data": {"phone_number_id": "5215522222222"}},
+        # Evento oficial de NeuroAPI con los datos en `data`.
+        {"event": "whatsapp.connected",
+         "data": {"session_id": "sess_sobre", "phone_number_id": "5215522222222",
+                  "phone_number": "+52 1 55 2222 2222", "waba_id": "999"}},
+        # Evento oficial con todo en la raíz.
+        {"event": "whatsapp.connected", "session_id": "sess_sobre",
+         "phone_number_id": "5215522222222", "phone_number": "+52 1 55 2222 2222"},
+        # `type` en lugar de `event`, y el id del número como otp_phone_number_id.
+        {"type": "whatsapp.connected", "session_id": "sess_sobre",
+         "otp_phone_number_id": "5215522222222"},
+        # Sobre estándar de Meta.
+        {"object": "whatsapp_business_account",
+         "entry": [{"id": "999", "changes": [{"field": "account_update", "value": {
+             "event": "whatsapp.connected", "session_id": "sess_sobre",
+             "phone_number_id": "5215522222222", "waba_id": "999"}}]}]},
+    ],
+    ids=[
+        "status-en-data", "status-en-event", "connected-en-data", "connected-en-raiz",
+        "connected-type-otp", "connected-sobre-meta",
+    ],
+)
+@pytest.mark.asyncio
+async def test_un_evento_con_los_datos_anidados_activa_el_canal(
+    http_client, tenant_y_usuario, con_secreto, evento
+):
+    tenant_id = tenant_y_usuario["tenant_id"]
+    await _sesion_pendiente(tenant_id, "sess_sobre")
+
+    cuerpo = json.dumps(evento).encode()
+    respuesta = await http_client.post(
+        "/api/canales/whatsapp/neuroapi/webhook",
+        content=cuerpo,
+        headers={"x-hub-signature-256": firmar(cuerpo), "content-type": "application/json"},
+    )
+    assert respuesta.status_code == 200
+
+    canal = await fetch_one(
+        "SELECT is_active FROM tenant_channels WHERE tenant_id = $1 AND channel_type = 'whatsapp'",
+        tenant_id,
+    )
+    assert canal is not None and canal["is_active"] is True
+    numero = await fetch_value(
+        "SELECT phone_number_id FROM channel_credentials WHERE tenant_id = $1 AND channel_type = 'whatsapp'",
+        tenant_id,
+    )
+    assert numero == "5215522222222"
+
+
+@pytest.mark.asyncio
+async def test_el_volcado_del_evento_no_muestra_tokens(http_client, con_secreto, caplog):
+    cuerpo = json.dumps(
+        {"event": "whatsapp.connected", "session_id": "sess_ajena",
+         "data": {"access_token": "EAAG-secreto", "phone_number_id": "1"}}
+    ).encode()
+    with caplog.at_level("WARNING", logger="operativai.canales.neuroapi_connect"):
+        await http_client.post(
+            "/api/canales/whatsapp/neuroapi/webhook",
+            content=cuerpo,
+            headers={"x-hub-signature-256": firmar(cuerpo), "content-type": "application/json"},
+        )
+    assert "EAAG-secreto" not in caplog.text
+    assert "phone_number_id" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_un_status_desconocido_no_rompe_el_webhook(
     http_client, tenant_y_usuario, con_secreto
