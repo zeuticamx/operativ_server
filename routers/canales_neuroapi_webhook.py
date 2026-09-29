@@ -19,6 +19,26 @@ router = APIRouter(prefix="/canales/whatsapp/neuroapi", tags=["canales"])
 
 log = logging.getLogger("operativai.canales.neuroapi_connect")
 
+# La tabla solo admite pendiente/completado/fallido (CHECK en
+# sql/24_neuroapi_connect_sessions.sql). El vocabulario de NeuroAPI no está
+# confirmado, así que se aceptan también los equivalentes en inglés: un valor
+# fuera del CHECK hacía fallar el UPDATE con 500 y el canal nunca se activaba.
+ESTADOS: dict[str, str] = {
+    "completado": "completado",
+    "completed": "completado",
+    "complete": "completado",
+    "success": "completado",
+    "succeeded": "completado",
+    "fallido": "fallido",
+    "failed": "fallido",
+    "error": "fallido",
+    "cancelled": "fallido",
+    "canceled": "fallido",
+    "expired": "fallido",
+    "pendiente": "pendiente",
+    "pending": "pendiente",
+}
+
 
 @router.post("/webhook", status_code=200)
 async def webhook(request: Request) -> dict[str, bool]:
@@ -54,9 +74,22 @@ async def webhook(request: Request) -> dict[str, bool]:
         return {"recibido": True}
 
     session_id = evento.get("session_id") or evento.get("id")
-    estado = str(evento.get("status", ""))
+    estado_crudo = str(evento.get("status", "")).strip()
+    log.info(
+        "Evento de NeuroAPI Connect: session_id=%s status=%r claves=%s",
+        session_id, estado_crudo, sorted(evento.keys()),
+    )
     if not session_id:
+        log.warning("Evento de NeuroAPI Connect sin session_id; claves=%s", sorted(evento.keys()))
         return {"recibido": True}
+
+    estado = ESTADOS.get(estado_crudo.lower())
+    if estado is None:
+        log.warning(
+            "NeuroAPI Connect mandó un status desconocido %r para la sesión %s",
+            estado_crudo, session_id,
+        )
+        estado = "pendiente"
 
     fila = await fetch_one(
         """
@@ -66,8 +99,8 @@ async def webhook(request: Request) -> dict[str, bool]:
         RETURNING tenant_id
         """,
         session_id,
-        estado or "pendiente",
-        evento.get("detail") or evento.get("error"),
+        estado,
+        evento.get("detail") or evento.get("error") or (estado_crudo if estado_crudo.lower() not in ESTADOS else None),
     )
     if fila is None:
         log.info("Evento de NeuroAPI Connect para una sesión que no es nuestra: %s", session_id)

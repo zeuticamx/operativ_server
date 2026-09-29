@@ -266,6 +266,53 @@ async def test_una_sesion_completada_activa_el_canal(
 
 
 @pytest.mark.asyncio
+async def test_un_status_en_ingles_tambien_activa_el_canal(
+    http_client, tenant_y_usuario, con_secreto
+):
+    tenant_id = tenant_y_usuario["tenant_id"]
+    await _sesion_pendiente(tenant_id, "sess_en")
+
+    cuerpo = json.dumps(
+        {"session_id": "sess_en", "status": "completed", "phone_number_id": "5215511111111"}
+    ).encode()
+    respuesta = await http_client.post(
+        "/api/canales/whatsapp/neuroapi/webhook",
+        content=cuerpo,
+        headers={"x-hub-signature-256": firmar(cuerpo), "content-type": "application/json"},
+    )
+    assert respuesta.status_code == 200
+
+    canal = await fetch_one(
+        "SELECT is_active FROM tenant_channels WHERE tenant_id = $1 AND channel_type = 'whatsapp'",
+        tenant_id,
+    )
+    assert canal["is_active"] is True
+
+
+@pytest.mark.asyncio
+async def test_un_status_desconocido_no_rompe_el_webhook(
+    http_client, tenant_y_usuario, con_secreto
+):
+    """Antes chocaba con el CHECK de la tabla y respondía 500."""
+    tenant_id = tenant_y_usuario["tenant_id"]
+    await _sesion_pendiente(tenant_id, "sess_rara")
+
+    cuerpo = json.dumps({"session_id": "sess_rara", "status": "in_review"}).encode()
+    respuesta = await http_client.post(
+        "/api/canales/whatsapp/neuroapi/webhook",
+        content=cuerpo,
+        headers={"x-hub-signature-256": firmar(cuerpo), "content-type": "application/json"},
+    )
+    assert respuesta.status_code == 200
+
+    fila = await fetch_one(
+        "SELECT status, detalle FROM neuroapi_connect_sessions WHERE session_id = $1", "sess_rara"
+    )
+    assert fila["status"] == "pendiente"
+    assert fila["detalle"] == "in_review"
+
+
+@pytest.mark.asyncio
 async def test_un_session_id_desconocido_no_rompe(http_client, db, con_secreto):
     """Una sesión que no es nuestra se contesta 200 y no toca nada."""
     cuerpo = json.dumps({"session_id": "sess_ajena", "status": "completado"}).encode()
