@@ -139,11 +139,21 @@ _COLUMNAS_HERRAMIENTAS = ", ".join(f"p.{c}" for c in COLUMNA_PLAN.values())
 
 
 async def acceso_plan(tenant_id: UUID) -> AccesoPlan:
+    # Una 'activa' con la fecha ya pasada se lee como 'pausada' aunque el job
+    # (jobs/pagos_background.py, cada hora) todavía no la haya escrito: así
+    # una prueba de gerencia (services/pruebas.py) o un ciclo pagado cortan
+    # las herramientas en el minuto exacto, no hasta una hora después.
+    # acceso_pagos NO hace lo mismo a propósito: tiene espejo en SQL
+    # (SQL_AGENTE_OPERANDO) y decide lo que ve el cliente final en WhatsApp;
+    # el agente sigue esperando al job.
     fila = await fetch_one(
         f"""
         SELECT
             s.plan,
-            s.estado AS estado_suscripcion,
+            CASE WHEN s.estado = 'activa' AND s.fecha_renovacion < NOW()
+                 THEN 'pausada'
+                 ELSE s.estado
+            END AS estado_suscripcion,
             ep.estado AS estado_plataforma,
             {_COLUMNAS_HERRAMIENTAS}
         FROM tenants t

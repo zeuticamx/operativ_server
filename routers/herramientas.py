@@ -18,7 +18,7 @@ from schemas import (
     HerramientaInfoOut,
     HerramientaOut,
 )
-from services import google_tools
+from services import google_tools, herramientas_calendario
 
 router = APIRouter(
     prefix="/herramientas",
@@ -58,6 +58,7 @@ async def listar(tenant_id: UUID = Depends(tenant_actual)):
             last_verified_at=f["last_verified_at"],
             nombre_documento=(f["config"] or {}).get("nombre_documento"),
             url_original=(f["config"] or {}).get("url_original"),
+            gestionada=herramientas_calendario.es_gestionada(f["tool_key"]),
         )
         for f in filas
     ]
@@ -290,11 +291,22 @@ async def actualizar(
         last_verified_at=fila["last_verified_at"],
         nombre_documento=config.get("nombre_documento"),
         url_original=config.get("url_original"),
+        gestionada=herramientas_calendario.es_gestionada(fila["tool_key"]),
     )
 
 
 @router.delete("/{tool_key}", status_code=204)
 async def eliminar(tool_key: str, tenant_id: UUID = Depends(tenant_actual)):
+    # Las del calendario las vuelve a crear el sistema (al encender el
+    # módulo o al arrancar): borrarlas no serviría. Pausarlas sí.
+    if herramientas_calendario.es_gestionada(tool_key):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Esta herramienta es parte del calendario: no se puede eliminar. "
+                "Puedes pausarla, o apagar el calendario."
+            ),
+        )
     await execute(
         "DELETE FROM tenant_tools WHERE tenant_id = $1 AND tool_key = $2",
         tenant_id,

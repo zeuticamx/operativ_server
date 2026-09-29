@@ -158,6 +158,10 @@ class HerramientaOut(BaseModel):
     last_verified_at: datetime | None
     nombre_documento: str | None = None
     url_original: str | None = None
+    # La crea y la mantiene el sistema (las del calendario, ver
+    # services/herramientas_calendario.py): se puede pausar o editar su
+    # texto, no borrar ni "verificar" como un documento de Google.
+    gestionada: bool = False
 
 
 class ConectarGoogleSheetIn(BaseModel):
@@ -815,6 +819,9 @@ class AlertaOut(BaseModel):
 TipoPago = Literal["subscription", "credit_purchase"]
 EstadoPago = Literal["pendiente", "aprobado", "rechazado", "cancelado", "reembolsado"]
 EstadoSuscripcion = Literal["activa", "pausada", "cancelada"]
+# De dónde salió la suscripción (26_plan_prueba.sql): un pago aprobado o una
+# prueba otorgada por gerencia de plataforma.
+OrigenSuscripcion = Literal["pago", "prueba"]
 # Texto y no Literal: los planes se dan de alta desde /gerencia/planes, y
 # tenant_subscriptions.plan es FK a planes(nombre) (25_planes_herramientas.sql).
 # Si el plan existe y está activo lo decide la base (pagos.cotizar), no el
@@ -1025,6 +1032,9 @@ class TenantGerenciaOut(BaseModel):
 
     agente_ia_activo: bool
     gestion_vendedores_activo: bool
+    # El interruptor del módulo (tenant_servicios). Aparte del plan: el plan
+    # da el derecho a usar el calendario, esto es que esté encendido.
+    calendario_activo: bool
     # El efectivo, ya cruzado con pagos y suspensión: es lo que de verdad
     # responde n8n. Puede diferir de `agente_ia_activo`, y esa diferencia es
     # justo lo que gerencia necesita ver.
@@ -1032,6 +1042,9 @@ class TenantGerenciaOut(BaseModel):
 
     plan: NombrePlan | None
     estado_suscripcion: EstadoSuscripcion | None
+    # 'prueba' = la otorgó gerencia; en ese caso `fecha_renovacion` es el
+    # fin de la prueba. None si nunca tuvo suscripción.
+    origen_suscripcion: OrigenSuscripcion | None
     fecha_renovacion: datetime | None
     precio_monthly: Decimal | None
     creditos_disponibles: Decimal
@@ -1150,11 +1163,16 @@ class CambiarServiciosTenantIn(BaseModel):
 
     agente_ia_activo: bool | None = None
     gestion_vendedores_activo: bool | None = None
+    calendario_activo: bool | None = None
     motivo: str | None = Field(default=None, max_length=1000)
 
     @model_validator(mode="after")
     def al_menos_uno(self):
-        if self.agente_ia_activo is None and self.gestion_vendedores_activo is None:
+        if (
+            self.agente_ia_activo is None
+            and self.gestion_vendedores_activo is None
+            and self.calendario_activo is None
+        ):
             raise ValueError("Hay que indicar al menos un servicio para cambiar")
         return self
 
@@ -1177,6 +1195,52 @@ class AjusteCreditosIn(BaseModel):
 
 class AjusteCreditosOut(BaseModel):
     creditos_disponibles: Decimal
+
+
+UnidadDuracionPrueba = Literal["dias", "semanas", "fecha"]
+
+
+class OtorgarPruebaIn(BaseModel):
+    """
+    Plan de prueba otorgado por gerencia (services/pruebas.py).
+
+    La duración llega de una de tres formas, según `unidad`:
+      - 'dias' / 'semanas': `cantidad` desde ahora.
+      - 'fecha': `fecha_expiracion` explícita, con zona horaria.
+
+    Los topes de acá son de forma (nada de 400 días); el tope real de tres
+    meses calendario depende de "ahora" y lo aplica calcular_expiracion.
+    """
+
+    plan: NombrePlan
+    unidad: UnidadDuracionPrueba
+    cantidad: int | None = Field(default=None, ge=1, le=92)
+    fecha_expiracion: datetime | None = None
+    motivo: str = Field(min_length=3, max_length=500)
+
+    @model_validator(mode="after")
+    def duracion_coherente(self):
+        if self.unidad == "fecha":
+            if self.fecha_expiracion is None:
+                raise ValueError("Falta la fecha de expiración")
+            if self.cantidad is not None:
+                raise ValueError("Con una fecha límite no va `cantidad`")
+            # Una fecha sin zona horaria es ambigua (¿hora de quién?): mejor
+            # rechazarla que vencer la prueba seis horas antes o después.
+            if self.fecha_expiracion.tzinfo is None:
+                raise ValueError("La fecha de expiración tiene que incluir zona horaria")
+        else:
+            if self.cantidad is None:
+                raise ValueError("Falta la cantidad de días o semanas")
+            if self.fecha_expiracion is not None:
+                raise ValueError("Con días o semanas no va `fecha_expiracion`")
+            if self.unidad == "semanas" and self.cantidad > 13:
+                raise ValueError("La prueba dura como máximo 3 meses")
+        return self
+
+
+class RevocarPruebaIn(BaseModel):
+    motivo: str = Field(min_length=3, max_length=500)
 
 
 class EntradaAuditoriaOut(BaseModel):

@@ -454,6 +454,8 @@ JOIN en cada request.
 | PATCH | `/gerencia/tenants/{id}/estado` | activo / prueba / suspendido / baja |
 | PATCH | `/gerencia/tenants/{id}/servicios` | Enciende o apaga agente y módulo de vendedores |
 | POST | `/gerencia/tenants/{id}/creditos` | Ajuste manual de saldo (positivo suma, negativo resta) |
+| POST | `/gerencia/tenants/{id}/prueba` | Otorga un plan activo del catálogo como prueba (días, semanas o fecha; máx. 3 meses) |
+| POST | `/gerencia/tenants/{id}/prueba/revocar` | Termina la prueba ya (queda `cancelada`) |
 | GET | `/gerencia/consumo?dias=&tenant_id=` | Serie diaria de tokens y desglose por modelo |
 | GET | `/gerencia/auditoria?tenant_id=&accion=&limite=` | Bitácora, solo lectura |
 | GET | `/gerencia/salud` | Problemas operativos de ahora + alertas de plataforma abiertas |
@@ -466,6 +468,23 @@ JOIN en cada request.
 | PATCH | `/gerencia/planes/{nombre}` | Edita un plan (no se puede renombrar) |
 
 `orden=margen` ordena del peor margen al mejor.
+
+**Plan de prueba** (`services/pruebas.py`, `sql/26_plan_prueba.sql`): no es
+un mecanismo aparte, es una fila de `tenant_subscriptions` `activa` con
+`origen='prueba'`, `precio_monthly=0` (no infla el MRR) y
+`fecha_renovacion` = fin de la prueba. Por eso el gate por plan, el de pagos
+y el job de vencimiento la tratan igual que a un plan pagado. Reglas: tope de
+3 meses calendario, solo planes `activo`, no pisa un plan pagado vigente
+(409) pero sí otra prueba o una suscripción pausada/cancelada, y un pago
+aprobado la convierte en `origen='pago'`. Revocar la deja `cancelada` en vez
+de borrar la fila: sin fila el negocio contaría como "nunca pagó" y
+`acceso_pagos` dejaría al agente contestando.
+
+Al vencer, `acceso_plan` corta las herramientas del portal **al instante**
+(lee una `activa` con `fecha_renovacion` pasada como `pausada`, para toda
+suscripción, no solo pruebas). El agente de n8n (`acceso_pagos` y su espejo
+`SQL_AGENTE_OPERANDO`) sigue esperando al job, hasta
+`SUSCRIPCION_REVISION_INTERVALO_HORAS` (1 h por defecto).
 
 `TenantGerenciaOut.email` es el correo de un solo portal_user del negocio
 (owner primero, después superadmin, después el resto por antigüedad — mismo
@@ -526,6 +545,21 @@ bloquea nada.
 `tenants` es de n8n, así que el estado vive en su propia tabla del portal
 (`tenant_estado_plataforma`) en vez de como columna — mismo criterio que
 `tenant_servicios`.
+
+### Herramientas del agente para el calendario
+
+El agente de n8n usa el calendario a través de cinco filas de `tenant_tools`
+(`consultar_servicios`, `consultar_proveedores`, `consultar_disponibilidad`,
+`crear_reserva`, `cancelar_reserva`) que apuntan a `/api/eventos/calendario/*`
+con `X-Internal-Token`. Las crea `services/herramientas_calendario.py` al
+encender el calendario (dueño, gerencia o una prueba de plan) y las pausa al
+apagarlo; al arrancar, `sincronizar_todos()` se las da a quien ya lo tenía
+encendido y refresca URL (`BASE_URL_BACKEND`) y token (`N8N_INTERNAL_TOKEN`,
+guardado con `set_tool_credentials`). No pisa textos editados por el dueño ni
+reactiva una que él pausó. No se pueden eliminar desde `/herramientas` (409).
+
+Si cambias el contrato de esos endpoints, actualiza también `definiciones()`:
+es lo que lee el workflow `ejecutar-herramienta-tenant`.
 
 ### Control de acceso por plan
 

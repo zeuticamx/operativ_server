@@ -228,7 +228,10 @@ def expira_en(segundos: int | None) -> datetime | None:
 def a_http(e: MetaError) -> HTTPException:
     """Traduce un error de Meta a una respuesta HTTP con sentido."""
     if e.code in (190, 102):
-        codigo = status.HTTP_401_UNAUTHORIZED
+        # Token de Meta del canal vencido/revocado. NO puede ser 401: el
+        # frontend (apiFetch) lo lee como sesión del portal expirada, borra
+        # los tokens y manda a /login, y el mensaje nunca se envía.
+        codigo = status.HTTP_409_CONFLICT
     elif e.code in (3, 10, 200):
         codigo = status.HTTP_403_FORBIDDEN
     elif e.code == 613:

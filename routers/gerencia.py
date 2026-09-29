@@ -7,7 +7,7 @@ negocio" y está limitado a su tenant_id. Este nivel no tiene tenant y ve a
 todos, así que ninguna consulta de acá filtra por tenant salvo cuando la
 pantalla lo pide explícitamente.
 
-Las tres acciones que cambian algo (estado, servicios, créditos) escriben
+Las acciones que cambian algo (estado, servicios, créditos, prueba) escriben
 en gerencia_auditoria dentro de la misma transacción que el cambio: una
 suspensión aplicada que no quedó registrada es peor que una que no se
 aplicó.
@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from config import settings
 from deps import UsuarioActual, gerencia_plataforma_actual
+from services import herramientas_calendario, pruebas
 from services.banxico import obtener_tipo_cambio
 from schemas import (
     AjusteCreditosIn,
@@ -31,8 +32,10 @@ from schemas import (
     ConsumoTenantOut,
     EntradaAuditoriaOut,
     EstadoTenantPlataforma,
+    OtorgarPruebaIn,
     PuntoConsumoOut,
     ResumenGerenciaOut,
+    RevocarPruebaIn,
     TenantGerenciaOut,
     TenantsGerenciaOut,
     TransaccionOut,
@@ -272,6 +275,10 @@ def _sql_fichas(filtro: str, orden: str, limite: str = "") -> str:
                 COALESCE(co.tokens_total, 0)   AS tokens_total,
                 COALESCE(co.costo_usd, 0)      AS costo_usd,
                 COALESCE(co.llamadas, 0)       AS llamadas,
+                -- Aparte de la vista: v_gerencia_tenants es anterior a
+                -- 26_plan_prueba.sql y no hace falta recrearla por un campo.
+                sp.origen                      AS origen_suscripcion,
+                COALESCE(tsv.calendario_activo, false) AS calendario_activo,
                 ROUND(
                     CASE WHEN g.estado_suscripcion = 'activa'
                          THEN COALESCE(g.precio_monthly, 0) * $4::numeric / 30
@@ -300,6 +307,8 @@ def _sql_fichas(filtro: str, orden: str, limite: str = "") -> str:
             LEFT JOIN consumo           co ON co.tenant_id = g.tenant_id
             LEFT JOIN tenant_credits    cr ON cr.tenant_id = g.tenant_id
             LEFT JOIN creditos_cobrados cc ON cc.tenant_id = g.tenant_id
+            LEFT JOIN tenant_subscriptions sp ON sp.tenant_id = g.tenant_id
+            LEFT JOIN tenant_servicios tsv ON tsv.tenant_id = g.tenant_id
             {filtro}
         )
         SELECT
@@ -392,9 +401,11 @@ def _tenant_out(f, fuente) -> TenantGerenciaOut:
         estado_actualizado_por=f["estado_actualizado_por"],
         agente_ia_activo=f["agente_ia_activo"],
         gestion_vendedores_activo=f["gestion_vendedores_activo"],
+        calendario_activo=f["calendario_activo"],
         agente_operando=f["agente_operando"],
         plan=f["plan"],
         estado_suscripcion=f["estado_suscripcion"],
+        origen_suscripcion=f["origen_suscripcion"],
         fecha_renovacion=f["fecha_renovacion"],
         precio_monthly=f["precio_monthly"],
         creditos_disponibles=f["creditos_disponibles"],
@@ -576,7 +587,8 @@ async def cambiar_servicios_tenant(
             """
             SELECT
                 COALESCE(ts.agente_ia_activo, true)           AS agente_ia_activo,
-                COALESCE(ts.gestion_vendedores_activo, false) AS gestion_vendedores_activo
+                COALESCE(ts.gestion_vendedores_activo, false) AS gestion_vendedores_activo,
+                COALESCE(ts.calendario_activo, false)         AS calendario_activo
             FROM tenants t
             LEFT JOIN tenant_servicios ts ON ts.tenant_id = t.id
             WHERE t.id = $1
@@ -599,20 +611,32 @@ async def cambiar_servicios_tenant(
             if datos.gestion_vendedores_activo is None
             else datos.gestion_vendedores_activo
         )
+        calendario = (
+            anterior["calendario_activo"]
+            if datos.calendario_activo is None
+            else datos.calendario_activo
+        )
 
+        # No pasa por el gate de plan del endpoint del dueño (que impide
+        # encender lo que el plan no incluye): plataforma puede habilitar un
+        # módulo a mano. Ojo: sin plan que lo incluya, el portal lo sigue
+        # respondiendo 402 (services/acceso_plan.py).
         await conn.execute(
             """
             INSERT INTO tenant_servicios
-                (tenant_id, agente_ia_activo, gestion_vendedores_activo, actualizado_en)
-            VALUES ($1, $2, $3, NOW())
+                (tenant_id, agente_ia_activo, gestion_vendedores_activo,
+                 calendario_activo, actualizado_en)
+            VALUES ($1, $2, $3, $4, NOW())
             ON CONFLICT (tenant_id) DO UPDATE SET
                 agente_ia_activo          = EXCLUDED.agente_ia_activo,
                 gestion_vendedores_activo = EXCLUDED.gestion_vendedores_activo,
+                calendario_activo         = EXCLUDED.calendario_activo,
                 actualizado_en            = NOW()
             """,
             tenant_id,
             agente,
             vendedores,
+            calendario,
         )
 
         await registrar_auditoria(
@@ -624,15 +648,22 @@ async def cambiar_servicios_tenant(
                 "antes": {
                     "agente_ia_activo": anterior["agente_ia_activo"],
                     "gestion_vendedores_activo": anterior["gestion_vendedores_activo"],
+                    "calendario_activo": anterior["calendario_activo"],
                 },
                 "despues": {
                     "agente_ia_activo": agente,
                     "gestion_vendedores_activo": vendedores,
+                    "calendario_activo": calendario,
                 },
                 "motivo": datos.motivo,
             },
             conn=conn,
         )
+
+    # Fuera de la transacción: sincronizar abre la suya y nunca falla hacia
+    # afuera (services/herramientas_calendario.py).
+    if datos.calendario_activo is not None:
+        await herramientas_calendario.sincronizar(tenant_id, calendario)
 
     return await _traer_tenant(tenant_id, DIAS_POR_DEFECTO)
 
@@ -721,6 +752,39 @@ async def ajustar_creditos(
         )
 
     return AjusteCreditosOut(creditos_disponibles=saldo_nuevo)
+
+
+@router.post("/tenants/{tenant_id}/prueba", response_model=TenantGerenciaOut)
+async def otorgar_prueba(
+    tenant_id: UUID,
+    datos: OtorgarPruebaIn,
+    gerente: UsuarioActual = Depends(gerencia_plataforma_actual),
+):
+    """
+    Otorga un plan del catálogo como prueba, por días, semanas o hasta una
+    fecha (máximo 3 meses). Al vencer, el negocio queda como cualquier
+    cuenta sin plan vigente — ver services/pruebas.py.
+    """
+    await pruebas.otorgar_prueba(
+        tenant_id, datos, gerente_email=gerente.email, gerente_id=gerente.id
+    )
+    return await _traer_tenant(tenant_id, DIAS_POR_DEFECTO)
+
+
+@router.post("/tenants/{tenant_id}/prueba/revocar", response_model=TenantGerenciaOut)
+async def revocar_prueba(
+    tenant_id: UUID,
+    datos: RevocarPruebaIn,
+    gerente: UsuarioActual = Depends(gerencia_plataforma_actual),
+):
+    """
+    Termina la prueba ya. Es POST y no DELETE porque lleva un motivo en el
+    body, y no borra nada: la suscripción queda 'cancelada'.
+    """
+    await pruebas.revocar_prueba(
+        tenant_id, datos.motivo, gerente_email=gerente.email, gerente_id=gerente.id
+    )
+    return await _traer_tenant(tenant_id, DIAS_POR_DEFECTO)
 
 
 # ============================================================

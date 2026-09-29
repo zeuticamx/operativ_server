@@ -156,8 +156,10 @@ async def test_el_job_de_vencimiento_mas_el_gate_bloquean_de_punta_a_punta(
     http_client, tenant_y_usuario
 ):
     """
-    Simula el paso del tiempo: una suscripción que vence, el job que la
-    pasa a 'pausada', y recién ahí el 402.
+    Simula el paso del tiempo: una suscripción que vence y el job que la
+    pasa a 'pausada'. El 402 llega ANTES del job: acceso_plan lee la fecha
+    al vuelo (una 'activa' vencida cuenta como pausada), y el job solo
+    deja escrito lo que el gate ya aplicaba.
     """
     from jobs.pagos_background import job_pausar_suscripciones_vencidas
 
@@ -172,7 +174,8 @@ async def test_el_job_de_vencimiento_mas_el_gate_bloquean_de_punta_a_punta(
         RUTA_PIPELINE.format(tenant_id=tenant_id),
         headers={"Authorization": f"Bearer {tenant_y_usuario['token']}"},
     )
-    assert antes.status_code == 200
+    assert antes.status_code == 402
+    assert antes.json()["detail"]["estado"] == "vencido"
 
     await job_pausar_suscripciones_vencidas()
 

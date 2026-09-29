@@ -18,7 +18,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from realtime import broadcast_alerta
-from services import pipeline_estados
+from services import herramientas_calendario, pipeline_estados
 from services.acceso_plan import acceso_plan, exigir_herramienta
 from services.asignacion import asignar_vendedor_automatico, leer_config
 from deps import (
@@ -213,6 +213,10 @@ async def actualizar_servicios(
         datos.calendario_activo,
         datos.zona_horaria,
     )
+    # El agente usa el calendario a través de sus herramientas: se crean o
+    # se pausan junto con el módulo (services/herramientas_calendario.py).
+    if datos.calendario_activo is not None:
+        await herramientas_calendario.sincronizar(tenant_id, servicios.calendario_activo)
     return ServiciosOut(**vars(servicios))
 
 

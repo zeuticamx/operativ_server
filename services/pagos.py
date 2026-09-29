@@ -175,6 +175,10 @@ async def activar_suscripcion(tenant_id: UUID, plan: str) -> None:
                 precio_monthly    = EXCLUDED.precio_monthly,
                 fecha_renovacion  = EXCLUDED.fecha_renovacion,
                 intentos_fallidos = 0,
+                -- Pagar durante (o después de) una prueba de gerencia la
+                -- convierte en un plan pagado (26_plan_prueba.sql).
+                origen            = 'pago',
+                otorgada_por      = NULL,
                 updated_at        = NOW()
             """,
             tenant_id,

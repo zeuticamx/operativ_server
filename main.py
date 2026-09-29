@@ -40,6 +40,7 @@ from routers import (
 
 from config import settings
 from jobs.alertas_background import iniciar_scheduler
+from services import herramientas_calendario
 from session import close_pool, init_pool
 from realtime import sio
 
@@ -48,6 +49,9 @@ from realtime import sio
 async def lifespan(app: FastAPI):
     settings.validate()
     await init_pool()
+    # Negocios que encendieron el calendario antes de que las herramientas
+    # del agente se crearan solas; también refresca URL y token.
+    await herramientas_calendario.sincronizar_todos()
     scheduler = iniciar_scheduler()
     yield
     scheduler.shutdown()
