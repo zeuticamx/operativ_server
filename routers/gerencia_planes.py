@@ -21,6 +21,10 @@ la FK ya lo haría seguro con su ON UPDATE CASCADE.
 
 Además de precios y límites, cada plan dice qué herramientas del portal
 incluye (`*_activo`): es la matriz que evalúa services/acceso_plan.py.
+
+`stripe_price_id` es el Price recurrente creado en el panel de Stripe: lo
+que de verdad se cobra cada mes (ver services/stripe_suscripciones.py). Sin
+él, el plan no se puede contratar en línea.
 """
 
 import asyncpg
@@ -43,6 +47,7 @@ _COLUMNAS = """
     max_vendedores, max_leads_mensuales, creditos_incluidos_mensual,
     agente_ia_activo, gestion_vendedores_activo,
     herramientas_activo, crm_campo_activo, calendario_activo, activo, orden,
+    stripe_price_id,
     created_at AS creado_en, updated_at AS actualizado_en
 """
 
@@ -77,8 +82,8 @@ async def crear_plan(
                      max_vendedores, max_leads_mensuales, creditos_incluidos_mensual,
                      agente_ia_activo, gestion_vendedores_activo,
                      herramientas_activo, crm_campo_activo, calendario_activo,
-                     activo, orden)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                     activo, orden, stripe_price_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                 """,
                 datos.nombre,
                 datos.descripcion,
@@ -94,6 +99,7 @@ async def crear_plan(
                 datos.calendario_activo,
                 datos.activo,
                 datos.orden,
+                datos.stripe_price_id,
             )
         except asyncpg.UniqueViolationError:
             raise HTTPException(
@@ -178,6 +184,12 @@ async def actualizar_plan(
             },
             "activo": anterior["activo"] if datos.activo is None else datos.activo,
             "orden": anterior["orden"] if datos.orden is None else datos.orden,
+            # None = no tocar; "" = borrarlo (ver PlanActualizarIn).
+            "stripe_price_id": (
+                anterior["stripe_price_id"]
+                if datos.stripe_price_id is None
+                else (datos.stripe_price_id or None)
+            ),
         }
 
         await conn.execute(
@@ -196,6 +208,7 @@ async def actualizar_plan(
                 calendario_activo = $12,
                 activo = $13,
                 orden = $14,
+                stripe_price_id = $15,
                 updated_at = NOW()
             WHERE nombre = $1
             """,
@@ -213,6 +226,7 @@ async def actualizar_plan(
             nuevo["calendario_activo"],
             nuevo["activo"],
             nuevo["orden"],
+            nuevo["stripe_price_id"],
         )
 
         cambios = datos.model_dump(exclude_none=True)

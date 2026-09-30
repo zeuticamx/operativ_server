@@ -1,6 +1,12 @@
 """
 Cliente de Stripe: crear el Checkout y validar la firma de sus webhooks.
 
+Dos modos de Checkout:
+  - `payment`      -> compra de créditos (cargo único, precio de la base).
+  - `subscription` -> contratar un plan, sobre el Price recurrente del plan
+                      (`planes.stripe_price_id`). Stripe cobra solo cada mes y
+                      avisa por webhook (ver services/stripe_suscripciones.py).
+
 Sin SDK, con httpx directo, igual que Meta y Mercado Pago en este mismo
 proyecto. La API de Stripe es **form-encoded**, no JSON: los campos
 anidados viajan con notación de corchetes
@@ -39,6 +45,13 @@ MONEDAS_SIN_DECIMALES = frozenset(
     {"bif", "clp", "djf", "gnf", "jpy", "kmf", "krw", "mga", "pyg", "rwf",
      "ugx", "vnd", "vuv", "xaf", "xof", "xpf"}
 )
+
+
+def de_unidad_minima(monto: int, moneda: str) -> Decimal:
+    """La inversa de a_unidad_minima: 9999 (centavos) -> Decimal("99.99")."""
+    if moneda.lower() in MONEDAS_SIN_DECIMALES:
+        return Decimal(monto)
+    return (Decimal(monto) / 100).quantize(Decimal("0.01"))
 
 
 def a_unidad_minima(monto: Decimal, moneda: str) -> int:
@@ -87,9 +100,72 @@ def _payload_checkout(
     }
 
 
+def _payload_suscripcion(
+    transaccion_id: UUID,
+    tenant_id: UUID,
+    plan: str,
+    price_id: str,
+    email: str,
+    customer_id: str | None,
+) -> dict[str, str]:
+    """
+    Arma el form-encoded de POST /v1/checkout/sessions en modo
+    `subscription`.
+
+    El monto no viaja: lo pone el Price recurrente del plan. La metadata va
+    en `subscription_data` para que quede pegada a la Subscription y
+    Stripe la repita en cada factura — así cada evento de renovación, fallo
+    o cancelación sabe de qué tenant es sin depender de nuestra base.
+    """
+    payload = {
+        "mode": "subscription",
+        "client_reference_id": str(transaccion_id),
+        # Ver _payload_checkout sobre {CHECKOUT_SESSION_ID}.
+        "success_url": f"{settings.BASE_URL_FRONTEND}/pagos/exito?session_id={{CHECKOUT_SESSION_ID}}",
+        "cancel_url": f"{settings.BASE_URL_FRONTEND}/pagos/error",
+        "line_items[0][price]": price_id,
+        "line_items[0][quantity]": "1",
+        "metadata[transaccion_id]": str(transaccion_id),
+        "subscription_data[metadata][transaccion_id]": str(transaccion_id),
+        "subscription_data[metadata][tenant_id]": str(tenant_id),
+        "subscription_data[metadata][plan]": plan,
+    }
+    # Un tenant que ya fue cliente reusa su Customer (tarjetas guardadas,
+    # historial de facturas en un solo lugar). La primera vez se manda el
+    # correo y Stripe crea el Customer — en modo subscription siempre lo
+    # crea. `customer` y `customer_email` no pueden ir juntos.
+    if customer_id:
+        payload["customer"] = customer_id
+    else:
+        payload["customer_email"] = email
+    return payload
+
+
 async def crear_checkout_session(
     transaccion_id: UUID, concepto: str, monto: Decimal, email: str
 ) -> dict[str, Any]:
+    """Checkout de un cargo único (compra de créditos). Ver _post_checkout."""
+    return await _post_checkout(
+        transaccion_id, _payload_checkout(transaccion_id, concepto, monto, email)
+    )
+
+
+async def crear_checkout_suscripcion(
+    transaccion_id: UUID,
+    tenant_id: UUID,
+    plan: str,
+    price_id: str,
+    email: str,
+    customer_id: str | None,
+) -> dict[str, Any]:
+    """Checkout de una suscripción recurrente. Ver _post_checkout."""
+    return await _post_checkout(
+        transaccion_id,
+        _payload_suscripcion(transaccion_id, tenant_id, plan, price_id, email, customer_id),
+    )
+
+
+async def _post_checkout(transaccion_id: UUID, payload: dict[str, str]) -> dict[str, Any]:
     """
     Crea la Checkout Session hospedada y devuelve el JSON de Stripe.
 
@@ -108,7 +184,7 @@ async def crear_checkout_session(
                     # crear una segunda para el mismo cobro.
                     "Idempotency-Key": str(transaccion_id),
                 },
-                data=_payload_checkout(transaccion_id, concepto, monto, email),
+                data=payload,
             )
         respuesta.raise_for_status()
         return respuesta.json()

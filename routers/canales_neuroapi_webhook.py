@@ -5,13 +5,15 @@ Vive aparte de routers/canales.py por el mismo motivo que el de Stripe vive
 aparte de pagos.py: es el único endpoint del módulo de canales sin JWT, se
 autentica por el HMAC de la cabecera `X-Hub-Signature-256`.
 
-Al terminar el Embedded Signup, NeuroAPI dispara el evento
-`whatsapp.connected` a la `webhook_url` de la sesión. El formato del sobre no
-está confirmado, así que el parser acepta tres variantes:
+Al terminar el Embedded Signup, NeuroAPI dispara `whatsapp.connected` a la
+`webhook_url` de la sesión. Formato observado en producción (2026-09-29):
 
-  {"event": "whatsapp.connected", "data": {"session_id": ..., ...}}
-  {"event": "whatsapp.connected", "session_id": ..., "phone_number_id": ...}
-  {"entry": [{"changes": [{"value": {...}}]}]}          (sobre estándar de Meta)
+  {"event": "whatsapp.connected", "session_id": "...", "service_type": "...",
+   "timestamp": "...", "data": {"phones": [{"id": "...", "wabaId": "...",
+   "wabaName": "...", "phoneNumberId": "...", "displayPhone": "...", ...}]}}
+
+El parser acepta además variantes en snake_case, con los datos en la raíz o
+en `data`, y el sobre estándar de Meta (`entry[].changes[].value`).
 """
 
 import json
@@ -50,11 +52,6 @@ ESTADOS: dict[str, str] = {
     "pending": "pendiente",
 }
 
-# Nunca van en claro al log.
-_CABECERAS_SENSIBLES = {"authorization", "cookie", "x-api-key", "x-internal-token"}
-_FRAGMENTOS_SENSIBLES = ("token", "secret", "password", "api_key", "apikey")
-
-
 @router.post("/webhook", status_code=200)
 async def webhook(request: Request) -> dict[str, bool]:
     """
@@ -74,10 +71,6 @@ async def webhook(request: Request) -> dict[str, bool]:
     # El cuerpo crudo, no el JSON ya parseado: el HMAC se calcula sobre los
     # bytes tal cual llegaron.
     cuerpo_crudo = await request.body()
-
-    # TEMPORAL: volcar el evento completo hasta confirmar el formato real de
-    # NeuroAPI. Antes de la firma, para ver también los que se rechazan.
-    _registrar_evento_crudo(dict(request.headers), cuerpo_crudo)
 
     if not neuroapi_connect.verificar_webhook(cuerpo_crudo, dict(request.headers)):
         log.warning("Evento de NeuroAPI Connect con firma inválida")
@@ -109,9 +102,15 @@ async def webhook(request: Request) -> dict[str, bool]:
 
     tipo_evento = str(campo("event", "type") or "").strip().lower()
     session_id = campo("session_id") or evento.get("id")
-    phone_number_id = campo("phone_number_id", "otp_phone_number_id")
-    phone_number = campo("phone_number", "display_phone_number")
-    waba_id = campo("waba_id")
+    phone_number_id = campo("phoneNumberId", "phone_number_id", "otp_phone_number_id")
+    phone_number = campo("displayPhone", "phone_number", "display_phone_number")
+    waba_id = campo("wabaId", "waba_id")
+    telefonos = _telefonos(evento)
+    if len(telefonos) > 1:
+        log.warning(
+            "NeuroAPI Connect mandó %d números para la sesión %s; se usa el primero (%s)",
+            len(telefonos), session_id, phone_number_id,
+        )
 
     if tipo_evento in EVENTOS_CONECTADO:
         estado_crudo = tipo_evento
@@ -188,14 +187,22 @@ async def _activar_whatsapp(tenant_id: Any, phone_number_id: str) -> None:
     )
 
 
+def _telefonos(evento: dict[str, Any]) -> list[dict[str, Any]]:
+    datos = evento.get("data")
+    telefonos = datos.get("phones") if isinstance(datos, dict) else None
+    return [t for t in telefonos or [] if isinstance(t, dict)]
+
+
 def _fuentes(evento: dict[str, Any]) -> list[dict[str, Any]]:
     """
-    Dónde buscar cada campo, en orden de prioridad: la raíz, `data`, y cada
-    `entry[].changes[].value` del sobre de Meta (con su `data` si lo trae).
+    Dónde buscar cada campo, en orden de prioridad: la raíz, `data`, los
+    `data.phones[]` y cada `entry[].changes[].value` del sobre de Meta (con
+    su `data` si lo trae).
     """
     fuentes: list[dict[str, Any]] = [evento]
     if isinstance(evento.get("data"), dict):
         fuentes.append(evento["data"])
+    fuentes.extend(_telefonos(evento))
     for entrada in evento.get("entry") or []:
         if not isinstance(entrada, dict):
             continue
@@ -206,32 +213,6 @@ def _fuentes(evento: dict[str, Any]) -> list[dict[str, Any]]:
                 if isinstance(valor.get("data"), dict):
                     fuentes.append(valor["data"])
     return fuentes
-
-
-def _ocultar(valor: Any) -> Any:
-    if isinstance(valor, dict):
-        return {
-            k: "***" if any(f in k.lower() for f in _FRAGMENTOS_SENSIBLES) else _ocultar(v)
-            for k, v in valor.items()
-        }
-    if isinstance(valor, list):
-        return [_ocultar(v) for v in valor]
-    return valor
-
-
-def _registrar_evento_crudo(cabeceras: dict[str, str], cuerpo_crudo: bytes) -> None:
-    cabeceras_log = {
-        k: "***" if k.lower() in _CABECERAS_SENSIBLES else v for k, v in cabeceras.items()
-    }
-    try:
-        cuerpo_log = json.dumps(_ocultar(json.loads(cuerpo_crudo)), indent=2, ensure_ascii=False)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        cuerpo_log = f"<no JSON, {len(cuerpo_crudo)} bytes>"
-    log.warning(
-        "NeuroAPI Connect webhook recibido\ncabeceras=%s\ncuerpo=%s",
-        json.dumps(cabeceras_log, indent=2, ensure_ascii=False),
-        cuerpo_log,
-    )
 
 
 def _estructura(evento: dict[str, Any]) -> str:

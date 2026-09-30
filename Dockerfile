@@ -12,4 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 EXPOSE 8000
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# main:socket_app y NO main:app: con `app` la capa Socket.IO (realtime.py)
+# no se monta, /socket.io/* cae en FastAPI (404) y el WebSocket de alertas
+# se rechaza con 403 en cada carga de página.
+CMD ["uvicorn", "main:socket_app", "--host", "0.0.0.0", "--port", "8000"]

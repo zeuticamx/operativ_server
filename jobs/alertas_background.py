@@ -23,6 +23,8 @@ from jobs.pagos_background import job_pausar_suscripciones_vencidas
 from jobs.pagos_background import JOB_ID as JOB_ID_PAGOS
 from jobs.gerencia_background import JOB_ID as JOB_ID_CONSUMO
 from jobs.gerencia_background import job_consumo_anomalo
+from jobs.perfil_background import JOB_ID as JOB_ID_PERFIL
+from jobs.perfil_background import job_recordatorio_perfil
 from realtime import broadcast_alerta
 from services.correo import ErrorEnvioCorreo, enviar_resumen_alertas
 from services.pipeline_estados import ESTADOS_CERRADOS
@@ -136,6 +138,9 @@ _SELECT_NO_LEIDAS = """
     FROM alertas a
     JOIN tenants t ON t.id = a.tenant_id
     WHERE a.leido = false
+      -- Las personales (recordatorio de perfil) ya mandan su propio correo
+      -- a su dueño; no son asunto del resumen del negocio.
+      AND a.portal_user_id IS NULL
     ORDER BY a.tenant_id, a.creado_en DESC
 """
 
@@ -230,6 +235,17 @@ def iniciar_scheduler() -> AsyncIOScheduler:
         hours=settings.CONSUMO_ANOMALO_INTERVALO_HORAS,
         id=JOB_ID_CONSUMO,
         name="Detectar consumo anómalo de IA",
+        max_instances=1,
+        coalesce=True,
+    )
+    # Recordatorio diario de perfil incompleto (jobs/perfil_background.py).
+    # Corre cada hora, pero a cada usuario le toca como mucho uno por día.
+    scheduler.add_job(
+        job_recordatorio_perfil,
+        "interval",
+        hours=settings.PERFIL_RECORDATORIO_INTERVALO_HORAS,
+        id=JOB_ID_PERFIL,
+        name="Recordatorio de perfil incompleto",
         max_instances=1,
         coalesce=True,
     )

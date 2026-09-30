@@ -107,6 +107,27 @@ class Settings:
     SMTP_FROM_NAME: str = os.getenv("SMTP_FROM_NAME", "OperativAI")
     SMTP_STARTTLS: bool = os.getenv("SMTP_STARTTLS", "true").lower() != "false"
 
+    # ---- Términos y condiciones ----
+    # Versión del texto de /condiciones y /privacidad que se guarda junto a
+    # la aceptación (portal_users.terminos_version). Es la fecha de "Última
+    # actualización" de esas páginas: si se cambian los términos, se sube
+    # acá y queda registrado quién aceptó cuál texto.
+    TERMINOS_VERSION: str = os.getenv("TERMINOS_VERSION", "2026-09-23")
+
+    # ---- Perfil del usuario (routers/perfil.py) ----
+    # Foto: tope de peso y de lado. El portal redimensiona en el navegador
+    # antes de subir; el backend solo rechaza (no hay Pillow).
+    PERFIL_FOTO_MAX_BYTES: int = int(os.getenv("PERFIL_FOTO_MAX_BYTES", str(2 * 1024 * 1024)))
+    PERFIL_FOTO_MAX_PX: int = int(os.getenv("PERFIL_FOTO_MAX_PX", "642"))
+    # Recordatorios de perfil incompleto (jobs/perfil_background.py): uno
+    # cada 24 h durante los primeros PERFIL_RECORDATORIO_DIAS días naturales
+    # desde la creación de la cuenta. El job corre cada
+    # PERFIL_RECORDATORIO_INTERVALO_HORAS y manda solo a quien le toca.
+    PERFIL_RECORDATORIO_DIAS: int = int(os.getenv("PERFIL_RECORDATORIO_DIAS", "20"))
+    PERFIL_RECORDATORIO_INTERVALO_HORAS: int = int(
+        os.getenv("PERFIL_RECORDATORIO_INTERVALO_HORAS", "1")
+    )
+
     # ---- Verificación de correo ----
     CODIGO_VIGENCIA_MINUTOS: int = int(os.getenv("CODIGO_VIGENCIA_MINUTOS", "10"))
     # Tope de intentos fallidos antes de descartar el alta. Con 6 dígitos hay
@@ -167,15 +188,6 @@ class Settings:
     STRIPE_WEBHOOK_SECRET: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
     # Stripe espera el código de moneda en minúsculas (iso 4217).
     STRIPE_CURRENCY: str = os.getenv("STRIPE_CURRENCY", "mxn").strip().lower()
-
-    # ---- Impuestos ----
-    # Los precios de `planes` (precio_monthly/precio_annual) se guardan y se
-    # muestran SIN IVA — de ahí la leyenda "más IVA (16%)" en /suscripcion.
-    # Esta tasa es lo que services/pagos.cotizar suma antes de mandarle el
-    # monto a la pasarela: lo que se cobra de verdad sí lo incluye. 0.16 es
-    # la tasa general de México; configurable por si algún día se cobra
-    # desde otro país con otra tasa.
-    IVA_TASA: str = os.getenv("IVA_TASA", "0.16").strip()
 
     # ---- Mercado Pago (deshabilitado; ver PAYMENT_PROVIDER) ----
     MERCADOPAGO_ACCESS_TOKEN: str = os.getenv("MERCADOPAGO_ACCESS_TOKEN", "")
@@ -317,19 +329,6 @@ class Settings:
         except (InvalidOperation, ValueError):
             return None
         return valor if valor > 0 else None
-
-    @property
-    def iva_tasa(self) -> Decimal:
-        """
-        IVA_TASA ya parseado. Un valor mal escrito cae al 16% en vez de
-        tumbar el arranque o cobrar sin impuesto por una variable de entorno
-        mal puesta a mano.
-        """
-        try:
-            valor = Decimal(self.IVA_TASA)
-        except (InvalidOperation, ValueError):
-            return Decimal("0.16")
-        return valor if valor >= 0 else Decimal("0.16")
 
     @property
     def banxico_configurado(self) -> bool:

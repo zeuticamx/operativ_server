@@ -146,6 +146,80 @@ log** en vez de enviarlos. Es cómodo en local, pero en producción significa
 que nadie recibe nada: llena `SMTP_HOST` y `SMTP_FROM`. El arranque avisa
 con un WARNING si faltan.
 
+### Aceptación de Términos y Condiciones
+
+Ninguna cuenta nace sin evidencia de que el dueño aceptó las Condiciones del
+servicio y el Aviso de privacidad (`/condiciones` y `/privacidad` del
+portal). La evidencia es `portal_users.terminos_aceptados_en` (TIMESTAMPTZ
+escrito por el servidor, NULL = no hay) y `terminos_version` (qué texto
+estaba vigente: `TERMINOS_VERSION` en `config.py`, hoy la fecha de "Última
+actualización" de esas páginas; súbela cuando cambien los términos).
+Migración: `sql/28_aceptacion_terminos.sql`.
+
+| Camino | Regla |
+|---|---|
+| `POST /auth/registro` | `acepta_terminos` es **obligatorio y debe ser el booleano `true`**. Ausente, `false`, `null`, `"true"` o `1` → **422** y ni siquiera se guarda el alta pendiente. La aceptación se guarda en `email_verifications` |
+| `POST /auth/verificar` | Copia la evidencia del alta pendiente a `portal_users`. Una pendiente sin evidencia (anterior a la migración) no crea cuenta (400) |
+| `POST /auth/google`, correo **nuevo** | Sin `acepta_terminos: true` → **428** `{"codigo": "terminos_requeridos", "cuenta_nueva": true}` y **no se crea nada** (ni tenant ni usuario) |
+| `POST /auth/google` y `POST /auth/login`, cuenta **existente sin evidencia** | **428** hasta que se reenvíe con `acepta_terminos: true`; entonces se guarda. En `/login` el 428 va *después* de validar la contraseña, así no sirve para confirmar si un correo existe |
+| Cuenta que ya aceptó | Entra como siempre; la evidencia previa no se toca |
+
+`_crear_cuenta` recibe la evidencia como argumento obligatorio, así que no
+puede existir un camino nuevo que cree cuentas sin ella. El frontend
+reconoce el 428 y abre un paso intermedio ("Antes de continuar") que
+reenvía la misma petición con la aceptación; para Google reenvía el mismo
+`credential`, que dura pocos minutos (si venció, se pide volver a pulsar el
+botón).
+
+Las cuentas anteriores quedan con la evidencia en NULL y aceptan en su
+próximo ingreso con `/login` o `/google`. Una sesión ya abierta sigue
+funcionando hasta que su refresh token venza: `/auth/refresh` no pide
+aceptación.
+
+### Perfil del usuario y recordatorios
+
+`/api/perfil` es siempre el del usuario de la sesión (no hay `{id}` en la
+ruta): cualquier rol edita el suyo desde `/preferencias` del portal. El alta
+no pide nada de esto. Migración: `sql/29_perfil_usuario.sql`.
+
+```
+GET    /api/perfil          datos + completo + faltantes + días de recordatorio
+PUT    /api/perfil          guarda el perfil entero (se puede a medias)
+PUT    /api/perfil/foto     multipart, campo "archivo"
+GET    /api/perfil/foto     la foto propia (con token; el portal la muestra como blob)
+DELETE /api/perfil/foto
+```
+
+**Completo** = `nombres`, `apellido_paterno`, `fecha_nacimiento` y `genero`
+(`femenino` / `masculino` / `prefiero_no_decirlo`). Opcionales:
+`apellido_materno`, `empresa` y la foto. Los nombres solo admiten letras
+(con acentos), espacios, guion, apóstrofo y punto; hay que tener 18 años.
+`perfil_completado_en` lo fija el servidor al completarse y vuelve a NULL si
+se vacía un obligatorio.
+
+**Foto:** solo JPEG/PNG, máximo 642×642 px (`PERFIL_FOTO_MAX_PX`) y 2 MB
+(`PERFIL_FOTO_MAX_BYTES`). El formato se decide por la firma de los bytes y
+la extensión tiene que coincidir; las dimensiones se leen del encabezado
+(`services/imagen.py`, sin Pillow). El backend **rechaza** lo que excede
+(415 formato, 413 peso, 422 dimensiones); el portal redimensiona con canvas
+antes de subir. Se guarda en `portal_user_fotos` (BYTEA): el contenedor no
+tiene volumen persistente.
+
+**Recordatorios** (`jobs/perfil_background.py`, cada
+`PERFIL_RECORDATORIO_INTERVALO_HORAS`): mientras el perfil esté incompleto,
+un correo + una alerta personal en la campana cada 24 h durante los primeros
+`PERFIL_RECORDATORIO_DIAS` (20) días naturales desde `created_at` — 20 en
+total. Solo roles `owner`/`superadmin`/`member` activos; las cuentas creadas
+hace más de 20 días no entran. Cesan al completar el perfil o al terminar la
+ventana. El envío se reserva con un `UPDATE … RETURNING`, así dos pasadas
+simultáneas no duplican.
+
+**Alertas personales:** `alertas.portal_user_id` NULL = del negocio (como
+siempre); con valor = solo de ese usuario. No van a la room del tenant sino
+a `usuario_{id}`, no aparecen en el historial ni en las estadísticas de sus
+compañeros, solo su dueño las marca leídas, y el resumen diario a gerencia
+las excluye.
+
 ### Canales
 ```
 GET    /api/canales                  Canales conectados
@@ -456,6 +530,8 @@ JOIN en cada request.
 | POST | `/gerencia/tenants/{id}/creditos` | Ajuste manual de saldo (positivo suma, negativo resta) |
 | POST | `/gerencia/tenants/{id}/prueba` | Otorga un plan activo del catálogo como prueba (días, semanas o fecha; máx. 3 meses) |
 | POST | `/gerencia/tenants/{id}/prueba/revocar` | Termina la prueba ya (queda `cancelada`) |
+| GET | `/gerencia/tenants/{id}/eliminacion` | Si se puede eliminar, por qué no, y qué se perdería |
+| POST | `/gerencia/tenants/{id}/eliminar` | Borrado definitivo (`{confirmacion: <nombre exacto>}`) |
 | GET | `/gerencia/consumo?dias=&tenant_id=` | Serie diaria de tokens y desglose por modelo |
 | GET | `/gerencia/auditoria?tenant_id=&accion=&limite=` | Bitácora, solo lectura |
 | GET | `/gerencia/salud` | Problemas operativos de ahora + alertas de plataforma abiertas |
@@ -468,6 +544,26 @@ JOIN en cada request.
 | PATCH | `/gerencia/planes/{nombre}` | Edita un plan (no se puede renombrar) |
 
 `orden=margen` ordena del peor margen al mejor.
+
+**Eliminar un negocio** (`services/eliminacion_tenant.py`): borrado duro,
+`DELETE FROM tenants` con todo lo que cuelga en cascada (usuarios del
+portal, conversaciones, CRM, calendario, historial de cobros). Dos pasos:
+primero se da de baja con `PATCH .../estado` (la inactivación de siempre) y
+después se elimina. 409 con `{codigo, mensaje, bloqueos}` si:
+
+- `cuenta_activa`: el estado no es `baja` (tampoco vale `suspendido`);
+- `suscripcion_vigente`: `activa`, `fecha_renovacion` futura, una
+  Subscription de Stripe sin `cancelada_en` (aunque figure `pausada`, Stripe
+  la sigue reintentando) o una de Mercado Pago no cancelada;
+- `cuenta_propia`: algún usuario del negocio tiene nivel gerencia.
+
+Los créditos sin usar no bloquean: se advierten en la confirmación. Las
+filas de estado y suscripción se toman `FOR UPDATE`, así que un webhook no
+puede reactivar la suscripción entre la revisión y el borrado. Queda una
+entrada `eliminar_tenant` en la bitácora con la foto de lo borrado (nombre,
+correos, `stripe_customer_id`, total cobrado); el cliente de Stripe no se
+toca. Si en producción alguna tabla apunta a `tenants` sin cascada, el
+DELETE falla, se revierte todo y responde 409 `referencias_pendientes`.
 
 **Plan de prueba** (`services/pruebas.py`, `sql/26_plan_prueba.sql`): no es
 un mecanismo aparte, es una fila de `tenant_subscriptions` `activa` con
@@ -514,18 +610,14 @@ Cada plan dice además **qué herramientas del portal incluye** (ver "Control
 de acceso por plan" abajo): `agente_ia_activo`, `gestion_vendedores_activo`,
 `herramientas_activo`, `crm_campo_activo`, `calendario_activo`.
 
-**`precio_monthly`/`precio_annual` son sin IVA.** Es lo que se guarda, lo
-que se muestra en `/gerencia/planes` y en las tarjetas de `/suscripcion`, y
-lo que queda en `tenant_subscriptions.precio_monthly` al activar un plan
-(`activar_suscripcion`) — ese campo refleja el precio de catálogo, no lo que
-se cobró. El IVA (`config.settings.iva_tasa`, `IVA_TASA` en el entorno, 16%
-por defecto) se suma una sola vez, en `services/pagos.con_iva`, justo antes
-de cotizar una suscripción (`cotizar`) — ahí es donde nace el monto que ve
-`tenant_transactions.monto` y el que de verdad se le manda a la pasarela. Un
-paquete de créditos no pasa por `con_iva`: su precio se cobra tal cual.
-`GET /api/pagos/catalogo` manda `iva_tasa` junto con los planes para que el
-portal arme la leyenda "más IVA (16%)" con el número real, no un texto fijo
-que se pueda desincronizar de lo que se cobra.
+**Los precios son netos.** `precio_monthly`/`precio_annual` se guardan y se
+muestran tal cual, sin ningún impuesto sumado. Con Stripe, lo que de verdad
+se cobra cada mes es el **Price recurrente** del plan (`stripe_price_id`,
+editable desde `/gerencia/planes`; ver "Suscripción recurrente con Stripe"
+abajo): si se cambia `precio_monthly`, hay que crear el Price nuevo en
+Stripe y pegarlo en el plan, o el portal mostrará un precio y Stripe cobrará
+otro. El monto real de cada cobro queda en `tenant_transactions.monto`.
+Los paquetes de créditos sí se cobran con el precio de la tabla.
 
 `PlanActualizarIn` es parcial: un campo en `null` significa "no tocar", no
 "borrar el valor" — mismo criterio que `CambiarServiciosTenantIn`. No hay
@@ -654,6 +746,109 @@ tokens de las últimas 24 h ≥ `CONSUMO_ANOMALO_FACTOR` × el promedio diario
 de los 7 días previos, con ese promedio nunca por debajo de
 `CONSUMO_ANOMALO_PISO_TOKENS`. Hay una sola alerta abierta por negocio (índice
 único parcial), así que un pico que dura todo el día manda un correo, no 24.
+
+### Suscripción recurrente con Stripe
+
+Contratar un plan abre un Checkout en **`mode=subscription`** sobre el Price
+recurrente del plan (`planes.stripe_price_id`, `27_stripe_suscripciones.sql`).
+Stripe cobra solo cada mes y avisa por webhook
+(`POST /api/pagos/stripe/webhook`); `services/stripe_suscripciones.py`
+traduce cada evento. La compra de créditos no cambió: es un cargo único.
+
+**Dónde van los Price IDs:** en la base, no en variables de entorno. Se
+cargan por plan desde `/gerencia/planes` (campo "Price de Stripe",
+`price_...`; el Product `prod_...` se rechaza con 422). Un plan sin Price
+existe y sirve para pruebas de gerencia, pero `crear-pago` responde 409.
+
+`crear-pago` también responde **409** si el tenant ya tiene una Subscription
+viva (`stripe_subscription_id` sin `cancelada_en`): otra encima cobraría dos
+veces. El cambio de plan se hace desde el panel de Stripe; la factura
+siguiente trae el Price nuevo y el plan se actualiza solo. Si el tenant ya
+fue cliente, se reusa su Customer (`stripe_customer_id`).
+
+| Evento | Qué hace | Aviso a gerencia |
+|---|---|---|
+| `checkout.session.completed` (mode=subscription) | Marca la transacción; **no** activa el plan (lo hace la factura, que sabe hasta cuándo quedó pagado) | — |
+| `invoice.payment_succeeded` (`subscription_create`) | Completa la transacción de `crear-pago` y activa el plan hasta el fin del período cobrado | correo "Nueva suscripción" |
+| `invoice.payment_succeeded` (renovación) | Una transacción por factura, extiende `fecha_renovacion`, pone `intentos_fallidos` en 0. Reactiva si estaba pausada | correo "Suscripción renovada" |
+| `invoice.payment_failed` | Cuenta el intento (`intentos_fallidos` = `attempt_count`), guarda `fecha_proximo_intento`. **No pausa**: conserva los días pagados | correo + alerta |
+| `customer.subscription.updated` | `cancela_al_vencer` = true/false (cancelación programada o revertida). Sigue activa | correo (+ alerta si se programó) |
+| `customer.subscription.deleted` | `cancelada_en`. Con días restantes sigue activa hasta `fecha_renovacion`; sin días, se pausa ya | correo + alerta |
+
+La pausa diferida (cobro fallido o baja con días restantes) la hace
+`jobs/pagos_background.py` cuando pasa `fecha_renovacion`, y en esos dos
+casos avisa "Suscripción pausada" (correo + alerta). Una prueba de gerencia
+que vence se pausa igual, pero sin aviso.
+
+**Idempotencia:** Stripe reintenta y no garantiza el orden. Una factura es
+una sola fila (`idx_tenant_transactions_stripe_invoice`); un intento fallido
+repetido no avanza `intentos_fallidos`; una cancelación solo se aplica si el
+estado cambia. Solo se avisa cuando la escritura ocurrió de verdad. Si la
+escritura falla, el webhook responde 500 y Stripe reintenta.
+
+**Avisos** (`services/notificaciones_gerencia.py`): correo a cada
+`gerencia_users` con negocio, correo del dueño, plan, monto, intento y
+próximo reintento, vigencia, motivo, qué hizo el sistema, ids de Stripe y
+enlace a `/gerencia/tenants/{id}`. Lo que pide acción abre además una alerta
+en `gerencia_alertas` (una abierta por tipo y negocio; un segundo intento
+fallido la actualiza). Van en background: un SMTP caído no afecta al cobro.
+
+Los lectores aceptan el formato de Invoice anterior y el de la API
+2025-03-31 "basil" (`parent.subscription_details`), así que da igual qué
+versión tenga el endpoint.
+
+#### Eventos que tiene que tener el endpoint del webhook
+
+En el panel de Stripe → Developers → Webhooks → el endpoint
+`{BASE_URL_BACKEND}/api/pagos/stripe/webhook`:
+
+- `checkout.session.completed`
+- `checkout.session.async_payment_succeeded`
+- `checkout.session.async_payment_failed`
+- `checkout.session.expired`
+- `charge.refunded`
+- `invoice.payment_succeeded`
+- `invoice.payment_failed`
+- `customer.subscription.updated`
+- `customer.subscription.deleted`
+
+Los primeros cinco ya se usaban (créditos y la transacción del checkout);
+los últimos cuatro son los del ciclo de vida. Cualquier otro evento se
+contesta 200 y se ignora.
+
+#### Prueba manual paso a paso (modo test)
+
+Automatizado: `pytest tests/test_stripe_suscripciones.py -v`. Contra Stripe
+de verdad:
+
+1. Aplicar la migración: `python aplicar_sql.py sql/27_stripe_suscripciones.sql`.
+2. En `/gerencia/planes`, pegar el Price de prueba (`price_...`) del plan.
+3. `stripe listen --forward-to localhost:8000/api/pagos/stripe/webhook` y
+   poner el `whsec_...` que imprime en `STRIPE_WEBHOOK_SECRET`.
+4. **Alta:** en `/suscripcion`, "Contratar ahora" con la tarjeta
+   `4242 4242 4242 4242`. Esperado: `tenant_subscriptions` en `activa` con
+   `stripe_subscription_id`, y en el log del backend
+   `Aviso a gerencia: alta` (sin SMTP el cuerpo del correo sale en el log).
+5. **Renovación:** crear la suscripción sobre un Customer con
+   [Test Clock](https://docs.stripe.com/billing/testing/test-clocks) y
+   adelantar el reloj un mes. Esperado: una transacción "Renovación ...",
+   `fecha_renovacion` extendida y aviso `renovacion`.
+6. **Cobro fallido:** en el panel de Stripe, cambiar el método de pago del
+   Customer por `4000 0000 0000 0341` (se asocia bien, pero el cobro falla)
+   y adelantar el Test Clock al fin del período. Esperado:
+   `intentos_fallidos = 1`, estado sigue `activa`, alerta
+   "Cobro de suscripción fallido" en `/gerencia/salud`. Adelantar hasta
+   pasada `fecha_renovacion` y esperar al job (o llamar a
+   `job_pausar_suscripciones_vencidas`): queda `pausada` con aviso.
+7. **Cancelación programada:** en el panel, "Cancel subscription" → "At end
+   of period". Esperado: `cancela_al_vencer = true`, sigue `activa`, aviso.
+8. **Baja inmediata con días restantes:** "Cancel immediately". Esperado:
+   `cancelada_en` con valor, sigue `activa` hasta `fecha_renovacion`, aviso
+   `cancelada`; al vencer, el job la pausa y avisa.
+
+`stripe trigger invoice.payment_failed` y parecidos crean objetos sin
+nuestra metadata ni un tenant enlazado: el webhook los contesta 200 y no
+hace nada. Sirven para ver que la firma pasa, no para probar el flujo.
 
 ### Margen por negocio
 

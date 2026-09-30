@@ -293,3 +293,40 @@ async def test_el_catalogo_publico_refleja_los_cambios_de_gerencia(
         headers={"Authorization": f"Bearer {tenant_y_usuario['token']}"},
     )
     assert not any(p["nombre"] == nombre_plan for p in catalogo_2.json()["planes"])
+
+
+# ------------------------------------------------------------
+# 6. Price de Stripe
+# ------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_el_price_de_stripe_se_carga_se_cambia_y_se_borra(http_client, gerente, nombre_plan):
+    creado = await _crear(
+        http_client, gerente["headers"], nombre=nombre_plan, stripe_price_id="price_1Abc"
+    )
+    assert creado.status_code == 201
+    assert creado.json()["stripe_price_id"] == "price_1Abc"
+
+    url = f"/api/gerencia/planes/{nombre_plan}"
+
+    # null = no tocar
+    r = await http_client.patch(url, json={"orden": 3}, headers=gerente["headers"])
+    assert r.json()["stripe_price_id"] == "price_1Abc"
+
+    r = await http_client.patch(url, json={"stripe_price_id": "price_2Xyz"}, headers=gerente["headers"])
+    assert r.json()["stripe_price_id"] == "price_2Xyz"
+
+    # "" = borrarlo
+    r = await http_client.patch(url, json={"stripe_price_id": ""}, headers=gerente["headers"])
+    assert r.status_code == 200
+    assert r.json()["stripe_price_id"] is None
+    assert (
+        await fetch_one("SELECT stripe_price_id FROM planes WHERE nombre = $1", nombre_plan)
+    )["stripe_price_id"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalido", ["prod_1Abc", "price_con espacio", "sk_test_123"])
+async def test_un_id_que_no_es_un_price_se_rechaza(http_client, gerente, nombre_plan, invalido):
+    """Pegar el Product (prod_...) en vez del Price es el error típico."""
+    r = await _crear(http_client, gerente["headers"], nombre=nombre_plan, stripe_price_id=invalido)
+    assert r.status_code == 422

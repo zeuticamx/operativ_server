@@ -2,6 +2,10 @@
 Alertas: notificaciones de eventos del tenant (cambios de leads, asignaciones, etc).
 Guarda historial en la tabla `alertas`; se envían en tiempo real por WebSocket
 (ver realtime.py, que llama a `crear_alerta` y transmite el resultado).
+
+Una alerta con `portal_user_id` es PERSONAL (29_perfil_usuario.sql): solo
+la ve y la marca leída ese usuario, aunque sea de su mismo negocio. Las que
+no lo tienen son del negocio, como siempre.
 """
 
 import logging
@@ -10,7 +14,13 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from deps import ROLES_GERENCIA, UsuarioActual, gerencia_actual, verificar_acceso_tenant
+from deps import (
+    ROLES_GERENCIA,
+    UsuarioActual,
+    gerencia_actual,
+    usuario_actual,
+    verificar_acceso_tenant,
+)
 from schemas import AlertaOut
 from services.correo import ErrorEnvioCorreo, enviar_alerta_critica
 from session import execute, fetch_all, fetch_one
@@ -38,11 +48,13 @@ async def obtener_alertas(
     verificar_acceso_tenant(usuario, tenant_id)
 
     query = """
-        SELECT id, tenant_id, tipo, titulo, mensaje, datos, leido, creado_en
+        SELECT id, tenant_id, tipo, titulo, mensaje, datos, leido, creado_en,
+               portal_user_id
         FROM alertas
         WHERE tenant_id = $1
+          AND (portal_user_id IS NULL OR portal_user_id = $2)
     """
-    params: list = [tenant_id]
+    params: list = [tenant_id, usuario.id]
 
     if tipo:
         params.append(tipo)
@@ -62,16 +74,29 @@ async def obtener_alertas(
 @router.patch("/alertas/{alerta_id}/marcar-leida")
 async def marcar_alerta_leida(
     alerta_id: UUID,
-    gerencia: UsuarioActual = Depends(gerencia_actual),
+    usuario: UsuarioActual = Depends(usuario_actual),
 ):
-    """Marcar una alerta como leída."""
+    """
+    Marcar una alerta como leída.
+
+    Una alerta del negocio la marca solo gerencia (owner/superadmin), como
+    siempre. Una personal la marca su dueño, sea del rol que sea — un
+    'member' también recibe el recordatorio de su perfil.
+    """
     # Filtra por tenant_id del propio token (no de la URL): sin esto,
     # cualquier gerencia autenticada podría marcar leída una alerta de
-    # otro negocio con solo adivinar el UUID.
+    # otro negocio con solo adivinar el UUID. Y la personal, además, por el
+    # usuario: la de un compañero da 404 igual que una inexistente.
     resultado = await execute(
-        "UPDATE alertas SET leido = true WHERE id = $1 AND tenant_id = $2",
+        """
+        UPDATE alertas SET leido = true
+         WHERE id = $1 AND tenant_id = $2
+           AND (portal_user_id = $3 OR (portal_user_id IS NULL AND $4))
+        """,
         alerta_id,
-        gerencia.tenant_id,
+        usuario.tenant_id,
+        usuario.id,
+        usuario.role in ROLES_GERENCIA,
     )
 
     # Si no fue actualizada (0 filas), es porque no existe o es de otro tenant
@@ -94,14 +119,21 @@ async def estadisticas_alertas(
         SELECT tipo, COUNT(*)::int as cantidad
         FROM alertas
         WHERE tenant_id = $1 AND leido = false
+          AND (portal_user_id IS NULL OR portal_user_id = $2)
         GROUP BY tipo
         """,
         tenant_id,
+        usuario.id,
     )
 
     total = await fetch_one(
-        "SELECT COUNT(*)::int as total FROM alertas WHERE tenant_id = $1 AND leido = false",
+        """
+        SELECT COUNT(*)::int as total FROM alertas
+        WHERE tenant_id = $1 AND leido = false
+          AND (portal_user_id IS NULL OR portal_user_id = $2)
+        """,
         tenant_id,
+        usuario.id,
     )
 
     return {
@@ -128,8 +160,11 @@ async def crear_alerta(
     titulo: str,
     mensaje: str,
     datos: Optional[dict] = None,
+    portal_user_id: Optional[UUID] = None,
 ) -> AlertaOut:
     """
+    `portal_user_id` la hace personal (ver el docstring del módulo).
+
     Crea la alerta en BD y devuelve la fila completa, lista para transmitir
     por WebSocket. No emite el WebSocket por sí sola: quien la llama decide
     cuándo y a quién avisar ahí (ver `realtime.broadcast_alerta`).
@@ -140,15 +175,17 @@ async def crear_alerta(
     """
     fila = await fetch_one(
         """
-        INSERT INTO alertas (tenant_id, tipo, titulo, mensaje, datos)
-        VALUES ($1, $2, $3, $4, $5)
-        RETURNING id, tenant_id, tipo, titulo, mensaje, datos, leido, creado_en
+        INSERT INTO alertas (tenant_id, tipo, titulo, mensaje, datos, portal_user_id)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, tenant_id, tipo, titulo, mensaje, datos, leido, creado_en,
+                  portal_user_id
         """,
         tenant_id,
         tipo,
         titulo,
         mensaje,
         datos or {},
+        portal_user_id,
     )
     alerta = AlertaOut(**fila)
 

@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from config import settings
 from services.correo import ErrorEnvioCorreo, enviar_codigo_verificacion
 from services.google_login import TokenGoogleInvalido, verificar_credential
+from routers.perfil import version_foto
 from deps import UsuarioActual, usuario_actual
 from security import (
     crear_access_token,
@@ -103,12 +104,43 @@ async def _mandar_codigo(email: str, codigo: str, negocio: str) -> None:
         )
 
 
+def _exigir_terminos(nuevo: bool) -> HTTPException:
+    """
+    428 con un `codigo` que el portal reconoce para abrir el paso de
+    aceptación. Ni tokens ni cuenta: lo que sigue es reenviar la misma
+    petición con `acepta_terminos: true`.
+    """
+    return HTTPException(
+        status_code=status.HTTP_428_PRECONDITION_REQUIRED,
+        detail={
+            "codigo": "terminos_requeridos",
+            "mensaje": "Para continuar debes aceptar los Términos y Condiciones.",
+            "cuenta_nueva": nuevo,
+        },
+    )
+
+
+async def _registrar_aceptacion(user_id: UUID) -> None:
+    """Deja la evidencia en una cuenta que ya existía. No pisa una previa."""
+    await execute(
+        """
+        UPDATE portal_users
+           SET terminos_aceptados_en = NOW(), terminos_version = $2
+         WHERE id = $1 AND terminos_aceptados_en IS NULL
+        """,
+        user_id,
+        settings.TERMINOS_VERSION,
+    )
+
+
 async def _crear_cuenta(
     conn: asyncpg.Connection,
     email: str,
     password_hash: str | None,
     full_name: str | None,
     nombre_negocio: str,
+    terminos_aceptados_en: datetime,
+    terminos_version: str,
     google_id: str | None = None,
 ) -> tuple[UUID, UUID]:
     """
@@ -118,6 +150,9 @@ async def _crear_cuenta(
 
     `password_hash` es None para cuentas que entran solo por Google
     (POST /auth/google): no hay contraseña que hashear en ese camino.
+
+    La aceptación de términos es un argumento obligatorio y no un default:
+    así no puede existir un camino que cree una cuenta sin evidencia.
     """
     tenant_id = await conn.fetchval(
         "INSERT INTO tenants (name) VALUES ($1) RETURNING id",
@@ -138,8 +173,9 @@ async def _crear_cuenta(
     user_id = await conn.fetchval(
         """
         INSERT INTO portal_users
-            (tenant_id, email, password_hash, full_name, role, google_id)
-        VALUES ($1, $2, $3, $4, 'owner', $5)
+            (tenant_id, email, password_hash, full_name, role, google_id,
+             terminos_aceptados_en, terminos_version)
+        VALUES ($1, $2, $3, $4, 'owner', $5, $6, $7)
         RETURNING id
         """,
         tenant_id,
@@ -147,6 +183,8 @@ async def _crear_cuenta(
         password_hash,
         full_name,
         google_id,
+        terminos_aceptados_en,
+        terminos_version,
     )
 
     return user_id, tenant_id
@@ -161,6 +199,9 @@ async def registro(datos: RegistroIn):
 
     Devuelve 202 y ningún token — la cuenta todavía no existe. Para
     terminar, POST /auth/verificar con el código.
+
+    `acepta_terminos` tiene que ser true (lo exige el esquema, 422 si no):
+    sin aceptación ni siquiera se guarda el alta pendiente.
     """
     email = datos.email.lower()
     # La contraseña se hashea acá y en claro no se guarda nunca, ni
@@ -208,8 +249,9 @@ async def registro(datos: RegistroIn):
                 """
                 INSERT INTO email_verifications
                     (email, code_hash, password_hash, full_name, nombre_negocio,
-                     attempts, expires_at, sent_at)
-                VALUES ($1, $2, $3, $4, $5, 0, $6, NOW())
+                     attempts, expires_at, sent_at,
+                     terminos_aceptados_en, terminos_version)
+                VALUES ($1, $2, $3, $4, $5, 0, $6, NOW(), NOW(), $7)
                 ON CONFLICT (email) DO UPDATE SET
                     code_hash      = EXCLUDED.code_hash,
                     password_hash  = EXCLUDED.password_hash,
@@ -217,7 +259,9 @@ async def registro(datos: RegistroIn):
                     nombre_negocio = EXCLUDED.nombre_negocio,
                     attempts       = 0,
                     expires_at     = EXCLUDED.expires_at,
-                    sent_at        = NOW()
+                    sent_at        = NOW(),
+                    terminos_aceptados_en = EXCLUDED.terminos_aceptados_en,
+                    terminos_version      = EXCLUDED.terminos_version
                 """,
                 email,
                 hash_password(codigo),
@@ -225,6 +269,7 @@ async def registro(datos: RegistroIn):
                 datos.full_name,
                 datos.nombre_negocio,
                 _vencimiento(),
+                settings.TERMINOS_VERSION,
             )
 
             # Dentro de la transacción a propósito: si el SMTP falla, el
@@ -252,7 +297,8 @@ async def verificar(datos: VerificarCodigoIn):
          WHERE email = $1
            AND expires_at > NOW()
            AND attempts < $2
-        RETURNING code_hash, password_hash, full_name, nombre_negocio
+        RETURNING code_hash, password_hash, full_name, nombre_negocio,
+                  terminos_aceptados_en, terminos_version
         """,
         email,
         settings.CODIGO_MAX_INTENTOS,
@@ -273,6 +319,16 @@ async def verificar(datos: VerificarCodigoIn):
             detail="Código incorrecto",
         )
 
+    # Un alta pendiente anterior a la migración de términos no tiene
+    # aceptación guardada: no se crea cuenta sin evidencia, se vuelve a
+    # registrar (ahora con la casilla).
+    if fila["terminos_aceptados_en"] is None:
+        await execute("DELETE FROM email_verifications WHERE email = $1", email)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Falta la aceptación de los Términos y Condiciones. Vuelve a registrarte.",
+        )
+
     try:
         async with get_pool().acquire() as conn:
             async with conn.transaction():
@@ -282,6 +338,8 @@ async def verificar(datos: VerificarCodigoIn):
                     fila["password_hash"],
                     fila["full_name"],
                     fila["nombre_negocio"],
+                    fila["terminos_aceptados_en"],
+                    fila["terminos_version"],
                 )
                 await conn.execute(
                     "DELETE FROM email_verifications WHERE email = $1", email
@@ -360,7 +418,8 @@ async def reenviar_codigo(datos: ReenviarCodigoIn):
 async def login(datos: LoginIn):
     fila = await fetch_one(
         """
-        SELECT id, tenant_id, password_hash, role, is_active
+        SELECT id, tenant_id, password_hash, role, is_active,
+               terminos_aceptados_en
         FROM portal_users
         WHERE LOWER(email) = LOWER($1)
         """,
@@ -388,6 +447,14 @@ async def login(datos: LoginIn):
             status_code=status.HTTP_403_FORBIDDEN,
             detail="La cuenta está desactivada",
         )
+
+    # Cuentas anteriores a los términos: en su próximo ingreso tienen que
+    # aceptarlos. Va DESPUÉS de comprobar la contraseña: pedir aceptación
+    # no puede servir para confirmar que un correo existe.
+    if fila["terminos_aceptados_en"] is None:
+        if not datos.acepta_terminos:
+            raise _exigir_terminos(nuevo=False)
+        await _registrar_aceptacion(fila["id"])
 
     # Si el hash quedó con parámetros viejos, se actualiza aprovechando
     # que en este momento tenemos la contraseña en claro.
@@ -425,6 +492,11 @@ async def login_google(datos: GoogleLoginIn):
         vincula el google_id a esa fila y entra, en vez de duplicar.
       - no hay ninguna  -> se da de alta un negocio nuevo, igual que
         /verificar pero sin password_hash.
+
+    Términos y condiciones: una cuenta NUEVA solo se crea si viene
+    `acepta_terminos: true`; si no, 428 y no se escribe nada (ni tenant ni
+    usuario). Una cuenta existente que todavía no los aceptó también recibe
+    428 hasta que los acepte, y entonces se le guarda la evidencia.
     """
     if not settings.google_login_configurado:
         raise HTTPException(
@@ -456,7 +528,7 @@ async def login_google(datos: GoogleLoginIn):
         async with conn.transaction():
             fila = await conn.fetchrow(
                 """
-                SELECT id, tenant_id, role, is_active
+                SELECT id, tenant_id, role, is_active, terminos_aceptados_en
                 FROM portal_users
                 WHERE google_id = $1
                 """,
@@ -471,13 +543,18 @@ async def login_google(datos: GoogleLoginIn):
                     """
                     UPDATE portal_users SET google_id = $2
                     WHERE LOWER(email) = LOWER($1) AND google_id IS NULL
-                    RETURNING id, tenant_id, role, is_active
+                    RETURNING id, tenant_id, role, is_active, terminos_aceptados_en
                     """,
                     email,
                     google_id,
                 )
 
             if fila is None:
+                # Sin aceptación explícita no se crea nada. El raise sale de
+                # la transacción, así que tampoco queda el tenant a medias.
+                if not datos.acepta_terminos:
+                    raise _exigir_terminos(nuevo=True)
+
                 # Cuenta nueva: negocio de arranque con el nombre que dio
                 # Google, editable después desde el portal.
                 user_id, tenant_id = await _crear_cuenta(
@@ -486,6 +563,8 @@ async def login_google(datos: GoogleLoginIn):
                     None,
                     full_name,
                     (full_name or "").strip() or "Mi negocio",
+                    datetime.now(timezone.utc),
+                    settings.TERMINOS_VERSION,
                     google_id=google_id,
                 )
                 fila = {
@@ -494,6 +573,21 @@ async def login_google(datos: GoogleLoginIn):
                     "role": "owner",
                     "is_active": True,
                 }
+            elif fila["terminos_aceptados_en"] is None and fila["is_active"]:
+                # Cuenta anterior a los términos: tiene que aceptar en este
+                # ingreso. El raise revierte también la vinculación del
+                # google_id de arriba.
+                if not datos.acepta_terminos:
+                    raise _exigir_terminos(nuevo=False)
+                await conn.execute(
+                    """
+                    UPDATE portal_users
+                       SET terminos_aceptados_en = NOW(), terminos_version = $2
+                     WHERE id = $1 AND terminos_aceptados_en IS NULL
+                    """,
+                    fila["id"],
+                    settings.TERMINOS_VERSION,
+                )
 
     if not fila["is_active"]:
         raise HTTPException(
@@ -552,6 +646,19 @@ async def yo(usuario: UsuarioActual = Depends(usuario_actual)):
         )
         nombre_negocio = nombre_negocio["name"] if nombre_negocio else None
 
+    # Lo mínimo del perfil para el sidebar (nombre, foto, "faltan datos").
+    # El perfil completo lo sirve GET /api/perfil.
+    perfil = await fetch_one(
+        """
+        SELECT pu.nombres, pu.apellido_paterno, pu.perfil_completado_en,
+               f.actualizada_en AS foto_actualizada_en
+        FROM portal_users pu
+        LEFT JOIN portal_user_fotos f ON f.portal_user_id = pu.id
+        WHERE pu.id = $1
+        """,
+        usuario.id,
+    )
+
     return UsuarioOut(
         id=usuario.id,
         email=usuario.email,
@@ -562,4 +669,8 @@ async def yo(usuario: UsuarioActual = Depends(usuario_actual)):
         es_gerencia_plataforma=usuario.es_gerencia_plataforma,
         impersonado_por=usuario.impersonado_por,
         impersonacion_expira=usuario.impersonacion_expira,
+        nombres=perfil["nombres"] if perfil else None,
+        apellido_paterno=perfil["apellido_paterno"] if perfil else None,
+        perfil_completo=bool(perfil and perfil["perfil_completado_en"]),
+        foto_version=version_foto(perfil["foto_actualizada_en"]) if perfil else None,
     )

@@ -20,6 +20,11 @@ a un namespace por usuario: todo lo que se emite ahí lo ven todas las
 sesiones abiertas de ese negocio, que es lo que hace falta para que gerencia
 vea alertas aunque el cambio lo haya disparado otro vendedor.
 
+Además cada cliente entra a una room propia (`usuario_{id}`) para las
+alertas PERSONALES (alertas.portal_user_id, p. ej. el recordatorio de
+perfil incompleto): esas no van a la room del tenant, así que ni los
+compañeros ni gerencia de plataforma mirando con `ver_tenant` las reciben.
+
 Un solo proceso, sin backend de mensajería (Redis, etc): alcanza para un
 despliegue de una sola instancia como el actual. Si el backend llega a
 correr en más de un worker/proceso a la vez, sio.emit deja de alcanzar a
@@ -49,6 +54,8 @@ sio = socketio.AsyncServer(
 # sid -> tenant_id. Hace falta en `disconnect`, donde socket.io ya no dice
 # de qué room salía el cliente.
 _conexiones: dict[str, UUID] = {}
+# sid -> portal_user_id, para filtrar las alertas personales al marcarlas.
+_usuarios: dict[str, UUID] = {}
 # sids de sesiones "ver como": reciben alertas, no pueden marcarlas leídas.
 _solo_lectura: set[str] = set()
 # sids de gerencia de plataforma (tabla gerencia_users): son los únicos que
@@ -59,6 +66,10 @@ _gerencia_plataforma: set[str] = set()
 
 def _sala(tenant_id: UUID) -> str:
     return f"tenant_{tenant_id}"
+
+
+def _sala_usuario(portal_user_id: UUID) -> str:
+    return f"usuario_{portal_user_id}"
 
 
 def _token_de(environ: dict, auth: Optional[dict]) -> Optional[str]:
@@ -153,7 +164,9 @@ async def connect(sid: str, environ: dict, auth: Optional[dict] = None) -> None:
         return
 
     _conexiones[sid] = tenant_id
+    _usuarios[sid] = usuario["id"]
     await sio.enter_room(sid, _sala(tenant_id))
+    await sio.enter_room(sid, _sala_usuario(usuario["id"]))
     logger.info("WS conectado: sid=%s tenant=%s role=%s", sid, tenant_id, usuario["role"])
 
     # Lo que se perdió mientras no había sesión abierta: las últimas no
@@ -163,10 +176,12 @@ async def connect(sid: str, environ: dict, auth: Optional[dict] = None) -> None:
         SELECT id, tenant_id, tipo, titulo, mensaje, datos, leido, creado_en
         FROM alertas
         WHERE tenant_id = $1 AND leido = false
+          AND (portal_user_id IS NULL OR portal_user_id = $2)
         ORDER BY creado_en DESC
         LIMIT 10
         """,
         tenant_id,
+        usuario["id"],
     )
     await sio.emit("alertas_pendientes", [_serializar(f) for f in pendientes], room=sid)
 
@@ -174,6 +189,7 @@ async def connect(sid: str, environ: dict, auth: Optional[dict] = None) -> None:
 @sio.event
 async def disconnect(sid: str) -> None:
     tenant_id = _conexiones.pop(sid, None)
+    _usuarios.pop(sid, None)
     _solo_lectura.discard(sid)
     _gerencia_plataforma.discard(sid)
     logger.info("WS desconectado: sid=%s tenant=%s", sid, tenant_id)
@@ -224,12 +240,23 @@ async def marcar_leida(sid: str, data: Optional[dict]) -> None:
     if not alerta_id:
         return
 
-    await execute(
-        "UPDATE alertas SET leido = true WHERE id = $1 AND tenant_id = $2",
+    # Una personal solo la marca su dueño; la del negocio, cualquiera de la
+    # room (como siempre).
+    fila = await fetch_one(
+        """
+        UPDATE alertas SET leido = true
+         WHERE id = $1 AND tenant_id = $2
+           AND (portal_user_id IS NULL OR portal_user_id = $3)
+        RETURNING portal_user_id
+        """,
         alerta_id,
         tenant_id,
+        _usuarios.get(sid),
     )
-    await sio.emit("alerta_leida", {"alerta_id": alerta_id}, room=_sala(tenant_id))
+    if fila is None:
+        return
+    sala = _sala_usuario(fila["portal_user_id"]) if fila["portal_user_id"] else _sala(tenant_id)
+    await sio.emit("alerta_leida", {"alerta_id": alerta_id}, room=sala)
 
 
 async def broadcast_alerta(
@@ -238,15 +265,17 @@ async def broadcast_alerta(
     titulo: str,
     mensaje: str,
     datos: Optional[dict] = None,
+    portal_user_id: Optional[UUID] = None,
 ) -> None:
     """
     Punto de entrada para el resto del backend: crea la alerta en BD y la
-    transmite a todos los clientes conectados de ese tenant.
+    transmite a todos los clientes conectados de ese tenant — o, si trae
+    `portal_user_id`, solo a las sesiones de ese usuario.
 
     sio.emit a una room sin nadie conectado es un no-op — no hace falta
     revisar antes si hay alguien escuchando.
     """
-    alerta = await crear_alerta(tenant_id, tipo, titulo, mensaje, datos)
+    alerta = await crear_alerta(tenant_id, tipo, titulo, mensaje, datos, portal_user_id)
     await sio.emit(
         "nueva_alerta",
         {
@@ -258,8 +287,9 @@ async def broadcast_alerta(
             "datos": alerta.datos,
             "leido": alerta.leido,
             "creado_en": alerta.creado_en.isoformat(),
+            "portal_user_id": str(portal_user_id) if portal_user_id else None,
         },
-        room=_sala(tenant_id),
+        room=_sala_usuario(portal_user_id) if portal_user_id else _sala(tenant_id),
     )
 
 

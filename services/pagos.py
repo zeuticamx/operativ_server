@@ -22,7 +22,7 @@ Dos reglas que valen para todo el módulo:
 
 import logging
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import Decimal
 from uuid import UUID
 
 import asyncpg
@@ -40,31 +40,14 @@ log = logging.getLogger("operativai.pagos")
 DIAS_CICLO = 30
 
 
-def con_iva(monto: Decimal) -> Decimal:
-    """
-    Suma el IVA (config.settings.iva_tasa, 16% por defecto) y redondea a
-    centavos. ROUND_HALF_UP y no el bankers' rounding de Decimal por
-    defecto: es como se redondean los cobros, no un cálculo contable.
-
-    `planes.precio_monthly`/`precio_annual` se guardan y se muestran SIN
-    IVA (ver PlanOut y la leyenda "más IVA (16%)" en /suscripcion); esto es
-    lo único que lo agrega, justo antes de cotizar lo que se le manda a la
-    pasarela. `tenant_subscriptions.precio_monthly` (activar_suscripcion)
-    sigue guardando el precio de catálogo, sin IVA — es el precio del plan,
-    no el cobro.
-    """
-    return (monto * (1 + settings.iva_tasa)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
-
 async def cotizar(datos: CrearPagoIn) -> tuple[Decimal, str]:
     """
     Traduce "qué quiere comprar" a (monto, concepto), leyendo el precio de
     la base. Un plan o un paquete que no exista (o esté dado de baja) es un
     404 y no un cobro por un monto inventado.
 
-    Solo la suscripción lleva IVA acá: es lo único que el catálogo muestra
-    sin él (ver con_iva). Los créditos se cotizan y se muestran al mismo
-    precio, sin ese ajuste.
+    Los precios son netos: el monto cotizado es exactamente el de la tabla
+    (el mismo que muestra el catálogo), sin ningún impuesto encima.
     """
     if datos.tipo == "subscription":
         fila = await fetch_one(
@@ -76,7 +59,7 @@ async def cotizar(datos: CrearPagoIn) -> tuple[Decimal, str]:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Ese plan no existe o no está disponible",
             )
-        return con_iva(fila["precio_monthly"]), f"Suscripción {datos.plan}"
+        return fila["precio_monthly"], f"Suscripción {datos.plan}"
 
     fila = await fetch_one(
         "SELECT precio FROM paquetes_creditos WHERE creditos = $1 AND activo",
@@ -146,9 +129,44 @@ async def procesar_pago_aprobado(transaccion_id: UUID) -> None:
         log.exception("Falló el procesamiento del pago %s", transaccion_id)
 
 
-async def activar_suscripcion(tenant_id: UUID, plan: str) -> None:
-    """Deja el plan vigente y prende los servicios que ese plan incluye."""
-    plan_fila = await fetch_one(
+async def activar_suscripcion(
+    tenant_id: UUID,
+    plan: str,
+    *,
+    fecha_renovacion: datetime | None = None,
+    stripe_customer_id: str | None = None,
+    stripe_subscription_id: str | None = None,
+    conn: asyncpg.Connection | None = None,
+) -> bool:
+    """
+    Deja el plan vigente y prende los servicios que ese plan incluye.
+    Devuelve False si el plan no existe (no activa nada).
+
+    Los parámetros opcionales son del cobro recurrente de Stripe
+    (services/stripe_suscripciones.py):
+      - fecha_renovacion: el fin del período que Stripe acaba de cobrar. Sin
+        ella se usan DIAS_CICLO desde hoy, como con el pago único.
+      - stripe_*_id: dejan la fila enlazada a la Subscription, que es como
+        llegan los eventos siguientes (renovación, fallo, cancelación).
+      - conn: para correr dentro de la transacción de quien llama, junto con
+        el registro del cobro — si una de las dos cosas falla, el webhook
+        responde 500, Stripe reintenta y no queda un cobro sin entregar.
+
+    Activar limpia cualquier rastro de cancelación o cobro fallido: un pago
+    aprobado es la prueba de que la suscripción está al día.
+    """
+    if conn is None:
+        async with transaccion() as nueva:
+            return await activar_suscripcion(
+                tenant_id,
+                plan,
+                fecha_renovacion=fecha_renovacion,
+                stripe_customer_id=stripe_customer_id,
+                stripe_subscription_id=stripe_subscription_id,
+                conn=nueva,
+            )
+
+    plan_fila = await conn.fetchrow(
         """
         SELECT precio_monthly, agente_ia_activo, gestion_vendedores_activo
         FROM planes
@@ -158,54 +176,64 @@ async def activar_suscripcion(tenant_id: UUID, plan: str) -> None:
     )
     if plan_fila is None:
         log.error("Pago aprobado de un plan inexistente: %s", plan)
-        return
+        return False
 
-    renovacion = datetime.now(timezone.utc) + timedelta(days=DIAS_CICLO)
+    renovacion = fecha_renovacion or datetime.now(timezone.utc) + timedelta(days=DIAS_CICLO)
 
-    async with transaccion() as conn:
-        await conn.execute(
-            """
-            INSERT INTO tenant_subscriptions
-                (tenant_id, plan, estado, precio_monthly, fecha_inicio,
-                 fecha_renovacion, intentos_fallidos)
-            VALUES ($1, $2, 'activa', $3, NOW(), $4, 0)
-            ON CONFLICT (tenant_id) DO UPDATE SET
-                plan              = EXCLUDED.plan,
-                estado            = 'activa',
-                precio_monthly    = EXCLUDED.precio_monthly,
-                fecha_renovacion  = EXCLUDED.fecha_renovacion,
-                intentos_fallidos = 0,
-                -- Pagar durante (o después de) una prueba de gerencia la
-                -- convierte en un plan pagado (26_plan_prueba.sql).
-                origen            = 'pago',
-                otorgada_por      = NULL,
-                updated_at        = NOW()
-            """,
-            tenant_id,
-            plan,
-            plan_fila["precio_monthly"],
-            renovacion,
-        )
+    await conn.execute(
+        """
+        INSERT INTO tenant_subscriptions
+            (tenant_id, plan, estado, precio_monthly, fecha_inicio,
+             fecha_renovacion, intentos_fallidos, stripe_customer_id,
+             stripe_subscription_id)
+        VALUES ($1, $2, 'activa', $3, NOW(), $4, 0, $5, $6)
+        ON CONFLICT (tenant_id) DO UPDATE SET
+            plan                   = EXCLUDED.plan,
+            estado                 = 'activa',
+            precio_monthly         = EXCLUDED.precio_monthly,
+            fecha_renovacion       = EXCLUDED.fecha_renovacion,
+            intentos_fallidos      = 0,
+            fecha_proximo_intento  = NULL,
+            cancela_al_vencer      = false,
+            cancelada_en           = NULL,
+            stripe_customer_id     = COALESCE(EXCLUDED.stripe_customer_id,
+                                              tenant_subscriptions.stripe_customer_id),
+            stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id,
+                                              tenant_subscriptions.stripe_subscription_id),
+            -- Pagar durante (o después de) una prueba de gerencia la
+            -- convierte en un plan pagado (26_plan_prueba.sql).
+            origen                 = 'pago',
+            otorgada_por           = NULL,
+            updated_at             = NOW()
+        """,
+        tenant_id,
+        plan,
+        plan_fila["precio_monthly"],
+        renovacion,
+        stripe_customer_id,
+        stripe_subscription_id,
+    )
 
-        # tenant_servicios es la tabla que miran el resto de los módulos
-        # para saber si el agente / el CRM están encendidos. El plan es
-        # quien manda sobre esos flags.
-        await conn.execute(
-            """
-            INSERT INTO tenant_servicios
-                (tenant_id, agente_ia_activo, gestion_vendedores_activo, actualizado_en)
-            VALUES ($1, $2, $3, NOW())
-            ON CONFLICT (tenant_id) DO UPDATE SET
-                agente_ia_activo          = EXCLUDED.agente_ia_activo,
-                gestion_vendedores_activo = EXCLUDED.gestion_vendedores_activo,
-                actualizado_en            = NOW()
-            """,
-            tenant_id,
-            plan_fila["agente_ia_activo"],
-            plan_fila["gestion_vendedores_activo"],
-        )
+    # tenant_servicios es la tabla que miran el resto de los módulos
+    # para saber si el agente / el CRM están encendidos. El plan es
+    # quien manda sobre esos flags.
+    await conn.execute(
+        """
+        INSERT INTO tenant_servicios
+            (tenant_id, agente_ia_activo, gestion_vendedores_activo, actualizado_en)
+        VALUES ($1, $2, $3, NOW())
+        ON CONFLICT (tenant_id) DO UPDATE SET
+            agente_ia_activo          = EXCLUDED.agente_ia_activo,
+            gestion_vendedores_activo = EXCLUDED.gestion_vendedores_activo,
+            actualizado_en            = NOW()
+        """,
+        tenant_id,
+        plan_fila["agente_ia_activo"],
+        plan_fila["gestion_vendedores_activo"],
+    )
 
     log.info("Suscripción %s activada para el tenant %s", plan, tenant_id)
+    return True
 
 
 async def acreditar_creditos(

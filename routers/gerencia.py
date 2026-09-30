@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from config import settings
 from deps import UsuarioActual, gerencia_plataforma_actual
-from services import herramientas_calendario, pruebas
+from services import eliminacion_tenant, herramientas_calendario, pruebas
 from services.banxico import obtener_tipo_cambio
 from schemas import (
     AjusteCreditosIn,
@@ -30,6 +30,8 @@ from schemas import (
     ConsumoModeloOut,
     ConsumoOut,
     ConsumoTenantOut,
+    EliminacionTenantOut,
+    EliminarTenantIn,
     EntradaAuditoriaOut,
     EstadoTenantPlataforma,
     OtorgarPruebaIn,
@@ -51,7 +53,7 @@ from services.gerencia import (
     rango_dias,
     registrar_auditoria,
 )
-from session import fetch_all, fetch_one, transaccion
+from session import conexion, fetch_all, fetch_one, transaccion
 
 router = APIRouter(
     prefix="/gerencia",
@@ -788,6 +790,90 @@ async def revocar_prueba(
 
 
 # ============================================================
+# Eliminación definitiva
+# ============================================================
+def _eliminacion_out(r: eliminacion_tenant.Revision) -> EliminacionTenantOut:
+    return EliminacionTenantOut(
+        eliminable=r.eliminable,
+        bloqueos=r.bloqueos,
+        creditos_disponibles=r.creditos_disponibles,
+        usuarios_portal=r.usuarios_portal,
+        conversaciones=r.conversaciones,
+        transacciones=r.transacciones,
+    )
+
+
+def _no_encontrado() -> HTTPException:
+    return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Negocio no encontrado")
+
+
+@router.get("/tenants/{tenant_id}/eliminacion", response_model=EliminacionTenantOut)
+async def revisar_eliminacion(tenant_id: UUID):
+    """Si se puede eliminar y qué se perdería. El botón de la ficha sale de acá."""
+    async with conexion() as conn:
+        try:
+            r = await eliminacion_tenant.revisar(conn, tenant_id)
+        except eliminacion_tenant.NegocioNoEncontrado:
+            raise _no_encontrado()
+    return _eliminacion_out(r)
+
+
+@router.post("/tenants/{tenant_id}/eliminar", status_code=status.HTTP_204_NO_CONTENT)
+async def eliminar_tenant(
+    tenant_id: UUID,
+    datos: EliminarTenantIn,
+    gerente: UsuarioActual = Depends(gerencia_plataforma_actual),
+):
+    """
+    Borra el negocio y todo lo que cuelga de él. Irreversible.
+
+    Solo si está en 'baja' (puesta con PATCH .../estado, que es la
+    inactivación de siempre) y sin suscripción vigente — ver
+    services/eliminacion_tenant.py. Es POST y no DELETE porque lleva la
+    confirmación en el body, igual que /prueba/revocar.
+
+    409 con {codigo, mensaje, bloqueos} si algo lo impide; 400 si la
+    confirmación no es el nombre exacto del negocio.
+    """
+    async with transaccion() as conn:
+        try:
+            await eliminacion_tenant.eliminar(
+                conn,
+                tenant_id,
+                confirmacion=datos.confirmacion,
+                gerente_email=gerente.email,
+                gerente_id=gerente.id,
+            )
+        except eliminacion_tenant.NegocioNoEncontrado:
+            raise _no_encontrado()
+        except eliminacion_tenant.EliminacionBloqueada as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "codigo": e.bloqueos[0].codigo,
+                    "mensaje": e.bloqueos[0].mensaje,
+                    "bloqueos": [b.model_dump() for b in e.bloqueos],
+                },
+            )
+        except eliminacion_tenant.ConfirmacionIncorrecta:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="La confirmación no coincide con el nombre del negocio",
+            )
+        except eliminacion_tenant.ReferenciasPendientes:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "codigo": "referencias_pendientes",
+                    "mensaje": (
+                        "Hay datos que apuntan a este negocio y no se borran en cascada. "
+                        "No se eliminó nada."
+                    ),
+                },
+            )
+
+
+# ============================================================
 # Consumo
 # ============================================================
 @router.get("/consumo", response_model=ConsumoOut)
@@ -843,7 +929,15 @@ async def auditoria(
     filas = await fetch_all(
         """
         SELECT a.id, a.actor_email, a.accion, a.tenant_id,
-               t.name AS tenant_nombre, a.detalle, a.created_at
+               -- Un negocio eliminado ya no está en tenants: su nombre
+               -- quedó en el detalle de la entrada 'eliminar_tenant'.
+               COALESCE(
+                   t.name,
+                   (SELECT e.detalle->>'nombre' FROM gerencia_auditoria e
+                     WHERE e.tenant_id = a.tenant_id AND e.accion = 'eliminar_tenant'
+                     LIMIT 1)
+               ) AS tenant_nombre,
+               a.detalle, a.created_at
         FROM gerencia_auditoria a
         LEFT JOIN tenants t ON t.id = a.tenant_id
         WHERE ($1::uuid IS NULL OR a.tenant_id = $1)

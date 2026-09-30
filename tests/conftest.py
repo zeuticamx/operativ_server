@@ -18,6 +18,7 @@ from security import crear_access_token, hash_password
 from session import (
     close_pool,
     execute,
+    fetch_all,
     fetch_one,
     fetch_value,
     init_pool,
@@ -140,3 +141,22 @@ async def plan_enterprise(tenant_y_usuario):
         tenant_y_usuario["tenant_id"],
     )
     return tenant_y_usuario
+
+
+@pytest.fixture
+async def precios_stripe(db):
+    """
+    Price IDs de prueba (price_test_<plan>) en todos los planes, y al
+    terminar los que había antes. Con Stripe activo, contratar un plan sin
+    Price es un 409 (services/stripe_suscripciones.py), así que cualquier
+    test que llegue al checkout de una suscripción lo necesita.
+    """
+    previos = await fetch_all("SELECT nombre, stripe_price_id FROM planes")
+    await execute("UPDATE planes SET stripe_price_id = 'price_test_' || nombre")
+    yield {f["nombre"]: f"price_test_{f['nombre']}" for f in previos}
+    for f in previos:
+        await execute(
+            "UPDATE planes SET stripe_price_id = $2 WHERE nombre = $1",
+            f["nombre"],
+            f["stripe_price_id"],
+        )

@@ -31,6 +31,7 @@ from routers import (
     herramientas,
     pagos,
     pagos_stripe,
+    perfil,
     pipeline_config,
     reportes,
     tareas,
@@ -72,6 +73,8 @@ app.add_middleware(
 )
 
 app.include_router(auth.router, prefix="/api")
+# Perfil personal (datos + foto) del usuario de la sesión, desde /preferencias.
+app.include_router(perfil.router, prefix="/api")
 app.include_router(canales.router, prefix="/api")
 # Alta de WhatsApp vía NeuroAPI Connect Sessions: el único endpoint del
 # módulo de canales sin JWT, autenticado por firma HMAC (ver comentario del

@@ -12,6 +12,8 @@ Se concentran en lo que cuesta dinero si falla:
 
 La entrega en sí (activar plan, acreditar créditos) no se prueba acá: vive
 en services/pagos.py, no depende del proveedor y ya la cubre test_pagos.py.
+El ciclo de vida de la suscripción recurrente (facturas, cancelaciones,
+avisos a gerencia) está en test_stripe_suscripciones.py.
 
 La API de Stripe no se llama nunca: lo que se prueba es nuestro lado.
 """
@@ -27,7 +29,6 @@ import pytest
 
 from config import settings
 from services import stripe_pagos
-from services.pagos import con_iva
 from services.stripe_pagos import a_unidad_minima, firma_valida
 from session import execute, fetch_one, fetch_value
 
@@ -229,7 +230,7 @@ def stripe_simulado(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_crear_pago_guarda_la_transaccion_con_el_precio_de_la_base(
-    http_client, tenant_y_usuario, stripe_simulado
+    http_client, tenant_y_usuario, stripe_simulado, precios_stripe
 ):
     stripe_simulado(
         _RespuestaFalsa({"id": "cs_test_123", "url": "https://checkout.stripe.com/c/abc"})
@@ -256,23 +257,24 @@ async def test_crear_pago_guarda_la_transaccion_con_el_precio_de_la_base(
         datos["transaccion_id"],
     )
     assert fila["tipo"] == "subscription"
-    # Lo que se cobra de verdad lleva IVA encima del precio de catálogo.
-    assert fila["monto"] == con_iva(precio_base)
+    # Se cobra el precio neto de catálogo, sin impuesto encima.
+    assert fila["monto"] == precio_base
     # Nace pendiente: lo que la aprueba es el webhook, no esta llamada.
     assert fila["estado_pago"] == "pendiente"
     assert fila["plan_nombre"] == "pro"
     assert fila["stripe_session_id"] == "cs_test_123"
 
-    # El monto que se le manda a Stripe sale de la base (con IVA sumado),
-    # no del cliente.
-    assert _ClienteFalso.ultimo_payload["line_items[0][price_data][unit_amount]"] == str(
-        a_unidad_minima(con_iva(precio_base), settings.STRIPE_CURRENCY)
-    )
+    # Un plan se contrata como suscripción recurrente sobre el Price del
+    # plan: el monto no viaja en el payload, lo pone Stripe.
+    payload = _ClienteFalso.ultimo_payload
+    assert payload["mode"] == "subscription"
+    assert payload["line_items[0][price]"] == precios_stripe["pro"]
+    assert "line_items[0][price_data][unit_amount]" not in payload
 
 
 @pytest.mark.asyncio
 async def test_si_stripe_falla_la_transaccion_no_queda_pendiente_para_siempre(
-    http_client, tenant_y_usuario, stripe_simulado
+    http_client, tenant_y_usuario, stripe_simulado, precios_stripe
 ):
     stripe_simulado(_RespuestaFalsa({}, error=True))
 

@@ -1,11 +1,12 @@
 """Schemas de entrada y salida de la API."""
 
-from datetime import date, datetime, time
+import re
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field, model_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 
 # ============================================================
@@ -16,6 +17,17 @@ class RegistroIn(BaseModel):
     password: str = Field(min_length=8, max_length=128)
     full_name: str | None = None
     nombre_negocio: str = Field(min_length=2, max_length=255)
+    # Obligatorio y sin valor por defecto: ausente o false es un 422 y no se
+    # guarda ni el alta pendiente. strict=True para que "true" o 1 tampoco
+    # cuenten como aceptación.
+    acepta_terminos: Annotated[bool, Field(strict=True)]
+
+    @field_validator("acepta_terminos")
+    @classmethod
+    def _debe_aceptar(cls, v: bool) -> bool:
+        if v is not True:
+            raise ValueError("Debes aceptar los Términos y Condiciones para crear tu cuenta")
+        return v
 
 
 class VerificacionPendienteOut(BaseModel):
@@ -39,14 +51,114 @@ class ReenviarCodigoIn(BaseModel):
     email: EmailStr
 
 
+# ============================================================
+# PERFIL DEL USUARIO (routers/perfil.py)
+# ============================================================
+GeneroPerfil = Literal["femenino", "masculino", "prefiero_no_decirlo"]
+
+# Letras de cualquier alfabeto (con acentos, ñ, ü), separadas por espacio,
+# apóstrofo, guion o punto: "María José", "O'Connor", "Pérez-Ruiz", "Ma.".
+# Sin dígitos ni símbolos. [^\W\d_] es "una letra" en re con Unicode.
+_PATRON_NOMBRE = re.compile(r"^[^\W\d_](?:[^\W\d_]|[ '’\-.])*$")
+
+EDAD_MINIMA = 18
+EDAD_MAXIMA = 120
+
+# Obligatorios para que el perfil cuente como completo. apellido_materno,
+# empresa y la foto son opcionales.
+CAMPOS_PERFIL_OBLIGATORIOS = ("nombres", "apellido_paterno", "fecha_nacimiento", "genero")
+
+
+def _limpiar_texto(v: str | None) -> str | None:
+    """Recorta, colapsa espacios repetidos y convierte '' en None."""
+    if v is None:
+        return None
+    v = " ".join(v.split())
+    return v or None
+
+
+def _edad(nacimiento: date, hoy: date) -> int:
+    return hoy.year - nacimiento.year - ((hoy.month, hoy.day) < (nacimiento.month, nacimiento.day))
+
+
+class PerfilIn(BaseModel):
+    """
+    PUT /api/perfil: el perfil entero, como lo dejó el formulario. null (o
+    vacío) en un campo lo deja vacío.
+
+    Se puede guardar a medias: un obligatorio vacío no es error, solo deja el
+    perfil incompleto (y los recordatorios siguen). Lo que sí viene tiene que
+    ser válido.
+    """
+
+    nombres: str | None = Field(default=None, max_length=100)
+    apellido_paterno: str | None = Field(default=None, max_length=100)
+    apellido_materno: str | None = Field(default=None, max_length=100)
+    fecha_nacimiento: date | None = None
+    genero: GeneroPerfil | None = None
+    empresa: str | None = Field(default=None, max_length=255)
+
+    @field_validator("nombres", "apellido_paterno", "apellido_materno", mode="after")
+    @classmethod
+    def _nombre_valido(cls, v: str | None) -> str | None:
+        v = _limpiar_texto(v)
+        if v is not None and not _PATRON_NOMBRE.match(v):
+            raise ValueError("Solo letras, espacios, guion, apóstrofo o punto")
+        return v
+
+    @field_validator("empresa", mode="after")
+    @classmethod
+    def _empresa(cls, v: str | None) -> str | None:
+        return _limpiar_texto(v)
+
+    @field_validator("fecha_nacimiento")
+    @classmethod
+    def _fecha_valida(cls, v: date | None) -> date | None:
+        if v is None:
+            return None
+        hoy = datetime.now(timezone.utc).date()
+        if v > hoy:
+            raise ValueError("La fecha de nacimiento no puede ser futura")
+        edad = _edad(v, hoy)
+        if edad < EDAD_MINIMA:
+            raise ValueError(f"Debes tener al menos {EDAD_MINIMA} años")
+        if edad > EDAD_MAXIMA:
+            raise ValueError("Revisa la fecha de nacimiento")
+        return v
+
+
+class PerfilOut(BaseModel):
+    nombres: str | None
+    apellido_paterno: str | None
+    apellido_materno: str | None
+    fecha_nacimiento: date | None
+    genero: GeneroPerfil | None
+    empresa: str | None
+    completo: bool
+    # Claves de CAMPOS_PERFIL_OBLIGATORIOS que siguen vacías.
+    faltantes: list[str]
+    tiene_foto: bool
+    foto_version: str | None
+    # Días que quedan de recordatorios mientras esté incompleto; None si ya
+    # está completo o si la ventana de recordatorios ya pasó.
+    recordatorio_dias_restantes: int | None
+
+
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
+    # Solo hace falta la primera vez de una cuenta que todavía no aceptó los
+    # términos: sin él el backend responde 428 y el portal pide la aceptación.
+    acepta_terminos: bool = False
 
 
 class GoogleLoginIn(BaseModel):
     """ID token (JWT) que entrega el botón "Sign in with Google" del portal."""
     credential: str
+    # Aquí no puede ser obligatorio: el mismo endpoint sirve para entrar
+    # (cuenta ya aceptada) y para darse de alta. Una cuenta nueva sin
+    # aceptación no se crea (428).
+    acepta_terminos: bool = False
 
 
 class TokenOut(BaseModel):
@@ -72,6 +184,14 @@ class UsuarioOut(BaseModel):
     # aviso permanente de modo solo lectura.
     impersonado_por: str | None = None
     impersonacion_expira: datetime | None = None
+    # Perfil personal (routers/perfil.py). Van acá para que el sidebar pinte
+    # nombre, foto e indicador de "faltan datos" sin otra petición.
+    nombres: str | None = None
+    apellido_paterno: str | None = None
+    perfil_completo: bool = False
+    # Cambia cada vez que se sube o borra la foto: el portal la usa para no
+    # mostrar una foto vieja cacheada. None = sin foto.
+    foto_version: str | None = None
 
 
 # ============================================================
@@ -795,6 +915,8 @@ class TipoAlerta(str, Enum):
     cierre = "cierre"
     reserva_creada = "reserva_creada"
     reserva_cancelada = "reserva_cancelada"
+    conversacion_transferida = "conversacion_transferida"
+    perfil_incompleto = "perfil_incompleto"
 
 class AlertaOut(BaseModel):
     id: UUID
@@ -805,6 +927,9 @@ class AlertaOut(BaseModel):
     datos: Optional[Dict[str, Any]] = None
     leido: bool
     creado_en: datetime
+    # None = alerta del negocio (la ven todos); con valor = personal, solo
+    # para ese usuario (p. ej. el recordatorio de perfil incompleto).
+    portal_user_id: Optional[UUID] = None
     
     class Config:
         from_attributes = True
@@ -898,12 +1023,6 @@ class CatalogoPagosOut(BaseModel):
 
     planes: list[PlanOut]
     paquetes: list[PaqueteCreditosOut]
-    # config.settings.iva_tasa (0.16 = 16%). Los precios de `planes` no lo
-    # incluyen (services.pagos.con_iva lo suma recién al cotizar), así que
-    # el portal la usa para la leyenda "más IVA (16%)" — viaja acá y no
-    # como texto fijo en el frontend para que nunca se desincronice de lo
-    # que de verdad se cobra.
-    iva_tasa: Decimal
 
 
 class TransaccionOut(BaseModel):
@@ -940,6 +1059,12 @@ class SuscripcionOut(BaseModel):
     precio_monthly: Decimal | None
     creditos_disponibles: Decimal
     creditos_gastados: Decimal
+    # Hay una Subscription de Stripe viva (no dada de baja): se cobra sola
+    # cada mes y crear-pago no deja contratar otra encima (409).
+    suscripcion_recurrente: bool = False
+    # Se pidió cancelar al final del período: sigue vigente hasta
+    # fecha_renovacion y después se pausa.
+    cancela_al_vencer: bool = False
 
 
 Herramienta = Literal["agente", "vendedores", "herramientas", "crm_campo", "calendario"]
@@ -1243,6 +1368,36 @@ class RevocarPruebaIn(BaseModel):
     motivo: str = Field(min_length=3, max_length=500)
 
 
+# Eliminación definitiva de un negocio (services/eliminacion_tenant.py).
+CodigoBloqueoEliminacion = Literal["cuenta_activa", "suscripcion_vigente", "cuenta_propia"]
+
+
+class BloqueoEliminacionOut(BaseModel):
+    codigo: CodigoBloqueoEliminacion
+    mensaje: str
+
+
+class EliminacionTenantOut(BaseModel):
+    """
+    Si el negocio se puede borrar y, si no, por qué. `bloqueos` vacío =
+    eliminable. Lo demás es lo que se pierde: se muestra en la confirmación,
+    no bloquea (los créditos sin usar se advierten, no impiden el borrado).
+    """
+    eliminable: bool
+    bloqueos: list[BloqueoEliminacionOut]
+    creditos_disponibles: Decimal
+    usuarios_portal: int
+    conversaciones: int
+    transacciones: int
+
+
+class EliminarTenantIn(BaseModel):
+    # El nombre exacto del negocio, escrito a mano en el diálogo. El backend
+    # lo vuelve a comparar: una llamada suelta a la API no borra nada por
+    # error.
+    confirmacion: str = Field(min_length=1, max_length=255)
+
+
 class EntradaAuditoriaOut(BaseModel):
     id: UUID
     actor_email: str
@@ -1365,6 +1520,14 @@ class ImpersonarOut(BaseModel):
 # `orden`, y filtrado a `WHERE activo` antes de llegar ahí (ver
 # routers/pagos.catalogo). Estos son para routers/gerencia_planes.py, que
 # necesita ver y tocar también los planes apagados.
+# Un Price de Stripe: "price_" + alfanumérico. Validarlo acá evita pegar por
+# error un prod_... (el Product), que Stripe rechazaría recién al contratar,
+# con el cliente ya en el checkout.
+StripePriceId = Annotated[str, Field(pattern=r"^price_[A-Za-z0-9]+$", max_length=255)]
+# Igual, pero "" también vale: en PATCH es la forma de borrarlo.
+StripePriceIdOVacio = Annotated[str, Field(pattern=r"^(price_[A-Za-z0-9]+)?$", max_length=255)]
+
+
 class PlanGerenciaOut(BaseModel):
     nombre: str
     descripcion: str | None
@@ -1380,6 +1543,9 @@ class PlanGerenciaOut(BaseModel):
     calendario_activo: bool
     activo: bool
     orden: int
+    # Price recurrente de Stripe (price_...). None = todavía no se puede
+    # contratar en línea (crear-pago responde 409).
+    stripe_price_id: str | None
     creado_en: datetime
     actualizado_en: datetime
 
@@ -1407,6 +1573,9 @@ class PlanCrearIn(BaseModel):
     calendario_activo: bool = True
     activo: bool = True
     orden: int = Field(default=0, ge=0, le=32767)
+    # Price recurrente mensual creado en el panel de Stripe. Opcional: sin
+    # él el plan existe (sirve para pruebas) pero no se contrata en línea.
+    stripe_price_id: StripePriceId | None = None
 
 
 class PlanActualizarIn(BaseModel):
@@ -1437,6 +1606,10 @@ class PlanActualizarIn(BaseModel):
     calendario_activo: bool | None = None
     activo: bool | None = None
     orden: int | None = Field(default=None, ge=0, le=32767)
+    # A diferencia de precio_annual, este sí se puede borrar: "" lo deja en
+    # NULL (null sigue siendo "no tocar"). Hace falta para sacar un Price
+    # que se archivó en Stripe.
+    stripe_price_id: StripePriceIdOVacio | None = None
 
     @model_validator(mode="after")
     def al_menos_uno(self):

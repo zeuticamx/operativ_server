@@ -9,6 +9,9 @@ Qué vive dónde:
 
     services/pagos.py        cotizar + entregar lo comprado (sin proveedor)
     services/stripe_pagos.py llamadas a la API de Stripe + firma del webhook
+    services/stripe_suscripciones.py
+                             suscripción recurrente de Stripe: validar antes
+                             del checkout + ciclo de vida por webhook
     este archivo             endpoints del portal, y el camino de Mercado
                              Pago (crear preferencia + su webhook)
     routers/pagos_stripe.py  el webhook de Stripe
@@ -48,7 +51,8 @@ from services.pagos import (
     marcar_cancelada,
     procesar_pago_aprobado,
 )
-from services.stripe_pagos import crear_checkout_session
+from services.stripe_pagos import crear_checkout_session, crear_checkout_suscripcion
+from services.stripe_suscripciones import PreparacionCheckout, preparar_checkout_suscripcion
 from session import execute, fetch_all, fetch_one, fetch_value
 
 router = APIRouter(prefix="/pagos", tags=["pagos"])
@@ -133,7 +137,6 @@ async def catalogo(_tenant_id: UUID = Depends(tenant_actual)) -> CatalogoPagosOu
     return CatalogoPagosOut(
         planes=[PlanOut(**dict(f)) for f in filas_planes],
         paquetes=[PaqueteCreditosOut(**dict(f)) for f in filas_paquetes],
-        iva_tasa=settings.iva_tasa,
     )
 
 
@@ -162,6 +165,14 @@ async def crear_pago(
 
     monto, concepto = await cotizar(datos)
 
+    # Con Stripe, un plan se contrata como suscripción recurrente sobre el
+    # Price del plan. Se valida antes de crear la fila pendiente: un plan sin
+    # Price, o un tenant que ya tiene una suscripción viva, es 409 y no un
+    # checkout a medias (ver services/stripe_suscripciones.py).
+    preparacion: PreparacionCheckout | None = None
+    if settings.stripe_activo and datos.tipo == "subscription" and datos.plan:
+        preparacion = await preparar_checkout_suscripcion(usuario.tenant_id, datos.plan)
+
     # La fila se crea antes de llamar a la pasarela porque su id es la
     # referencia que le mandamos (client_reference_id en Stripe,
     # external_reference en Mercado Pago). Queda 'pendiente' hasta que el
@@ -182,15 +193,41 @@ async def crear_pago(
     )
 
     if settings.stripe_activo:
-        return await _crear_pago_stripe(transaccion_id, concepto, monto, usuario.email)
+        return await _crear_pago_stripe(
+            transaccion_id,
+            concepto,
+            monto,
+            usuario.email,
+            usuario.tenant_id,
+            datos.plan,
+            preparacion,
+        )
     return await _crear_pago_mercadopago(transaccion_id, concepto, monto, usuario.email)
 
 
 async def _crear_pago_stripe(
-    transaccion_id: UUID, concepto: str, monto: Decimal, email: str
+    transaccion_id: UUID,
+    concepto: str,
+    monto: Decimal,
+    email: str,
+    tenant_id: UUID,
+    plan: str | None,
+    preparacion: PreparacionCheckout | None,
 ) -> CrearPagoOut:
     try:
-        sesion = await crear_checkout_session(transaccion_id, concepto, monto, email)
+        if preparacion is not None and plan:
+            # Suscripción recurrente: el monto lo pone el Price de Stripe.
+            sesion = await crear_checkout_suscripcion(
+                transaccion_id,
+                tenant_id,
+                plan,
+                preparacion.price_id,
+                email,
+                preparacion.customer_id,
+            )
+        else:
+            # Créditos: cargo único por el precio de la base.
+            sesion = await crear_checkout_session(transaccion_id, concepto, monto, email)
     except HTTPException:
         # Sin checkout no hay nada que cobrar: la fila pendiente se cierra
         # para que no quede colgada en el historial del cliente para siempre.
@@ -499,7 +536,10 @@ async def suscripcion(tenant_id: UUID = Depends(tenant_actual)) -> SuscripcionOu
         SELECT s.plan, s.estado AS estado_suscripcion, s.fecha_renovacion,
                s.precio_monthly,
                COALESCE(c.creditos_disponibles, 0) AS creditos_disponibles,
-               COALESCE(c.creditos_gastados, 0)    AS creditos_gastados
+               COALESCE(c.creditos_gastados, 0)    AS creditos_gastados,
+               COALESCE(s.stripe_subscription_id IS NOT NULL
+                        AND s.cancelada_en IS NULL, false) AS suscripcion_recurrente,
+               COALESCE(s.cancela_al_vencer, false)        AS cancela_al_vencer
         FROM tenants t
         LEFT JOIN tenant_subscriptions s ON s.tenant_id = t.id
         LEFT JOIN tenant_credits      c ON c.tenant_id = t.id

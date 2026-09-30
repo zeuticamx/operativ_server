@@ -8,6 +8,7 @@ se hace en un hilo aparte con `asyncio.to_thread` para no frenar el loop.
 """
 
 import asyncio
+import html as html_mod
 import logging
 import smtplib
 import ssl
@@ -229,4 +230,76 @@ async def enviar_resumen_alertas(
         asunto=f"Resumen diario: {total} {plural} sin leer - OperativAI",
         texto=texto,
         html=html,
+    )
+
+
+# ============================================================
+# Recordatorio de perfil incompleto (jobs/perfil_background.py)
+# ============================================================
+_TEXTO_PERFIL = """Hola{saludo},
+
+Todavía faltan algunos datos de tu perfil en OperativAI: {faltan}.
+
+Complétalos en Preferencias, toma menos de un minuto:
+{url}
+
+{cierre}
+"""
+
+_HTML_PERFIL = """<div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1c1c1c">
+  <p style="margin:0 0 16px;font-size:16px">Hola{saludo},</p>
+  <p style="margin:0 0 16px;font-size:14px;color:#333">
+    Todavía faltan algunos datos de tu perfil en OperativAI: {faltan}.
+  </p>
+  <p style="margin:0 0 24px">
+    <a href="{url}" style="display:inline-block;padding:10px 16px;border-radius:6px;background:#1c1c1c;color:#fff;font-size:14px;text-decoration:none">
+      Completar en Preferencias
+    </a>
+  </p>
+  <p style="margin:0;font-size:12px;color:#888">{cierre}</p>
+</div>"""
+
+# Nombres legibles de schemas.CAMPOS_PERFIL_OBLIGATORIOS.
+ETIQUETAS_PERFIL = {
+    "nombres": "nombre(s)",
+    "apellido_paterno": "apellido paterno",
+    "fecha_nacimiento": "fecha de nacimiento",
+    "genero": "género",
+}
+
+
+def texto_faltantes(faltantes: list[str]) -> str:
+    etiquetas = [ETIQUETAS_PERFIL.get(f, f) for f in faltantes] or ["tus datos personales"]
+    if len(etiquetas) == 1:
+        return etiquetas[0]
+    return ", ".join(etiquetas[:-1]) + " y " + etiquetas[-1]
+
+
+def _url_preferencias() -> str:
+    base = settings.FRONTEND_ORIGINS[0] if settings.FRONTEND_ORIGINS else ""
+    return f"{base}/preferencias"
+
+
+async def enviar_recordatorio_perfil(
+    destino: str, nombre: str | None, faltantes: list[str], dias_restantes: int
+) -> None:
+    """Lanza ErrorEnvioCorreo si el SMTP falla (quien llama decide qué hacer)."""
+    cierre = (
+        "Es el último recordatorio que te enviamos."
+        if dias_restantes <= 1
+        else f"Te lo recordaremos una vez al día durante {dias_restantes} días más, o hasta que lo completes."
+    )
+    faltan = texto_faltantes(faltantes)
+    saludo = f" {nombre}" if nombre else ""
+    url = _url_preferencias()
+    await enviar_correo(
+        destino,
+        asunto="Completa tu perfil en OperativAI",
+        texto=_TEXTO_PERFIL.format(saludo=saludo, faltan=faltan, url=url, cierre=cierre),
+        html=_HTML_PERFIL.format(
+            saludo=html_mod.escape(saludo),
+            faltan=html_mod.escape(faltan),
+            url=html_mod.escape(url),
+            cierre=html_mod.escape(cierre),
+        ),
     )

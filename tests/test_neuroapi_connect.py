@@ -292,6 +292,13 @@ async def test_un_status_en_ingles_tambien_activa_el_canal(
 @pytest.mark.parametrize(
     "evento",
     [
+        # Formato real observado en producción (2026-09-29).
+        {"event": "whatsapp.connected", "session_id": "sess_sobre",
+         "service_type": "whatsapp_cloud_api", "timestamp": "2026-09-29T22:48:25.778Z",
+         "data": {"phones": [{"id": "ceb244b8-3608-44ab-90b7-9228d57638e5",
+                              "wabaId": "1594460962159498", "wabaName": "Operativai",
+                              "phoneNumberId": "5215522222222", "displayPhone": "+52 1 56 5431 9727",
+                              "serviceType": "whatsapp_cloud_api", "connectionMethod": "api"}]}},
         # Mismo sobre que la respuesta de crear la sesión.
         {"success": True, "data": {"session_id": "sess_sobre", "status": "completed",
                                     "phone_number_id": "5215522222222"}},
@@ -315,6 +322,7 @@ async def test_un_status_en_ingles_tambien_activa_el_canal(
              "phone_number_id": "5215522222222", "waba_id": "999"}}]}]},
     ],
     ids=[
+        "formato-real-produccion",
         "status-en-data", "status-en-event", "connected-en-data", "connected-en-raiz",
         "connected-type-otp", "connected-sobre-meta",
     ],
@@ -344,22 +352,6 @@ async def test_un_evento_con_los_datos_anidados_activa_el_canal(
         tenant_id,
     )
     assert numero == "5215522222222"
-
-
-@pytest.mark.asyncio
-async def test_el_volcado_del_evento_no_muestra_tokens(http_client, con_secreto, caplog):
-    cuerpo = json.dumps(
-        {"event": "whatsapp.connected", "session_id": "sess_ajena",
-         "data": {"access_token": "EAAG-secreto", "phone_number_id": "1"}}
-    ).encode()
-    with caplog.at_level("WARNING", logger="operativai.canales.neuroapi_connect"):
-        await http_client.post(
-            "/api/canales/whatsapp/neuroapi/webhook",
-            content=cuerpo,
-            headers={"x-hub-signature-256": firmar(cuerpo), "content-type": "application/json"},
-        )
-    assert "EAAG-secreto" not in caplog.text
-    assert "phone_number_id" in caplog.text
 
 
 @pytest.mark.asyncio

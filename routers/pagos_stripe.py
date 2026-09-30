@@ -11,6 +11,13 @@ endpoint obligaría a adivinar de quién es cada POST.
 Es el único endpoint del módulo sin JWT: se autentica por el HMAC de la
 cabecera `Stripe-Signature`. Todo lo que entregue lo compró alguien, así
 que la firma es lo único que separa un cobro real de un regalo.
+
+Dos familias de eventos:
+  - checkout.session.* / charge.refunded: el estado de la transacción que
+    creó crear-pago (y, para créditos, la entrega).
+  - invoice.* / customer.subscription.*: el ciclo de vida de la
+    suscripción recurrente, en services/stripe_suscripciones.py. Esos
+    además avisan a gerencia (services/notificaciones_gerencia.py).
 """
 
 import json
@@ -20,8 +27,10 @@ from uuid import UUID
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request, status
 
 from config import settings
+from services.notificaciones_gerencia import notificar_evento_suscripcion
 from services.pagos import procesar_pago_aprobado
 from services.stripe_pagos import firma_valida
+from services.stripe_suscripciones import PROCESADORES as PROCESADORES_SUSCRIPCION
 from session import execute, fetch_one
 
 router = APIRouter(prefix="/pagos/stripe", tags=["pagos"])
@@ -95,6 +104,16 @@ async def webhook(
         await _procesar_reembolso(objeto)
         return {"recibido": True}
 
+    if tipo in PROCESADORES_SUSCRIPCION:
+        # Sin try: si la escritura falla, el 500 hace que Stripe reintente,
+        # que es justo lo que se quiere con un cobro que no se registró.
+        evento_suscripcion = await PROCESADORES_SUSCRIPCION[tipo](objeto)
+        if evento_suscripcion is not None:
+            # El correo en background: el SMTP puede tardar segundos y
+            # Stripe da el evento por fallido si no contestamos rápido.
+            tareas.add_task(notificar_evento_suscripcion, evento_suscripcion)
+        return {"recibido": True}
+
     if tipo != "checkout.session.completed" and tipo not in ESTADOS_SESION:
         log.info("Evento de Stripe ignorado (type=%s)", tipo)
         return {"recibido": True}
@@ -162,7 +181,11 @@ async def webhook(
             )
         return {"recibido": True}
 
-    if nuevo_estado == "aprobado":
+    # En modo subscription la sesión solo confirma el checkout: el plan lo
+    # activa invoice.payment_succeeded (services/stripe_suscripciones.py),
+    # que es el que sabe hasta cuándo quedó pagado. Activarlo también acá
+    # pisaría esa fecha con un "hoy + 30 días" según qué evento llegue último.
+    if nuevo_estado == "aprobado" and objeto.get("mode") != "subscription":
         # En background para contestarle rápido a Stripe: si tardamos, da el
         # evento por fallido y lo reintenta.
         tareas.add_task(procesar_pago_aprobado, transaccion_id)
