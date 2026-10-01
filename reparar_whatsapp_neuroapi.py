@@ -12,10 +12,17 @@ Lee el mismo DATABASE_URL que la app, igual que aplicar_sql.py. Sin
 
     python reparar_whatsapp_neuroapi.py              # revisar
     python reparar_whatsapp_neuroapi.py --aplicar    # guardar
+
+Con --tenant <uuid> se toma solo ese tenant y sin exigir una Connect
+Session completada (líneas vinculadas a mano o cuya sesión quedó
+pendiente). Úsalo solo con tenants que de verdad salen por NeuroAPI.
+
+    python reparar_whatsapp_neuroapi.py --tenant <uuid> --aplicar
 """
 
 import asyncio
 import sys
+from uuid import UUID
 
 import asyncpg
 
@@ -39,16 +46,40 @@ PENDIENTES = """
      ORDER BY c.tenant_id
 """
 
+UN_TENANT = """
+    SELECT c.tenant_id, c.phone_number_id, c.bsp_provider,
+           c.access_token IS NULL AS sin_token
+      FROM channel_credentials c
+     WHERE c.channel_type = 'whatsapp'
+       AND c.is_active
+       AND c.phone_number_id IS NOT NULL
+       AND c.tenant_id = $1
+"""
+
+
+def tenant_de_args(args: list[str]) -> UUID | None:
+    if "--tenant" not in args:
+        return None
+    try:
+        return UUID(args[args.index("--tenant") + 1])
+    except (IndexError, ValueError):
+        raise SystemExit("--tenant necesita un UUID válido.")
+
 
 async def main() -> None:
-    aplicar = "--aplicar" in sys.argv[1:]
+    args = sys.argv[1:]
+    aplicar = "--aplicar" in args
+    tenant_id = tenant_de_args(args)
 
     if aplicar and not settings.NEUROAPI_API_KEY:
         raise SystemExit("NEUROAPI_API_KEY sin configurar: no hay nada que guardar.")
 
     conn = await asyncpg.connect(dsn=settings.DATABASE_URL)
     try:
-        filas = await conn.fetch(PENDIENTES)
+        if tenant_id:
+            filas = await conn.fetch(UN_TENANT, tenant_id)
+        else:
+            filas = await conn.fetch(PENDIENTES)
         if not filas:
             print("No hay líneas de NeuroAPI pendientes de reparar.")
             return
