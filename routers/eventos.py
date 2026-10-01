@@ -22,7 +22,7 @@ from services.acceso_pagos import acceso_pagos
 from services.asignacion import asignar_vendedor_automatico
 from deps import llamada_interna
 from realtime import broadcast_alerta
-from services import calendario
+from services import calendario, creditos
 from services.calendario import actor_desde_chat, verificar_calendario_activo
 from services.gerencia import registrar_uso_tokens
 from services.notificaciones import notificar_vendedor_nuevo_lead
@@ -31,6 +31,8 @@ from schemas import (
     CancelarReservaEventoIn,
     ConsultarDisponibilidadIn,
     ConsultarDisponibilidadOut,
+    ConsumirCreditoIn,
+    ConsumirCreditoOut,
     ConversacionTransferidaIn,
     ConversacionTransferidaOut,
     CrearReservaEventoIn,
@@ -178,6 +180,43 @@ async def uso_tokens(datos: UsoTokensIn):
         idempotency_key=datos.idempotency_key,
     )
     return UsoTokensOut(registrado=registrado, duplicado=not registrado)
+
+
+# ============================================================
+# Créditos por llamada a herramienta
+# ============================================================
+@router.post("/creditos/consumir", response_model=ConsumirCreditoOut)
+async def consumir_credito(datos: ConsumirCreditoIn):
+    """
+    Descuenta 1 crédito antes de que el agente ejecute una herramienta.
+
+    Lo llama el sub-workflow ejecutar-herramienta-tenant de n8n después de
+    validar que la herramienta existe y está activa (una herramienta
+    inexistente no cobra) y antes de ejecutarla. Con `permitido=false` n8n
+    no la ejecuta y le devuelve al agente un resultado controlado.
+
+    Sin saldo responde 200 y no 402 a propósito: n8n tiene que poder
+    distinguir "no hay créditos" de un token inválido o un backend caído,
+    que sí son errores. El descuento es atómico (services/creditos.py).
+    """
+    r = await creditos.consumir_credito(
+        datos.tenant_id,
+        datos.herramienta,
+        datos.idempotency_key,
+        datos.conversation_id,
+    )
+    if not r.permitido:
+        log.warning(
+            "Herramienta %s bloqueada por falta de créditos (tenant %s)",
+            datos.herramienta, datos.tenant_id,
+        )
+    return ConsumirCreditoOut(
+        permitido=r.permitido,
+        motivo=None if r.permitido else "sin_creditos",
+        saldo_restante=r.saldo_restante,
+        bolsa=r.bolsa,
+        duplicado=r.duplicado,
+    )
 
 
 # ============================================================

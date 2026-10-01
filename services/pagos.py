@@ -30,6 +30,7 @@ from fastapi import HTTPException, status
 
 from config import settings
 from schemas import CrearPagoIn
+from services.creditos import cargar_creditos_plan
 from session import execute, fetch_one, transaccion
 
 log = logging.getLogger("operativai.pagos")
@@ -117,7 +118,9 @@ async def procesar_pago_aprobado(transaccion_id: UUID) -> None:
             return
 
         if fila["tipo"] == "subscription":
-            await activar_suscripcion(fila["tenant_id"], fila["plan_nombre"])
+            await activar_suscripcion(
+                fila["tenant_id"], fila["plan_nombre"], referencia=f"tx:{transaccion_id}"
+            )
         elif fila["tipo"] == "credit_purchase":
             await acreditar_creditos(
                 fila["tenant_id"],
@@ -136,6 +139,7 @@ async def activar_suscripcion(
     fecha_renovacion: datetime | None = None,
     stripe_customer_id: str | None = None,
     stripe_subscription_id: str | None = None,
+    referencia: str | None = None,
     conn: asyncpg.Connection | None = None,
 ) -> bool:
     """
@@ -152,6 +156,12 @@ async def activar_suscripcion(
         el registro del cobro — si una de las dos cosas falla, el webhook
         responde 500, Stripe reintenta y no queda un cobro sin entregar.
 
+    `referencia` identifica el cobro ('tx:<uuid>', 'stripe_invoice:<id>') y
+    con ella se carga la cuota de créditos del plan (services/creditos.py).
+    Es lo que hace idempotente la carga: un aviso repetido de la pasarela
+    vuelve a escribir el mismo estado de la suscripción, pero no le devuelve
+    al tenant los créditos que ya gastó en el ciclo.
+
     Activar limpia cualquier rastro de cancelación o cobro fallido: un pago
     aprobado es la prueba de que la suscripción está al día.
     """
@@ -163,6 +173,7 @@ async def activar_suscripcion(
                 fecha_renovacion=fecha_renovacion,
                 stripe_customer_id=stripe_customer_id,
                 stripe_subscription_id=stripe_subscription_id,
+                referencia=referencia,
                 conn=nueva,
             )
 
@@ -231,6 +242,11 @@ async def activar_suscripcion(
         plan_fila["agente_ia_activo"],
         plan_fila["gestion_vendedores_activo"],
     )
+
+    if referencia is not None:
+        await cargar_creditos_plan(
+            conn, tenant_id, plan, renovacion, referencia, f"Créditos del plan {plan}"
+        )
 
     log.info("Suscripción %s activada para el tenant %s", plan, tenant_id)
     return True

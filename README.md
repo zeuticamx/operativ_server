@@ -908,6 +908,61 @@ y tiene su propio libro (`credit_transactions`). Están separados a propósito:
 el día que cambie la equivalencia token→crédito, el histórico de consumo no
 se toca.
 
+### Créditos por llamada a herramienta
+
+Regla: **1 crédito = 1 llamada a herramienta** ejecutada por el agente
+(`services/creditos.py`, `sql/31_creditos_herramientas.sql`). `escalar_humano`
+no cobra: sin saldo, quien pide una persona tiene que poder llegar a ella.
+
+Dos bolsas en `tenant_credits`:
+
+| Columna | Qué es | Se gasta |
+|---|---|---|
+| `creditos_plan` (+ `creditos_plan_vence`) | Cuota del ciclo: `planes.creditos_incluidos_mensual`. Se **reinicia** (no acumula) en cada activación o renovación | primero, y solo mientras no venza |
+| `creditos_disponibles` | Comprados (paquetes) o ajustados por gerencia. No vencen | cuando la del plan se acaba |
+
+La bolsa del plan **no** cuenta en `acceso_pagos`: solo los comprados dejan
+operar sin suscripción (modelo híbrido), así un plan vencido no sigue
+funcionando con lo que le sobró del mes.
+
+Cuándo se carga la cuota (siempre en la misma transacción que activa el
+plan, con asiento `asignacion_plan` en `credit_transactions`):
+
+| Disparador | `referencia` (idempotencia) |
+|---|---|
+| Pago aprobado (Mercado Pago, `procesar_pago_aprobado`) | `tx:<transaccion_id>` |
+| Factura pagada de Stripe (alta y cada renovación) | `stripe_invoice:<id>` |
+| Prueba otorgada por gerencia | `prueba:<uuid>` (cada otorgamiento reinicia) |
+
+Revocar una prueba o que el job pause un plan vencido deja la bolsa en 0
+(asiento `expiracion_plan`). Los tenants sin plan (demos, internos) no
+tienen cuota: se les da saldo con el ajuste manual de gerencia
+(`POST /api/gerencia/tenants/{id}/creditos`), que va a `creditos_disponibles`.
+
+`POST /api/eventos/creditos/consumir` — con `X-Internal-Token`. Lo llama el
+sub-workflow `ejecutar-herramienta-tenant` de n8n después de validar que la
+herramienta existe (una inexistente no cobra) y antes de ejecutarla:
+
+```json
+{ "tenant_id": "…", "herramienta": "crear_reserva", "conversation_id": "…",
+  "idempotency_key": "{{$execution.id}}" }
+→ { "permitido": true,  "saldo_restante": "41.00", "bolsa": "plan", "duplicado": false }
+→ { "permitido": false, "motivo": "sin_creditos", "saldo_restante": "0.00" }
+```
+
+- Sin saldo responde **200 con `permitido: false`**, no 402: n8n tiene que
+  distinguirlo de un token inválido o un backend caído. En ese caso n8n no
+  ejecuta la herramienta y le devuelve al agente `SIN_CREDITOS: …`; con
+  error HTTP tampoco la ejecuta (falla cerrado).
+- **Atómico**: la fila de `tenant_credits` se bloquea (`FOR UPDATE`) durante
+  el descuento, así que llamadas en paralelo del mismo tenant se serializan
+  y nunca gastan más de lo que hay; los `CHECK >= 0` son el segundo candado.
+- La misma `idempotency_key` no cobra dos veces (`duplicado: true`).
+- Cada descuento deja un asiento `gasto`: fecha, tenant, herramienta,
+  conversación, bolsa y saldo anterior/nuevo.
+- Se cobra al validar, antes de ejecutar: una herramienta que después
+  falla por un problema técnico (API externa caída) ya consumió su crédito.
+
 ## Flujo de conexión con Meta
 
 ```
@@ -987,3 +1042,11 @@ Se puede desarrollar y probar todo hoy con las páginas propias.
   `--aplicar` solo las lista). Ese script no sirve para rotar la API key
   (solo toca líneas sin token o con otro proveedor): tras rotarla hay que
   reconectar cada línea.
+- **Desconectar una línea de NeuroAPI**: NeuroAPI no expone endpoint de baja
+  (su API pública solo tiene connect/sessions, messaging/send,
+  messaging/webhooks/api y messaging/logs). `DELETE /api/canales/whatsapp`
+  desactiva la línea en nuestra base, y con eso basta para que el proxy
+  descarte lo que siga llegando y n8n no conteste. Devuelve
+  `"proveedor": "neuroapi"` y el portal le pide al negocio que retire el
+  acceso de la app en su Meta Business Manager, que es lo que la desvincula
+  del todo.

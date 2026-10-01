@@ -440,6 +440,7 @@ async def procesar_factura_pagada(obj: dict[str, Any]) -> EventoSuscripcion | No
             fecha_renovacion=factura.periodo_fin,
             stripe_customer_id=factura.customer_id,
             stripe_subscription_id=factura.subscription_id,
+            referencia=f"stripe_invoice:{factura.id}",
             conn=conn,
         )
         fecha_renovacion = await conn.fetchval(

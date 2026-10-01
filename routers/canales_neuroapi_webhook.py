@@ -131,8 +131,12 @@ async def _reenviar_mensaje(cuerpo_crudo: bytes, evento: dict[str, Any], tipo_ev
 
     tenant_id = await entrada_mensajes.tenant_por_numero(phone_number_id)
     if tenant_id is None:
+        # Lo normal es una línea desconectada desde el portal: NeuroAPI no
+        # tiene endpoint de baja y sigue mandando hasta que se retire el
+        # acceso en Meta.
         log.warning(
-            "Mensaje de NeuroAPI para un número que no es de ningún tenant: %s",
+            "Mensaje de NeuroAPI descartado: el número %s no tiene tenant activo "
+            "(desconectado o ajeno)",
             phone_number_id,
         )
         return

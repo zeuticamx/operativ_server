@@ -348,10 +348,15 @@ async def desconectar_canal(
             detail=f"Canal no válido: {channel_type}",
         )
 
-    await execute(
+    # bsp_provider vuelve en la respuesta porque NeuroAPI no tiene endpoint de
+    # baja: desactivar aquí basta para que el proxy deje de reenviar y n8n de
+    # contestar, pero la línea sigue vinculada a la app hasta que el negocio
+    # retire el acceso en su Meta Business Manager, y el portal se lo avisa.
+    fila = await fetch_one(
         """
         UPDATE channel_credentials SET is_active = false
         WHERE tenant_id = $1 AND channel_type = $2
+        RETURNING bsp_provider
         """,
         tenant_id,
         channel_type,
@@ -364,4 +369,4 @@ async def desconectar_canal(
         tenant_id,
         channel_type,
     )
-    return {"desconectado": channel_type}
+    return {"desconectado": channel_type, "proveedor": fila["bsp_provider"] if fila else None}

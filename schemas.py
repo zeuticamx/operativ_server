@@ -1130,6 +1130,30 @@ class UsoTokensOut(BaseModel):
     duplicado: bool = False
 
 
+class ConsumirCreditoIn(BaseModel):
+    """
+    n8n pide descontar 1 crédito antes de ejecutar una herramienta
+    (services/creditos.py). `idempotency_key` es obligatoria: es el id de la
+    ejecución del sub-workflow, y con ella un reintento no cobra dos veces.
+    """
+
+    tenant_id: UUID
+    herramienta: str = Field(min_length=1, max_length=100)
+    conversation_id: UUID | None = None
+    idempotency_key: str = Field(min_length=1, max_length=255)
+
+
+class ConsumirCreditoOut(BaseModel):
+    # False = sin saldo: n8n no ejecuta la herramienta. No es un error HTTP
+    # para que n8n lo distinga de un token inválido o un backend caído.
+    permitido: bool
+    motivo: Literal["sin_creditos"] | None = None
+    saldo_restante: Decimal
+    bolsa: Literal["plan", "comprados"] | None = None
+    # True cuando la idempotency_key ya se había cobrado: no se descontó otra vez.
+    duplicado: bool = False
+
+
 class ConsumoTenantOut(BaseModel):
     """Consumo de un tenant dentro del rango consultado."""
 

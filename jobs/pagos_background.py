@@ -24,8 +24,9 @@ otro reactiva por pago aprobado.
 
 import logging
 
+from services.creditos import expirar_creditos_plan
 from services.notificaciones_gerencia import EventoSuscripcion, notificar_evento_suscripcion
-from session import fetch_all
+from session import fetch_all, transaccion
 
 log = logging.getLogger("operativai.jobs.pagos")
 
@@ -75,6 +76,17 @@ async def job_pausar_suscripciones_vencidas() -> None:
         log.info("Suscripciones pausadas por vencimiento: %s", len(pausadas))
 
     for fila in pausadas:
+        # La bolsa del plan ya no se puede gastar (venció por fecha); esto
+        # la deja en cero y con asiento para que el saldo mostrado cuadre.
+        # Un fallo acá no frena las demás pausas.
+        try:
+            async with transaccion() as conn:
+                await expirar_creditos_plan(
+                    conn, fila["tenant_id"], f"Plan {fila['plan']} vencido sin renovar"
+                )
+        except Exception:  # noqa: BLE001 - un tenant no puede frenar al resto
+            log.exception("No se pudieron expirar los créditos del plan de %s", fila["tenant_id"])
+
         evento = _evento_de_pausa(fila)
         if evento is not None:
             # notificar_evento_suscripcion no lanza: un SMTP caído no frena

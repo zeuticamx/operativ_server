@@ -18,7 +18,7 @@ import json
 import pytest
 
 from config import settings
-from services import neuroapi_connect
+from services import entrada_mensajes, neuroapi_connect
 from services.neuroapi_connect import verificar_webhook
 from session import execute, fetch_one, fetch_value
 
@@ -317,6 +317,51 @@ async def test_reconectar_con_otro_numero_deja_el_nuevo(
     assert cred["phone_number_id"] == "5215522222222"
     assert cred["bsp_provider"] == "neuroapi"
     assert cred["access_token"] == "clave-de-prueba"
+
+
+@pytest.mark.asyncio
+async def test_desconectar_avisa_que_es_neuroapi_y_corta_los_mensajes(
+    http_client, tenant_y_usuario, con_secreto, monkeypatch
+):
+    """
+    NeuroAPI no tiene endpoint de baja: el portal necesita saber que la línea
+    era suya para pedir que se retire el acceso en Meta, y lo que siga
+    mandando NeuroAPI no debe llegar a n8n.
+    """
+    monkeypatch.setattr(settings, "NEUROAPI_API_KEY", "clave-de-prueba")
+    monkeypatch.setattr(settings, "N8N_WEBHOOK_ENTRADA_URL", "https://n8n.ejemplo.com/webhook/x")
+    tenant_id = tenant_y_usuario["tenant_id"]
+    await _sesion_pendiente(tenant_id, "sess_baja")
+    await _completar(http_client, "sess_baja", "5215533330000")
+
+    respuesta = await http_client.delete(
+        "/api/canales/whatsapp",
+        headers={"Authorization": f"Bearer {tenant_y_usuario['token']}"},
+    )
+    assert respuesta.status_code == 200
+    assert respuesta.json() == {"desconectado": "whatsapp", "proveedor": "neuroapi"}
+
+    reenvios: list[str] = []
+
+    async def no_reenviar(cuerpo_crudo, tenant, destino):
+        reenvios.append(destino)
+
+    monkeypatch.setattr(entrada_mensajes, "reenviar", no_reenviar)
+    mensaje = json.dumps({
+        "object": "whatsapp_business_account",
+        "entry": [{"changes": [{"value": {
+            "metadata": {"phone_number_id": "5215533330000"},
+            "messages": [{"from": "5215599999999", "id": "wamid.B", "type": "text",
+                          "text": {"body": "hola"}}],
+        }}]}],
+    }).encode()
+    respuesta = await http_client.post(
+        "/api/canales/whatsapp/neuroapi/webhook",
+        content=mensaje,
+        headers={"x-hub-signature-256": firmar(mensaje), "content-type": "application/json"},
+    )
+    assert respuesta.status_code == 200
+    assert reenvios == []
 
 
 @pytest.mark.asyncio

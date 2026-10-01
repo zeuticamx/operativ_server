@@ -27,12 +27,13 @@ Reglas propias de la prueba:
 import calendar
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import HTTPException, status
 
 from schemas import OtorgarPruebaIn, UnidadDuracionPrueba
 from services import herramientas_calendario
+from services.creditos import cargar_creditos_plan, expirar_creditos_plan
 from services.gerencia import registrar_auditoria
 from session import transaccion
 
@@ -216,6 +217,18 @@ async def otorgar_prueba(
             plan["calendario_activo"],
         )
 
+        # Cuota de créditos del plan, hasta el fin de la prueba. Cada
+        # otorgamiento es una carga nueva (referencia propia): extender o
+        # cambiar de plan reinicia la bolsa, igual que una renovación pagada.
+        await cargar_creditos_plan(
+            conn,
+            tenant_id,
+            plan["nombre"],
+            expiracion,
+            f"prueba:{uuid4()}",
+            f"Créditos del plan {plan['nombre']} (prueba otorgada por {gerente_email})",
+        )
+
         await registrar_auditoria(
             actor_email=gerente_email,
             actor_portal_user_id=gerente_id,
@@ -287,6 +300,9 @@ async def revocar_prueba(
              WHERE tenant_id = $1
             """,
             tenant_id,
+        )
+        await expirar_creditos_plan(
+            conn, tenant_id, f"Prueba revocada por {gerente_email}: {motivo}"
         )
 
         await registrar_auditoria(
