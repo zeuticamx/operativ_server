@@ -6,6 +6,10 @@ proyecto (Meta, Stripe, Kontesta). Esto es distinto de `services/whatsapp.py`:
 `NeuroApiProvider` de ahí es el BSP para *enviar/recibir mensajes* una vez la
 cuenta ya está conectada; esto es *el alta de la cuenta*, mismo vendor y mismo
 esquema de firma pero otro endpoint y otro secreto de webhook.
+
+La `webhook_url` de la sesión recibe también los mensajes entrantes una vez
+vinculada la cuenta; el router los reenvía a n8n (services/entrada_mensajes.py)
+con la firma ya validada por `verificar_webhook` de este módulo.
 """
 
 from __future__ import annotations

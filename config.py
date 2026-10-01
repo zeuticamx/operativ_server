@@ -33,6 +33,14 @@ class Settings:
     # existe no puede quedar abierto por olvidar una variable.
     N8N_INTERNAL_TOKEN: str = os.getenv("N8N_INTERNAL_TOKEN", "")
 
+    # URL de producción del webhook `entrada-canal-universal` de n8n. El
+    # backend le reenvía los mensajes entrantes de WhatsApp que NeuroAPI
+    # manda a /api/canales/whatsapp/neuroapi/webhook, ya con la firma
+    # validada y el tenant resuelto (services/entrada_mensajes.py), y se
+    # autentica con N8N_INTERNAL_TOKEN en la cabecera X-Internal-Token.
+    # Vacío = esos mensajes se responden 503 y NeuroAPI los reintenta.
+    N8N_WEBHOOK_ENTRADA_URL: str = os.getenv("N8N_WEBHOOK_ENTRADA_URL", "")
+
     # ---- Meta ----
     META_APP_ID: str = os.getenv("META_APP_ID", "")
     META_APP_SECRET: str = os.getenv("META_APP_SECRET", "")
@@ -74,12 +82,13 @@ class Settings:
     # cuenta.
     NEUROAPI_PHONE_NUMBER_ID: str = os.getenv("NEUROAPI_PHONE_NUMBER_ID", "")
 
-    # Secreto del webhook de NeuroAPI Connect Sessions (alta de la cuenta vía
-    # Embedded Signup), distinto de NEUROAPI_WEBHOOK_SECRET (que es el de los
-    # webhooks de mensajería una vez la cuenta ya está conectada). Se manda
-    # como webhook_secret al crear la sesión y NeuroAPI lo usa para firmar su
-    # callback; compartir el mismo secreto entre ambos webhooks haría que una
-    # fuga de uno comprometa el otro. Vacío = ese webhook rechaza todo.
+    # Secreto del webhook de NeuroAPI Connect Sessions. Se manda como
+    # webhook_secret al crear la sesión y NeuroAPI lo usa para firmar todo lo
+    # que llega a esa webhook_url: el alta de la cuenta (Embedded Signup) y,
+    # ya vinculada, los mensajes entrantes que el backend reenvía a n8n. Es
+    # el único secreto que valida ese endpoint. NEUROAPI_WEBHOOK_SECRET queda
+    # para NeuroApiProvider.verificar_webhook (services/whatsapp.py), que hoy
+    # no usa ningún router. Vacío = ese webhook rechaza todo.
     NEUROAPI_CONNECT_WEBHOOK_SECRET: str = os.getenv("NEUROAPI_CONNECT_WEBHOOK_SECRET", "")
 
     # ---- Google (cuenta de servicio compartida, para Sheets/Docs) ----
@@ -446,6 +455,13 @@ class Settings:
                 "/api/canales/whatsapp/neuroapi/webhook va a rechazar todo, "
                 "así que ninguna vinculación automática de WhatsApp se "
                 "completará."
+            )
+
+        if not self.N8N_WEBHOOK_ENTRADA_URL:
+            logging.getLogger("operativai.config").warning(
+                "N8N_WEBHOOK_ENTRADA_URL sin configurar: los mensajes de "
+                "WhatsApp que lleguen por NeuroAPI se van a responder 503 y "
+                "no llegarán a n8n."
             )
 
         # Tampoco se exige: el alta y el login con correo siguen funcionando

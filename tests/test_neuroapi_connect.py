@@ -265,6 +265,60 @@ async def test_una_sesion_completada_activa_el_canal(
     assert numero == "5215500000000"
 
 
+async def _completar(http_client, session_id: str, phone_number_id: str) -> None:
+    cuerpo = json.dumps(
+        {"session_id": session_id, "status": "completado", "phone_number_id": phone_number_id}
+    ).encode()
+    respuesta = await http_client.post(
+        "/api/canales/whatsapp/neuroapi/webhook",
+        content=cuerpo,
+        headers={"x-hub-signature-256": firmar(cuerpo), "content-type": "application/json"},
+    )
+    assert respuesta.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_la_linea_activada_queda_lista_para_que_n8n_conteste(
+    http_client, tenant_y_usuario, con_secreto, monkeypatch
+):
+    """
+    n8n contesta por NeuroAPI solo si get_channel_credentials le da
+    bsp_provider='neuroapi' y un token para x-api-key. Antes quedaban NULL y
+    'meta', y el agente no contestaba nunca.
+    """
+    monkeypatch.setattr(settings, "NEUROAPI_API_KEY", "clave-de-prueba")
+    tenant_id = tenant_y_usuario["tenant_id"]
+    await _sesion_pendiente(tenant_id, "sess_lista")
+
+    await _completar(http_client, "sess_lista", "5215511111111")
+
+    cred = await fetch_one(
+        "SELECT * FROM get_channel_credentials($1, 'whatsapp')", tenant_id
+    )
+    assert cred["bsp_provider"] == "neuroapi"
+    assert cred["access_token"] == "clave-de-prueba"
+    assert cred["phone_number_id"] == "5215511111111"
+
+
+@pytest.mark.asyncio
+async def test_reconectar_con_otro_numero_deja_el_nuevo(
+    http_client, tenant_y_usuario, con_secreto, monkeypatch
+):
+    monkeypatch.setattr(settings, "NEUROAPI_API_KEY", "clave-de-prueba")
+    tenant_id = tenant_y_usuario["tenant_id"]
+    await _sesion_pendiente(tenant_id, "sess_uno")
+    await _completar(http_client, "sess_uno", "5215511111111")
+    await _sesion_pendiente(tenant_id, "sess_dos")
+    await _completar(http_client, "sess_dos", "5215522222222")
+
+    cred = await fetch_one(
+        "SELECT * FROM get_channel_credentials($1, 'whatsapp')", tenant_id
+    )
+    assert cred["phone_number_id"] == "5215522222222"
+    assert cred["bsp_provider"] == "neuroapi"
+    assert cred["access_token"] == "clave-de-prueba"
+
+
 @pytest.mark.asyncio
 async def test_un_status_en_ingles_tambien_activa_el_canal(
     http_client, tenant_y_usuario, con_secreto

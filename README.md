@@ -969,3 +969,21 @@ Se puede desarrollar y probar todo hoy con las páginas propias.
   (`NeuroApiProvider`) es una tercera opción ya implementada contra el BSP
   NeuroAPI/NeuroChat, con el mismo alcance y las mismas limitaciones que
   Kontesta hasta que se decida cuál usar en producción.
+- **Mensajes entrantes de NeuroAPI**: llegan a la misma `webhook_url` de la
+  Connect Session (`/api/canales/whatsapp/neuroapi/webhook`). El backend
+  valida la firma con `NEUROAPI_CONNECT_WEBHOOK_SECRET`, resuelve el tenant
+  por el `phone_number_id` receptor y reenvía el cuerpo intacto a
+  `N8N_WEBHOOK_ENTRADA_URL` (`services/entrada_mensajes.py`), con
+  `X-Tenant-Id`, `X-Canal`, `X-Proveedor` y `X-Internal-Token`. Si n8n no lo
+  recibe responde 502/503 para que NeuroAPI reintente. El enrutamiento por
+  tenant a otro destino se agrega en `entrada_mensajes.destino_para`.
+- **Respuestas por NeuroAPI**: las manda n8n, no el backend. Al vincular, el
+  backend guarda la línea con `set_whatsapp_neuroapi`
+  (`sql/30_whatsapp_neuroapi_credenciales.sql`): `bsp_provider='neuroapi'` y
+  `NEUROAPI_API_KEY` cifrada como `access_token`, que n8n lee con
+  `get_channel_credentials` y manda en `x-api-key`. Las líneas vinculadas
+  antes de esa migración quedaron con token NULL y `bsp_provider='meta'`;
+  se reparan con `python reparar_whatsapp_neuroapi.py --aplicar` (sin
+  `--aplicar` solo las lista). Ese script no sirve para rotar la API key
+  (solo toca líneas sin token o con otro proveedor): tras rotarla hay que
+  reconectar cada línea.
