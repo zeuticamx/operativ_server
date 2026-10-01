@@ -338,6 +338,51 @@ async def enviar_mensaje_humano(
     return fila
 
 
+async def tomar_conversacion(tenant_id: UUID, conversacion_id: UUID):
+    """
+    Un humano toma el control desde el portal: es la inversa de `volver_a_ia`
+    y deja el mismo estado que `escalar_humano` (status='transferred'), así
+    que entrada-canal-universal deja de contestar con IA sin cambios en n8n.
+
+    `ack_pendiente` queda en false a propósito: ese acuse ("te estamos
+    transfiriendo con una persona") es para cuando la IA escala por su cuenta;
+    quien toma la conversación a mano va a escribir él mismo, y un aviso
+    automático antes de su mensaje sería ruido.
+
+    El UPDATE condicional (status='active') evita pisar una transferencia que
+    el agente hizo entre la lectura y la escritura.
+    """
+    conv = await _conversacion_para_escritura(tenant_id, conversacion_id)
+
+    if conv["status"] != "active":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="La conversación ya está en modo humano",
+        )
+
+    fila = await fetch_one(
+        """
+        UPDATE conversations
+        SET status = 'transferred',
+            metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+                'motivo_escalamiento', 'tomada_desde_portal',
+                'escalado_en', NOW()::text,
+                'ack_pendiente', false
+            )
+        WHERE id = $1 AND tenant_id = $2 AND status = 'active'
+        RETURNING id, status
+        """,
+        conversacion_id,
+        tenant_id,
+    )
+    if fila is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="La conversación ya está en modo humano",
+        )
+    return fila
+
+
 async def volver_a_ia(tenant_id: UUID, conversacion_id: UUID):
     """
     Le devuelve el control a la IA: solo hace falta poner status='active'

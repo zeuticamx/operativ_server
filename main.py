@@ -28,7 +28,9 @@ from routers import (
     gerencia,
     gerencia_operacion,
     gerencia_planes,
+    gerencia_incidencias,
     herramientas,
+    incidencias,
     pagos,
     pagos_stripe,
     perfil,
@@ -75,6 +77,7 @@ app.add_middleware(
 app.include_router(auth.router, prefix="/api")
 # Perfil personal (datos + foto) del usuario de la sesión, desde /preferencias.
 app.include_router(perfil.router, prefix="/api")
+app.include_router(incidencias.router, prefix="/api")
 app.include_router(canales.router, prefix="/api")
 # Alta de WhatsApp vía NeuroAPI Connect Sessions: el único endpoint del
 # módulo de canales sin JWT, autenticado por firma HMAC (ver comentario del
@@ -118,6 +121,7 @@ app.include_router(calendario.router_calendario, prefix="/api")
 app.include_router(gerencia.router, prefix="/api")
 app.include_router(gerencia_operacion.router, prefix="/api")
 app.include_router(gerencia_planes.router, prefix="/api")
+app.include_router(gerencia_incidencias.router, prefix="/api")
 
 # Lo llama n8n con X-Internal-Token, no el frontend.
 app.include_router(eventos.router, prefix="/api")

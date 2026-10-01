@@ -103,6 +103,8 @@ Reconéctate después: el parámetro aplica en sesiones nuevas.
 POST   /api/auth/registro          Paso 1: manda un código de 6 dígitos al correo
 POST   /api/auth/verificar         Paso 2: código ok → crea negocio + agente + dueño
 POST   /api/auth/reenviar-codigo   Código nuevo para un alta pendiente
+POST   /api/auth/recuperar/solicitar    Código de recuperación al correo (siempre 202)
+POST   /api/auth/recuperar/restablecer  Código + contraseña nueva (204; cierra sesiones)
 POST   /api/auth/login
 POST   /api/auth/refresh
 GET    /api/auth/yo
@@ -146,6 +148,39 @@ log** en vez de enviarlos. Es cómodo en local, pero en producción significa
 que nadie recibe nada: llena `SMTP_HOST` y `SMTP_FROM`. El arranque avisa
 con un WARNING si faltan.
 
+### Recuperación de contraseña
+
+Pantalla `/recuperar` del portal (enlace "¿Olvidaste tu contraseña?" en el
+login). Lógica en `services/recuperacion_password.py`, migración
+`sql/32_recuperacion_password.sql` (tabla `password_resets`, un código
+activo por `portal_user`, y `portal_users.credenciales_cambiadas_en`).
+
+| Regla | Cómo |
+|---|---|
+| Vigencia **estricta de 5 minutos** | Constante `VIGENCIA_MINUTOS`, **no** variable de entorno. Emisión (`NOW() + 5 min`) y comprobación (`expires_at > NOW()`) usan el reloj de Postgres; en el segundo 300 ya no vale |
+| Un solo uso | El canje borra la fila en la misma transacción que cambia la contraseña, condicionado a que siga vigente y sea el mismo código (dos canjes simultáneos: gana uno) |
+| Intentos | `CODIGO_MAX_INTENTOS` (5); agotados, el código se descarta |
+| Reenvío | `CODIGO_REENVIO_SEGUNDOS` (60). Un código nuevo anula el anterior |
+| Hashing | `security.hash_password` (argon2id) para el código y la contraseña nueva; sin cambios al algoritmo |
+| Cuentas solo-Google (`password_hash` NULL) | Reciben código y pueden definir una contraseña: el código prueba que leen el correo |
+| Cuentas desactivadas | No reciben código |
+
+**Anti-enumeración.** `/solicitar` responde siempre `202` con el mismo
+cuerpo y hace todo el trabajo (buscar la cuenta, argon2, SMTP) en una
+`BackgroundTask` después de responder: ni el contenido ni el tiempo de la
+respuesta dicen si el correo existe. Por lo mismo, un fallo de SMTP no es un
+502, solo queda en el log. `/restablecer` da **un único 400** ("incorrecto o
+ya venció") para código errado, vencido, usado o agotado — distinguirlos
+diría si ese correo tiene un código pendiente — y gasta un argon2 contra un
+hash señuelo cuando no hay fila, para que tarde lo mismo. El "venció" que ve
+el usuario lo pone el portal con su propia cuenta regresiva.
+
+**Cierre de sesiones.** Restablecer escribe `credenciales_cambiadas_en =
+NOW()`; `deps.usuario_actual` y `/auth/refresh` rechazan (401) los tokens
+con `iat` anterior. Sin esto una sesión robada sobrevivía 30 días al cambio
+(refresh token). `iat` va en segundos enteros: un token emitido en el mismo
+segundo del cambio sigue valiendo.
+
 ### Aceptación de Términos y Condiciones
 
 Ninguna cuenta nace sin evidencia de que el dueño aceptó las Condiciones del
@@ -175,6 +210,33 @@ Las cuentas anteriores quedan con la evidencia en NULL y aceptan en su
 próximo ingreso con `/login` o `/google`. Una sesión ya abierta sigue
 funcionando hasta que su refresh token venza: `/auth/refresh` no pide
 aceptación.
+
+### Reporte de problemas (incidencias)
+
+Botón "Reportar un problema" al pie del sidebar del portal (modal, sin
+recargar ni navegar). Migración `sql/33_reportes_incidencia.sql`
+(`reportes_incidencia` y `reportes_incidencia_adjuntos`). Se llama
+"incidencias" en rutas y archivos porque `/reportes` ya es el de los
+reportes analíticos del embudo (`routers/reportes.py`).
+
+```
+POST   /api/incidencias                    multipart: resumen, descripcion, contexto (JSON), adjunto (opcional)
+GET    /api/gerencia/incidencias           lista (?estado=abierto|en_revision|resuelto)
+GET    /api/gerencia/incidencias/{id}      detalle
+GET    /api/gerencia/incidencias/{id}/adjunto   la captura
+PATCH  /api/gerencia/incidencias/{id}      cambia el estado (deja asiento en gerencia_auditoria)
+```
+
+| Regla | Detalle |
+|---|---|
+| Quién puede reportar | Cualquier usuario autenticado, de cualquier rol y **aunque el plan esté vencido** (no cuelga de `requiere_herramienta`). En "ver como" es 403 como toda escritura |
+| Quién reporta | Sale del JWT (usuario, correo, negocio). El formulario no puede cambiarlo |
+| Campos | `resumen` 5–120 (una sola línea: va en el asunto del correo), `descripcion` 10–4000. Rango fuera → 422 |
+| Contexto técnico | Lo arma el navegador (`frontend/lib/contexto-reporte.ts`): ruta sin hash ni tokens, navegador, SO, resolución, ventana, idioma, zona horaria. El backend solo conserva esas claves, recortadas; un contexto ilegible queda `{}` y no rompe el envío |
+| Adjunto | Una imagen PNG/JPG, máx. `REPORTE_ADJUNTO_MAX_BYTES` (5 MB) y `REPORTE_ADJUNTO_MAX_PX` (8192). El tipo se decide por la firma de bytes (`services/imagen.py`), no por el nombre. 413 pesa de más, 415 no es imagen, 422 dañada |
+| Límite | `REPORTES_MAX_POR_HORA` (3) por usuario → 429 con `Retry-After`. Conteo e INSERT en una transacción con candado por usuario |
+| Aviso al equipo | Correo a cada `gerencia_users` en background (el reporte ya está guardado; un SMTP caído no le llega al usuario como error). Todo lo escrito por el usuario va escapado en el HTML |
+| Dónde se ven | `/gerencia/incidencias` en el portal. No se usa `gerencia_alertas`: permite una sola alerta abierta por (tipo, negocio) y escondería el segundo reporte |
 
 ### Perfil del usuario y recordatorios
 
@@ -243,10 +305,11 @@ GET    /api/conversaciones                Listado con filtros
 GET    /api/conversaciones/metricas
 GET    /api/conversaciones/{id}           Detalle con mensajes
 POST   /api/conversaciones/{id}/mensajes       Respuesta manual (handoff humano)
+POST   /api/conversaciones/{id}/tomar          Un humano toma el control (status='transferred', sin acuse)
 POST   /api/conversaciones/{id}/volver-a-ia    Le devuelve el control a la IA
 ```
 
-Gerencia de plataforma tiene los mismos dos últimos (más los dos GET) bajo
+Gerencia de plataforma tiene los mismos tres últimos (más los dos GET) bajo
 `/api/gerencia/tenants/{tenant_id}/conversaciones/...`, con el `tenant_id`
 explícito en la ruta en vez de salir del JWT de quien llama — es lo que le
 permite "filtrar por tenant_id" sin pasar por la impersonación de solo

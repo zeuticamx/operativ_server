@@ -106,6 +106,21 @@ def crear_refresh_token(user_id: UUID) -> str:
     )
 
 
+def emitido_antes_de(payload: dict[str, Any], instante: datetime | None) -> bool:
+    """
+    True si el token se emitió antes de `instante` (portal_users.
+    credenciales_cambiadas_en): ese token ya no vale.
+
+    `iat` viaja en segundos enteros, así que se compara contra el segundo
+    truncado del cambio. Un token emitido en el mismo segundo que el cambio
+    sigue valiendo: es el precio de no rechazar el login que el usuario hace
+    justo después de restablecer.
+    """
+    if instante is None:
+        return False
+    return int(payload.get("iat", 0)) < int(instante.timestamp())
+
+
 def decodificar_token(token: str, tipo_esperado: str = "access") -> dict[str, Any]:
     """
     Devuelve el payload si el token es válido.

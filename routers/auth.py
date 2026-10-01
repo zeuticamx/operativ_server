@@ -7,17 +7,19 @@ from uuid import UUID
 
 import asyncpg
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 
 from config import settings
 from services.correo import ErrorEnvioCorreo, enviar_codigo_verificacion
 from services.google_login import TokenGoogleInvalido, verificar_credential
+from services import recuperacion_password
 from routers.perfil import version_foto
 from deps import UsuarioActual, usuario_actual
 from security import (
     crear_access_token,
     crear_refresh_token,
     decodificar_token,
+    emitido_antes_de,
     hash_password,
     needs_rehash,
     verify_password,
@@ -26,9 +28,12 @@ from session import execute, fetch_one, get_pool
 from schemas import (
     GoogleLoginIn,
     LoginIn,
+    RecuperacionSolicitadaOut,
     RefreshIn,
     RegistroIn,
     ReenviarCodigoIn,
+    RestablecerPasswordIn,
+    SolicitarRecuperacionIn,
     TokenOut,
     UsuarioOut,
     VerificacionPendienteOut,
@@ -619,7 +624,10 @@ async def refresh(datos: RefreshIn):
         )
 
     fila = await fetch_one(
-        "SELECT id, tenant_id, role, is_active FROM portal_users WHERE id = $1",
+        """
+        SELECT id, tenant_id, role, is_active, credenciales_cambiadas_en
+        FROM portal_users WHERE id = $1
+        """,
         UUID(payload["sub"]),
     )
 
@@ -629,12 +637,68 @@ async def refresh(datos: RefreshIn):
             detail="Usuario no encontrado o inactivo",
         )
 
+    # Un refresh token de antes de un cambio de contraseña ya no renueva
+    # nada: sin esto, una sesión robada sobreviviría 30 días al cambio.
+    if emitido_antes_de(payload, fila["credenciales_cambiadas_en"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="La sesión ya no es válida. Inicia sesión de nuevo.",
+        )
+
     return TokenOut(
         access_token=crear_access_token(
             fila["id"], fila["tenant_id"], fila["role"]
         ),
         refresh_token=crear_refresh_token(fila["id"]),
     )
+
+
+# ============================================================
+# RECUPERACIÓN DE CONTRASEÑA (services/recuperacion_password.py)
+# ============================================================
+@router.post(
+    "/recuperar/solicitar",
+    response_model=RecuperacionSolicitadaOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def solicitar_recuperacion(
+    datos: SolicitarRecuperacionIn, tareas: BackgroundTasks
+) -> RecuperacionSolicitadaOut:
+    """
+    Manda un código de 6 dígitos (5 minutos, un solo uso) si el correo es
+    de una cuenta activa.
+
+    Siempre 202 con el mismo cuerpo, exista o no la cuenta, y todo el
+    trabajo (buscar la cuenta, hashear el código, SMTP) va en background
+    después de responder: ni el contenido ni el tiempo de la respuesta
+    sirven para averiguar qué correos están registrados. Por lo mismo, un
+    fallo de SMTP no llega acá como 502: queda en el log.
+    """
+    tareas.add_task(recuperacion_password.procesar_solicitud, datos.email)
+    return RecuperacionSolicitadaOut(
+        expira_en_minutos=recuperacion_password.VIGENCIA_MINUTOS,
+        reenviar_en_segundos=settings.CODIGO_REENVIO_SEGUNDOS,
+    )
+
+
+@router.post("/recuperar/restablecer", status_code=status.HTTP_204_NO_CONTENT)
+async def restablecer_password(datos: RestablecerPasswordIn) -> None:
+    """
+    Canjea el código y cambia la contraseña. Cierra todas las sesiones
+    abiertas de la cuenta; no devuelve tokens: hay que entrar con la nueva.
+
+    Un único 400 para código incorrecto, vencido, ya usado o con intentos
+    agotados. Distinguirlos le diría a quien prueba un correo ajeno si ese
+    correo tiene un código pendiente, o sea, que la cuenta existe. El portal
+    sabe cuándo venció por su propia cuenta regresiva.
+    """
+    try:
+        await recuperacion_password.restablecer(datos.email, datos.codigo, datos.password)
+    except recuperacion_password.CodigoInvalido:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El código es incorrecto o ya venció. Solicita uno nuevo.",
+        )
 
 
 @router.get("/yo", response_model=UsuarioOut)

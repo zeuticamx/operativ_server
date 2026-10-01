@@ -51,6 +51,30 @@ class ReenviarCodigoIn(BaseModel):
     email: EmailStr
 
 
+class SolicitarRecuperacionIn(BaseModel):
+    """Body de POST /auth/recuperar/solicitar."""
+    email: EmailStr
+
+
+class RecuperacionSolicitadaOut(BaseModel):
+    """
+    Respuesta de POST /auth/recuperar/solicitar. Siempre la misma, exista o
+    no la cuenta: no dice si se mandó un código, solo cómo funciona si sí.
+    """
+    expira_en_minutos: int
+    reenviar_en_segundos: int
+
+
+class RestablecerPasswordIn(BaseModel):
+    """Body de POST /auth/recuperar/restablecer."""
+    email: EmailStr
+    # Exactamente 6 dígitos: se valida acá para no gastar un argon2 por
+    # cada cadena cualquiera que llegue.
+    codigo: str = Field(pattern=r"^\d{6}$")
+    # Misma regla que RegistroIn.password.
+    password: str = Field(min_length=8, max_length=128)
+
+
 # ============================================================
 # PERFIL DEL USUARIO (routers/perfil.py)
 # ============================================================
@@ -1999,3 +2023,33 @@ class ConversacionTransferidaIn(BaseModel):
 
 class ConversacionTransferidaOut(BaseModel):
     registrado: bool
+
+
+# ============================================================
+# REPORTES DE INCIDENCIAS (routers/incidencias.py, gerencia_incidencias.py)
+# ============================================================
+EstadoReporte = Literal["abierto", "en_revision", "resuelto"]
+
+
+class ReporteCreadoOut(BaseModel):
+    """Respuesta de POST /reportes: solo el acuse, no lo que se guardó."""
+    id: UUID
+
+
+class ReporteGerenciaOut(BaseModel):
+    id: UUID
+    tenant_id: UUID | None
+    nombre_negocio: str | None
+    email: str
+    resumen: str
+    descripcion: str
+    contexto: dict
+    estado: EstadoReporte
+    creado_en: datetime
+    atendido_por: str | None
+    atendido_en: datetime | None
+    tiene_adjunto: bool
+
+
+class ReporteEstadoIn(BaseModel):
+    estado: EstadoReporte

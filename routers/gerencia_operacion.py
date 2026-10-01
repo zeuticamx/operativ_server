@@ -511,6 +511,28 @@ async def enviar_mensaje_conversacion_tenant(
 
 
 @router.post(
+    "/tenants/{tenant_id}/conversaciones/{conversacion_id}/tomar",
+    response_model=ConversacionEstadoOut,
+)
+async def tomar_conversacion_tenant(
+    tenant_id: UUID,
+    conversacion_id: UUID,
+    gerente: UsuarioActual = Depends(gerencia_plataforma_actual),
+):
+    fila = await conversaciones_svc.tomar_conversacion(tenant_id, conversacion_id)
+    await registrar_auditoria(
+        actor_email=gerente.email,
+        actor_portal_user_id=gerente.id,
+        accion="tomar_conversacion_gerencia",
+        tenant_id=tenant_id,
+        detalle={"conversation_id": str(conversacion_id)},
+    )
+
+    await emit_conversacion_estado(tenant_id, conversacion_id, fila["status"])
+    return ConversacionEstadoOut(**dict(fila))
+
+
+@router.post(
     "/tenants/{tenant_id}/conversaciones/{conversacion_id}/volver-a-ia",
     response_model=ConversacionEstadoOut,
 )

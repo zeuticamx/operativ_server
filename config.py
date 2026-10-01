@@ -137,6 +137,17 @@ class Settings:
         os.getenv("PERFIL_RECORDATORIO_INTERVALO_HORAS", "1")
     )
 
+    # ---- Reportes de incidencias (services/reportes.py) ----
+    # Tope por usuario y hora: un formulario abierto a todos los roles no
+    # debe servir para inundar el buzón del equipo.
+    REPORTES_MAX_POR_HORA: int = int(os.getenv("REPORTES_MAX_POR_HORA", "3"))
+    REPORTE_ADJUNTO_MAX_BYTES: int = int(
+        os.getenv("REPORTE_ADJUNTO_MAX_BYTES", str(5 * 1024 * 1024))
+    )
+    # Una captura de pantalla completa es mucho más grande que una foto de
+    # perfil (642 px); 8192 cubre un monitor 8K sin aceptar basura.
+    REPORTE_ADJUNTO_MAX_PX: int = int(os.getenv("REPORTE_ADJUNTO_MAX_PX", "8192"))
+
     # ---- Verificación de correo ----
     CODIGO_VIGENCIA_MINUTOS: int = int(os.getenv("CODIGO_VIGENCIA_MINUTOS", "10"))
     # Tope de intentos fallidos antes de descartar el alta. Con 6 dígitos hay

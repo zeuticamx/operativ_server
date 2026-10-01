@@ -96,6 +96,17 @@ async def enviar_mensaje(
     return mensaje
 
 
+@router.post("/{conversacion_id}/tomar", response_model=ConversacionEstadoOut)
+async def tomar(
+    conversacion_id: UUID,
+    tenant_id: UUID = Depends(tenant_actual),
+):
+    """Un humano toma el control: la IA deja de contestar (inversa de volver-a-ia)."""
+    fila = await svc.tomar_conversacion(tenant_id, conversacion_id)
+    await emit_conversacion_estado(tenant_id, conversacion_id, fila["status"])
+    return ConversacionEstadoOut(**dict(fila))
+
+
 @router.post("/{conversacion_id}/volver-a-ia", response_model=ConversacionEstadoOut)
 async def volver_a_ia(
     conversacion_id: UUID,

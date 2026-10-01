@@ -10,7 +10,7 @@ from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from config import settings
-from security import decodificar_token
+from security import decodificar_token, emitido_antes_de
 from services.acceso_plan import exigir_herramienta
 from session import fetch_one
 
@@ -124,6 +124,7 @@ async def usuario_actual(
     fila = await fetch_one(
         """
         SELECT pu.id, pu.tenant_id, pu.email, pu.role, pu.is_active,
+               pu.credenciales_cambiadas_en,
                (gu.id IS NOT NULL) AS es_gerencia_plataforma
         FROM portal_users pu
         LEFT JOIN gerencia_users gu ON LOWER(gu.email) = LOWER(pu.email)
@@ -136,6 +137,16 @@ async def usuario_actual(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Usuario no encontrado o inactivo",
+        )
+
+    # Token de antes de un cambio de contraseña: esa sesión se cerró. 401
+    # para que el portal intente /refresh, que también lo rechaza, y mande
+    # al login.
+    if emitido_antes_de(payload, fila["credenciales_cambiadas_en"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="La sesión ya no es válida. Inicia sesión de nuevo.",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
     if "imp" in payload:

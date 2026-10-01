@@ -135,6 +135,53 @@ async def enviar_codigo_verificacion(
 
 
 # ============================================================
+# Código de recuperación de contraseña
+# ============================================================
+_TEXTO_RECUPERACION = """Recibimos una solicitud para restablecer la contraseña de tu cuenta de OperativAI.
+
+Tu código es:
+
+    {codigo}
+
+Vence en {minutos} minutos y solo se puede usar una vez.
+
+Si no fuiste tú, ignora este correo: sin el código tu contraseña no cambia.
+Nunca te pediremos este código por teléfono ni por chat.
+"""
+
+_HTML_RECUPERACION = """\
+<div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:420px;margin:0 auto;padding:24px;color:#1c1c1c">
+  <p style="margin:0 0 20px;font-size:14px">
+    Recibimos una solicitud para restablecer la contraseña de tu cuenta de OperativAI. Tu código es:
+  </p>
+  <p style="margin:0 0 20px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:32px;font-weight:600;letter-spacing:8px">
+    {codigo}
+  </p>
+  <p style="margin:0 0 20px;font-size:13px;color:#666">
+    Vence en <strong>{minutos} minutos</strong> y solo se puede usar una vez.
+  </p>
+  <p style="margin:0;font-size:12px;color:#888">
+    Si no fuiste tú, ignora este correo: sin el código tu contraseña no cambia.
+    Nunca te pediremos este código por teléfono ni por chat.
+  </p>
+</div>"""
+
+
+async def enviar_codigo_recuperacion(destino: str, codigo: str, minutos: int) -> None:
+    """Lanza ErrorEnvioCorreo si el SMTP falla."""
+    datos = {"codigo": codigo, "minutos": minutos}
+    await enviar_correo(
+        destino,
+        # Sin el código en el asunto (a diferencia del alta): el asunto se ve
+        # en las notificaciones de la pantalla bloqueada, y este código da
+        # acceso a una cuenta que ya existe.
+        asunto="Código para restablecer tu contraseña de OperativAI",
+        texto=_TEXTO_RECUPERACION.format(**datos),
+        html=_HTML_RECUPERACION.format(**datos),
+    )
+
+
+# ============================================================
 # Alerta crítica (envío inmediato, una alerta = un correo)
 # ============================================================
 _TEXTO_ALERTA = """{titulo}

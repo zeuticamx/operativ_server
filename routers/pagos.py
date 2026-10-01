@@ -535,7 +535,13 @@ async def suscripcion(tenant_id: UUID = Depends(tenant_actual)) -> SuscripcionOu
         """
         SELECT s.plan, s.estado AS estado_suscripcion, s.fecha_renovacion,
                s.precio_monthly,
-               COALESCE(c.creditos_disponibles, 0) AS creditos_disponibles,
+               -- Saldo gastable: cuota del plan vigente + comprados. El consumo
+               -- descuenta primero de creditos_plan (services/creditos.py), así
+               -- que mostrar solo creditos_disponibles nunca bajaba.
+               COALESCE(c.creditos_disponibles, 0)
+                 + CASE WHEN c.creditos_plan_vence IS NULL OR c.creditos_plan_vence > NOW()
+                        THEN COALESCE(c.creditos_plan, 0) ELSE 0 END
+                 AS creditos_disponibles,
                COALESCE(c.creditos_gastados, 0)    AS creditos_gastados,
                COALESCE(s.stripe_subscription_id IS NOT NULL
                         AND s.cancelada_en IS NULL, false) AS suscripcion_recurrente,
