@@ -24,7 +24,7 @@ from uuid import UUID
 from fastapi import HTTPException, status
 
 from config import settings
-from services import meta
+from services import meta, whatsapp
 from session import execute, fetch_all, fetch_one
 
 # n8n arma el INSERT de `users` con expresiones de plantilla que, cuando el
@@ -313,12 +313,27 @@ async def enviar_mensaje_humano(
             detail=f"El canal {canal} no está conectado",
         )
 
-    url, body = _url_y_body(canal, cred, destinatario, texto)
-
-    try:
-        await meta.enviar_texto(url, cred["access_token"], body)
-    except meta.MetaError as e:
-        raise meta.a_http(e)
+    if canal == "whatsapp" and cred["bsp_provider"] == "neuroapi":
+        # El access_token de estas líneas es la API key de NeuroAPI, no un
+        # token de Meta: mandarlo a Graph API devuelve error 190 ("token
+        # expiró o fue revocado") aunque la cuenta esté sana. n8n hace la
+        # misma bifurcación según bsp_provider (ver sql/23).
+        proveedor = whatsapp.NeuroApiProvider(
+            api_key=cred["access_token"],
+            webhook_secret="",
+            base_url=settings.NEUROAPI_API_BASE_URL,
+            phone_number_id=cred["phone_number_id"] or "",
+        )
+        try:
+            await proveedor.enviar_mensaje(destinatario, texto)
+        except whatsapp.ProveedorWhatsAppError as e:
+            raise whatsapp.a_http(e)
+    else:
+        url, body = _url_y_body(canal, cred, destinatario, texto)
+        try:
+            await meta.enviar_texto(url, cred["access_token"], body)
+        except meta.MetaError as e:
+            raise meta.a_http(e)
 
     fila = await fetch_one(
         """

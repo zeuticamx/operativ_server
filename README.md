@@ -955,6 +955,16 @@ se mide es el consumo real, no el estimado.
 }
 ```
 
+Quien lo llama es el workflow `medir-uso-tokens`, no `entrada-canal-universal`:
+el `tokenUsage` del sub-nodo "Anthropic Chat Model" sale por la salida
+`ai_languageModel`, que un Code node de la misma ejecución no puede leer. Por
+eso un workflow programado (cada 2 min) lee por la API de n8n las ejecuciones
+ya terminadas, suma cada llamada al modelo (una por vuelta del agente) y
+reporta con `idempotency_key = exec:<id>:agente`. Solo si el backend devuelve
+`registrado: true` escribe además la fila `mensaje_procesado` en `usage_events`
+(tabla de n8n que alimenta el límite de tokens del plan). Así se usa este
+endpoint como candado para no duplicar.
+
 Va suelto y no colgado de `/mensaje-entrante` porque una sola respuesta
 puede ser varias llamadas al modelo (el agente más cada herramienta), y
 cada una tiene su propio consumo.

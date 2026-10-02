@@ -233,7 +233,7 @@ async def conversacion_transferida(datos: ConversacionTransferidaIn):
     así que sin esta llamada nadie se entera hasta que alguien entra al
     portal a filtrar conversaciones por estado a mano.
     """
-    detalle = [f"{datos.cliente_nombre or 'Un cliente'} pidió hablar con alguien del equipo por {datos.canal}"]
+    detalle = [f"{datos.cliente_nombre or datos.cliente_telefono or 'Un cliente'} pidió hablar con alguien del equipo por {datos.canal}"]
     if datos.motivo:
         detalle.append(f"— {datos.motivo}")
 

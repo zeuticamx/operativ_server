@@ -293,6 +293,44 @@ class HerramientaInfoOut(BaseModel):
     correo_servicio: str
 
 
+# ---- Auditoría de consumo de créditos (services/consumo_creditos.py) ----
+class ConsumoItemOut(BaseModel):
+    id: UUID
+    herramienta: str
+    creditos: Decimal
+    bolsa: Literal["plan", "comprados"] | None
+    # ISO con el offset de la zona horaria del tenant.
+    creado_en: datetime
+    # Número enmascarado; None = N/A (no vino de WhatsApp o ya no hay dato).
+    whatsapp: str | None
+    canal: str | None
+
+
+class ConsumoPaginaOut(BaseModel):
+    items: list[ConsumoItemOut]
+    total: int
+    limite: int
+    offset: int
+    zona_horaria: str
+
+
+class ConsumoPorHerramientaOut(BaseModel):
+    herramienta: str
+    creditos: Decimal
+
+
+class ConsumoPorDiaOut(BaseModel):
+    dia: date
+    creditos: Decimal
+
+
+class ConsumoResumenOut(BaseModel):
+    total_creditos: Decimal
+    por_herramienta: list[ConsumoPorHerramientaOut]
+    por_dia: list[ConsumoPorDiaOut]
+    zona_horaria: str
+
+
 class HerramientaOut(BaseModel):
     tool_key: str
     tool_type: str

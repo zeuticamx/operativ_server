@@ -4,9 +4,10 @@ Herramientas por tenant.
 
 import re
 import unicodedata
+from datetime import date
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.concurrency import run_in_threadpool
 
 from deps import UsuarioActual, requiere_herramienta, tenant_actual, usuario_actual
@@ -15,9 +16,12 @@ from schemas import (
     ActualizarHerramientaIn,
     ConectarGoogleDocIn,
     ConectarGoogleSheetIn,
+    ConsumoPaginaOut,
+    ConsumoResumenOut,
     HerramientaInfoOut,
     HerramientaOut,
 )
+from services import consumo_creditos as consumo_svc
 from services import google_tools, herramientas_calendario
 
 router = APIRouter(
@@ -34,6 +38,54 @@ async def info(usuario: UsuarioActual = Depends(usuario_actual)):
     except RuntimeError as e:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
     return HerramientaInfoOut(correo_servicio=correo)
+
+
+async def _solo_owner(usuario: UsuarioActual = Depends(usuario_actual)) -> UsuarioActual:
+    """La auditoría de consumo (con números de clientes) es solo del dueño del negocio."""
+    if usuario.role != "owner":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo el propietario del negocio puede ver el consumo de créditos",
+        )
+    return usuario
+
+
+@router.get("/consumo", response_model=ConsumoPaginaOut)
+async def consumo_creditos(
+    desde: date | None = None,
+    hasta: date | None = None,
+    herramienta: str | None = Query(None, max_length=100),
+    limite: int = Query(25, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    _: UsuarioActual = Depends(_solo_owner),
+    tenant_id: UUID = Depends(tenant_actual),
+):
+    """
+    Historial de créditos gastados por herramienta, más recientes primero.
+    Solo lee el tenant de la sesión; no hay forma de pedir otro.
+    """
+    if desde and hasta and desde > hasta:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="'desde' no puede ser posterior a 'hasta'",
+        )
+    return await consumo_svc.listar_consumo(tenant_id, desde, hasta, herramienta, limite, offset)
+
+
+@router.get("/consumo/resumen", response_model=ConsumoResumenOut)
+async def consumo_creditos_resumen(
+    desde: date | None = None,
+    hasta: date | None = None,
+    herramienta: str | None = Query(None, max_length=100),
+    _: UsuarioActual = Depends(_solo_owner),
+    tenant_id: UUID = Depends(tenant_actual),
+):
+    if desde and hasta and desde > hasta:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="'desde' no puede ser posterior a 'hasta'",
+        )
+    return await consumo_svc.resumen_consumo(tenant_id, desde, hasta, herramienta)
 
 
 @router.get("", response_model=list[HerramientaOut])
