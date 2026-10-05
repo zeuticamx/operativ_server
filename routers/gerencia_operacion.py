@@ -16,12 +16,13 @@ from datetime import date
 from uuid import UUID
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 
 from config import settings
 from deps import UsuarioActual, gerencia_plataforma_actual
 from realtime import emit_conversacion_estado, emit_mensaje
 from schemas import (
+    AdjuntoOut,
     AlertaGerenciaOut,
     CohorteOut,
     CohortesOut,
@@ -38,6 +39,7 @@ from schemas import (
     SaludOut,
 )
 from security import crear_token_impersonacion
+from services import adjuntos
 from services import conversaciones as conversaciones_svc
 from services.gerencia import registrar_auditoria
 from services.gerencia_salud import problemas_de_salud
@@ -508,6 +510,56 @@ async def enviar_mensaje_conversacion_tenant(
     mensaje = MensajeOut(**dict(fila), enviado_por=gerente.email)
     await emit_mensaje(tenant_id, conversacion_id, mensaje.model_dump(mode="json"))
     return mensaje
+
+
+@router.post(
+    "/tenants/{tenant_id}/conversaciones/{conversacion_id}/adjuntos",
+    response_model=MensajeOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def enviar_adjunto_conversacion_tenant(
+    tenant_id: UUID,
+    conversacion_id: UUID,
+    archivo: UploadFile = File(...),
+    leyenda: str | None = Form(None, max_length=1024),
+    gerente: UsuarioActual = Depends(gerencia_plataforma_actual),
+):
+    # Misma razón que en el envío de texto: la auditoría queda como
+    # constancia de un envío ya hecho, no como parte de una transacción.
+    contenido = await conversaciones_svc.leer_subida(archivo)
+    fila, adjunto = await conversaciones_svc.enviar_adjunto_humano(
+        tenant_id, conversacion_id, contenido, archivo.filename, leyenda, gerente.id
+    )
+    await registrar_auditoria(
+        actor_email=gerente.email,
+        actor_portal_user_id=gerente.id,
+        accion="adjunto_manual_gerencia",
+        tenant_id=tenant_id,
+        detalle={"conversation_id": str(conversacion_id), "mime": adjunto["mime"]},
+    )
+
+    mensaje = MensajeOut(
+        **dict(fila), enviado_por=gerente.email, adjuntos=[AdjuntoOut(**dict(adjunto))]
+    )
+    await emit_mensaje(tenant_id, conversacion_id, mensaje.model_dump(mode="json"))
+    return mensaje
+
+
+@router.get("/tenants/{tenant_id}/conversaciones/{conversacion_id}/adjuntos/{adjunto_id}")
+async def descargar_adjunto_conversacion_tenant(
+    tenant_id: UUID,
+    conversacion_id: UUID,
+    adjunto_id: UUID,
+    _: UsuarioActual = Depends(gerencia_plataforma_actual),
+):
+    fila = await conversaciones_svc.obtener_adjunto(tenant_id, conversacion_id, adjunto_id)
+    if fila is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Adjunto no encontrado")
+    return Response(
+        content=bytes(fila["contenido"]),
+        media_type=fila["mime"],
+        headers=adjuntos.cabeceras_descarga(fila["nombre"], privado=True),
+    )
 
 
 @router.post(

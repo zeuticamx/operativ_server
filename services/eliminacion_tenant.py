@@ -17,6 +17,12 @@ Qué bloquea (cualquiera alcanza):
                          gerencia (el propio gerente, típicamente, que usa
                          un tenant interno). Borrarlo le quitaría el acceso.
 
+El dueño también puede borrar su propia cuenta (services/eliminacion_cuenta.py)
+con `modo="propietario"`: ahí no se exige 'baja' (el dueño no puede ponerla)
+y una suscripción ya cancelada con días pagados no bloquea, solo se advierte
+(`Revision.pagado_hasta`). Lo que sí bloquea es lo que todavía puede cobrar
+(`_PUEDE_COBRAR`).
+
 Los créditos sin usar NO bloquean: se muestran como advertencia en la
 confirmación (decisión de producto).
 
@@ -30,6 +36,7 @@ Pago guardan de su lado — que no se toca.
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from typing import Literal
 from uuid import UUID
 
 import asyncpg
@@ -51,6 +58,30 @@ _SUSCRIPCION_VIGENTE = """
     OR (s.stripe_subscription_id IS NOT NULL AND s.cancelada_en IS NULL)
     OR (s.mp_subscription_id IS NOT NULL AND s.estado <> 'cancelada')
 """
+
+# Lo que todavía puede generar un cobro: una Subscription de Stripe que nadie
+# canceló (ni al vencer ni ya dada de baja), o una de Mercado Pago no
+# cancelada. Es el criterio del borrado por el propio dueño: lo ya pagado de
+# una suscripción cancelada se pierde, pero no se cobra nada más.
+_PUEDE_COBRAR = """
+    (s.stripe_subscription_id IS NOT NULL
+        AND s.cancelada_en IS NULL
+        AND NOT COALESCE(s.cancela_al_vencer, false))
+    OR (s.mp_subscription_id IS NOT NULL AND s.estado <> 'cancelada')
+"""
+
+Modo = Literal["gerencia", "propietario"]
+
+MENSAJES_PROPIETARIO: dict[CodigoBloqueoEliminacion, str] = {
+    "suscripcion_vigente": (
+        "Tu suscripción sigue activa y se va a renovar. Cancélala desde "
+        "\"Gestionar / Cancelar suscripción\" antes de borrar la cuenta."
+    ),
+    "cuenta_propia": (
+        "Esta cuenta tiene nivel gerencia de plataforma y no se puede borrar "
+        "desde aquí."
+    ),
+}
 
 _SUFIJO_SUSCRIPCION = (
     "Hay que esperar a que termine o cancelarla antes de eliminar, "
@@ -96,6 +127,9 @@ class Revision:
     usuarios_portal: int
     conversaciones: int
     transacciones: int
+    # Fin del período pagado si todavía no llegó; None si no hay días por
+    # perder. En modo propietario es solo una advertencia.
+    pagado_hasta: datetime | None = None
 
     @property
     def eliminable(self) -> bool:
@@ -111,7 +145,13 @@ def _mensaje_suscripcion(pagada_hasta: datetime | None) -> str:
     return MENSAJES["suscripcion_vigente"]
 
 
-async def revisar(conn: asyncpg.Connection, tenant_id: UUID, *, bloquear: bool = False) -> Revision:
+async def revisar(
+    conn: asyncpg.Connection,
+    tenant_id: UUID,
+    *,
+    bloquear: bool = False,
+    modo: Modo = "gerencia",
+) -> Revision:
     """
     Lo que decide si se puede borrar. La usan la ficha (GET) y el borrado
     (POST): una sola regla, no dos que se desincronicen.
@@ -133,7 +173,8 @@ async def revisar(conn: asyncpg.Connection, tenant_id: UUID, *, bloquear: bool =
         f"""
         SELECT s.fecha_renovacion,
                s.fecha_renovacion > NOW() AS periodo_en_curso,
-               ({_SUSCRIPCION_VIGENTE}) AS vigente
+               ({_SUSCRIPCION_VIGENTE}) AS vigente,
+               ({_PUEDE_COBRAR}) AS puede_cobrar
         FROM tenant_subscriptions s
         WHERE s.tenant_id = $1
         {candado}
@@ -158,25 +199,42 @@ async def revisar(conn: asyncpg.Connection, tenant_id: UUID, *, bloquear: bool =
         tenant_id,
     )
 
+    pagado_hasta = (
+        sub["fecha_renovacion"] if sub is not None and sub["periodo_en_curso"] else None
+    )
+
     bloqueos: list[BloqueoEliminacionOut] = []
-    # Sin fila de estado = 'activo' (mismo COALESCE que acceso_pagos).
-    if (estado or "activo") != "baja":
-        bloqueos.append(
-            BloqueoEliminacionOut(codigo="cuenta_activa", mensaje=MENSAJES["cuenta_activa"])
-        )
-    if sub is not None and sub["vigente"]:
-        bloqueos.append(
-            BloqueoEliminacionOut(
-                codigo="suscripcion_vigente",
-                mensaje=_mensaje_suscripcion(
-                    sub["fecha_renovacion"] if sub["periodo_en_curso"] else None
-                ),
+    if modo == "gerencia":
+        # Sin fila de estado = 'activo' (mismo COALESCE que acceso_pagos).
+        if (estado or "activo") != "baja":
+            bloqueos.append(
+                BloqueoEliminacionOut(codigo="cuenta_activa", mensaje=MENSAJES["cuenta_activa"])
             )
-        )
-    if datos["tiene_gerencia"]:
-        bloqueos.append(
-            BloqueoEliminacionOut(codigo="cuenta_propia", mensaje=MENSAJES["cuenta_propia"])
-        )
+        if sub is not None and sub["vigente"]:
+            bloqueos.append(
+                BloqueoEliminacionOut(
+                    codigo="suscripcion_vigente",
+                    mensaje=_mensaje_suscripcion(pagado_hasta),
+                )
+            )
+        if datos["tiene_gerencia"]:
+            bloqueos.append(
+                BloqueoEliminacionOut(codigo="cuenta_propia", mensaje=MENSAJES["cuenta_propia"])
+            )
+    else:
+        if sub is not None and sub["puede_cobrar"]:
+            bloqueos.append(
+                BloqueoEliminacionOut(
+                    codigo="suscripcion_vigente",
+                    mensaje=MENSAJES_PROPIETARIO["suscripcion_vigente"],
+                )
+            )
+        if datos["tiene_gerencia"]:
+            bloqueos.append(
+                BloqueoEliminacionOut(
+                    codigo="cuenta_propia", mensaje=MENSAJES_PROPIETARIO["cuenta_propia"]
+                )
+            )
 
     return Revision(
         nombre=tenant["name"],
@@ -185,6 +243,7 @@ async def revisar(conn: asyncpg.Connection, tenant_id: UUID, *, bloquear: bool =
         usuarios_portal=datos["usuarios"],
         conversaciones=datos["conversaciones"],
         transacciones=datos["transacciones"],
+        pagado_hasta=pagado_hasta,
     )
 
 
@@ -249,13 +308,18 @@ async def eliminar(
         conn=conn,
     )
 
-    # Savepoint: si una FK sin cascada frena el DELETE, la transacción
-    # externa entera se descarta igual (el router relanza), pero el error
-    # llega con un tipo propio en vez de un 500.
+    await borrar(conn, tenant_id)
+    return r
+
+
+async def borrar(conn: asyncpg.Connection, tenant_id: UUID) -> None:
+    """
+    El DELETE en cascada. Savepoint: si una FK sin cascada lo frena, la
+    transacción externa entera se descarta igual (el router relanza), pero
+    el error llega con un tipo propio en vez de un 500.
+    """
     try:
         async with conn.transaction():
             await conn.execute("DELETE FROM tenants WHERE id = $1", tenant_id)
     except asyncpg.ForeignKeyViolationError as e:
         raise ReferenciasPendientes(str(e)) from e
-
-    return r

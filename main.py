@@ -24,6 +24,7 @@ from routers import (
     canales_neuroapi_webhook,
     clientes,
     conversaciones,
+    cuenta,
     eventos,
     gerencia,
     gerencia_operacion,
@@ -31,6 +32,7 @@ from routers import (
     gerencia_incidencias,
     herramientas,
     incidencias,
+    media,
     pagos,
     pagos_stripe,
     perfil,
@@ -77,6 +79,7 @@ app.add_middleware(
 app.include_router(auth.router, prefix="/api")
 # Perfil personal (datos + foto) del usuario de la sesión, desde /preferencias.
 app.include_router(perfil.router, prefix="/api")
+app.include_router(cuenta.router, prefix="/api")
 app.include_router(incidencias.router, prefix="/api")
 app.include_router(canales.router, prefix="/api")
 # Alta de WhatsApp vía NeuroAPI Connect Sessions: el único endpoint del
@@ -85,6 +88,8 @@ app.include_router(canales.router, prefix="/api")
 app.include_router(canales_neuroapi_webhook.router, prefix="/api")
 app.include_router(agente.router, prefix="/api")
 app.include_router(conversaciones.router, prefix="/api")
+# Sin JWT: lo descargan NeuroAPI/Meta con un token aleatorio (routers/media.py).
+app.include_router(media.router, prefix="/api")
 app.include_router(herramientas.router, prefix="/api")
 
 # Módulo de gestión de vendedores (embudo de chat). Son cuatro routers y no

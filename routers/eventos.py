@@ -11,7 +11,10 @@ ejecutar-herramienta-tenant) no cambian: esto se llama antes, justo después
 de que n8n resuelve el tenant.
 """
 
+import base64
+import binascii
 import logging
+import secrets
 from typing import Any, Optional
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -28,6 +31,8 @@ from services.gerencia import registrar_uso_tokens
 from services.notificaciones import notificar_vendedor_nuevo_lead
 from services.pipeline import asignar_vendedor, get_or_create_pipeline, get_tenant_servicios
 from schemas import (
+    AdjuntoEntranteIn,
+    AdjuntoOut,
     CancelarReservaEventoIn,
     ConsultarDisponibilidadIn,
     ConsultarDisponibilidadOut,
@@ -46,7 +51,8 @@ from schemas import (
     UsoTokensIn,
     UsoTokensOut,
 )
-from session import transaccion
+from services import adjuntos as adjuntos_svc
+from session import fetch_one, transaccion
 
 log = logging.getLogger("operativai.eventos")
 
@@ -374,3 +380,53 @@ async def calendario_cancelar_reserva(datos: CancelarReservaEventoIn):
         datos={"reserva_id": str(reserva.id)},
     )
     return ReservaOut(**vars(reserva))
+
+
+@router.post("/adjunto-entrante", response_model=AdjuntoOut, status_code=201)
+async def adjunto_entrante(datos: AdjuntoEntranteIn) -> AdjuntoOut:
+    """
+    n8n asocia a un mensaje del cliente el archivo (JPG/PNG/PDF/DOCX) que
+    llegó por WhatsApp, para que el panel lo muestre. Se valida igual que
+    uno saliente (firma de bytes + tope de tamaño): 415 si es otro tipo
+    (audio, sticker...), y n8n deja el mensaje solo con su texto.
+    """
+    try:
+        if datos.url is not None:
+            contenido = await adjuntos_svc.descargar_media(datos.url)
+            nombre = datos.nombre or adjuntos_svc.nombre_desde_url(datos.url)
+        else:
+            try:
+                contenido = base64.b64decode(datos.contenido_base64, validate=True)
+            except (binascii.Error, ValueError):
+                raise HTTPException(status_code=422, detail="contenido_base64 no es base64 válido")
+            nombre = datos.nombre
+        info = adjuntos_svc.validar_adjunto(contenido, nombre)
+    except adjuntos_svc.AdjuntoInvalido as e:
+        raise HTTPException(status_code=e.status_code, detail=e.mensaje)
+
+    # El mensaje tiene que ser de ese tenant: n8n manda ambos ids, pero no
+    # hay por qué fiarse de que casen.
+    mensaje = await fetch_one(
+        "SELECT id FROM messages WHERE id = $1 AND tenant_id = $2",
+        datos.mensaje_id,
+        datos.tenant_id,
+    )
+    if mensaje is None:
+        raise HTTPException(status_code=404, detail="Mensaje no encontrado")
+
+    fila = await fetch_one(
+        """
+        INSERT INTO message_attachments
+            (tenant_id, message_id, direccion, mime, nombre, bytes, contenido, token_publico)
+        VALUES ($1, $2, 'in', $3, $4, $5, $6, $7)
+        RETURNING id, mime, nombre, bytes
+        """,
+        datos.tenant_id,
+        datos.mensaje_id,
+        info.mime,
+        info.nombre,
+        len(contenido),
+        contenido,
+        secrets.token_urlsafe(32),
+    )
+    return AdjuntoOut(**dict(fila))

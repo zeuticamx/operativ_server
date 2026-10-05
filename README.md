@@ -267,6 +267,35 @@ la extensión tiene que coincidir; las dimensiones se leen del encabezado
 antes de subir. Se guarda en `portal_user_fotos` (BYTEA): el contenedor no
 tiene volumen persistente.
 
+### Gestionar suscripción y borrar cuenta (solo el dueño)
+
+```
+POST   /api/pagos/portal-cliente   URL de una sesión del Customer Portal de Stripe
+GET    /api/cuenta/eliminacion     si se puede borrar, por qué no, y qué se pierde
+POST   /api/cuenta/eliminar        {confirmacion: "ELIMINAR", password | google_credential}
+```
+
+**Portal de Stripe** (`services/stripe_portal.py`): el Customer sale de
+`tenant_subscriptions.stripe_customer_id` por el tenant del JWT, nunca del
+body. 403 si no es `owner`, 409 sin Customer, 502 si Stripe falla (el caso
+típico: el portal sin configurar en Dashboard → Settings → Billing →
+Customer portal). Lo que se cancela allá vuelve por el webhook de siempre
+(`customer.subscription.updated` → `cancela_al_vencer`).
+
+**Borrar cuenta** (`services/eliminacion_cuenta.py`): borra el negocio entero
+con el mismo `DELETE FROM tenants` en cascada que gerencia
+(`services/eliminacion_tenant.py`, `modo="propietario"`). Orden: rol `owner`
+(403), escribir `ELIMINAR` (400), contraseña actual, o credencial de Google
+del mismo `google_id` en cuentas sin contraseña (403; 5 fallos → 429 durante
+15 min, `sql/35_eliminacion_cuenta.sql`). Después, los bloqueos (409):
+suscripción que todavía cobra (Stripe sin cancelar, Mercado Pago activa),
+facturas `open` en Stripe, o Stripe que no contesta (se falla cerrado). Una
+suscripción ya cancelada con días pagados **no** bloquea: se devuelve
+`pagado_hasta` y el portal advierte que esos días se pierden. En la bitácora
+queda UUID, plan y Customer de Stripe, sin correos ni nombres. El Customer de
+Stripe no se borra (historial de facturas). Las sesiones abiertas dan 401 en
+su siguiente petición porque `deps.usuario_actual` relee al usuario.
+
 **Recordatorios** (`jobs/perfil_background.py`, cada
 `PERFIL_RECORDATORIO_INTERVALO_HORAS`): mientras el perfil esté incompleto,
 un correo + una alerta personal en la campana cada 24 h durante los primeros
@@ -307,7 +336,21 @@ GET    /api/conversaciones/{id}           Detalle con mensajes
 POST   /api/conversaciones/{id}/mensajes       Respuesta manual (handoff humano)
 POST   /api/conversaciones/{id}/tomar          Un humano toma el control (status='transferred', sin acuse)
 POST   /api/conversaciones/{id}/volver-a-ia    Le devuelve el control a la IA
+POST   /api/conversaciones/{id}/adjuntos       Imagen/documento por WhatsApp (multipart: archivo, leyenda?)
+GET    /api/conversaciones/{id}/adjuntos/{aid} Contenido de un adjunto (JWT, filtrado por tenant)
+GET    /api/media/{token}                      Público: lo descargan NeuroAPI/Meta (token aleatorio)
+POST   /api/eventos/adjunto-entrante           n8n asocia a un mensaje el archivo que mandó el cliente
 ```
+
+**Adjuntos de WhatsApp.** Solo JPG/PNG (tope `WA_IMAGEN_MAX_BYTES`, 5 MB) y
+PDF/DOCX (`WA_DOCUMENTO_MAX_BYTES`, 16 MB). El tipo se decide por la firma de
+los bytes y la extensión tiene que coincidir (`services/adjuntos.py`): 413
+pesa de más, 415 tipo no permitido, 422 vacío. Se guardan en
+`message_attachments` (`sql/34_mensajes_adjuntos.sql`, BYTEA; `messages` no se
+toca porque es de n8n). NeuroAPI y Meta reciben una `link` HTTPS a
+`/api/media/{token}`, por eso `BASE_URL_BACKEND` tiene que ser pública y HTTPS
+(si no, 409). El mensaje se inserta antes de enviar y se borra si el envío
+falla. Facebook/Instagram no soportan archivos (400).
 
 Gerencia de plataforma tiene los mismos tres últimos (más los dos GET) bajo
 `/api/gerencia/tenants/{tenant_id}/conversaciones/...`, con el `tenant_id`

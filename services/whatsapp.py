@@ -66,6 +66,30 @@ def a_http(e: ProveedorWhatsAppError) -> HTTPException:
     return HTTPException(status_code=codigo, detail=e.mensaje)
 
 
+def cuerpo_media(
+    destinatario: str,
+    tipo: str,
+    url: str,
+    nombre: str | None = None,
+    leyenda: str | None = None,
+) -> dict[str, Any]:
+    """
+    Cuerpo de un mensaje de imagen o documento para NeuroAPI
+    (`POST /messaging/send`), con el mismo shape mínimo que el de texto. La
+    Graph API usa el mismo objeto `image`/`document`; solo le suma
+    `messaging_product` y `recipient_type` (ver services/conversaciones.py).
+    El archivo se referencia por `link`, que el proveedor descarga.
+    """
+    if tipo not in ("image", "document"):
+        raise ValueError(f"tipo de media no soportado: {tipo!r}")
+    media: dict[str, Any] = {"link": url}
+    if leyenda:
+        media["caption"] = leyenda
+    if tipo == "document" and nombre:
+        media["filename"] = nombre
+    return {"to": destinatario, "type": tipo, tipo: media}
+
+
 # ============================================================
 # Interfaz común
 # ============================================================
@@ -87,6 +111,24 @@ class ProveedorWhatsApp(ABC):
         conversación, no el teléfono del contacto.
         """
         ...
+
+    async def enviar_media(
+        self,
+        destinatario: str,
+        tipo: str,
+        url: str,
+        nombre: str | None = None,
+        leyenda: str | None = None,
+    ) -> ResultadoEnvio:
+        """
+        Manda una imagen (`tipo="image"`) o un documento (`tipo="document"`)
+        que el proveedor descarga de `url` (HTTPS pública). No es abstracto:
+        un proveedor sin soporte de media falla con un error controlado en
+        vez de obligar a todos a implementarlo.
+        """
+        raise ProveedorWhatsAppError(
+            f"{type(self).__name__} no soporta el envío de archivos"
+        )
 
     @abstractmethod
     async def enviar_plantilla(
@@ -353,6 +395,17 @@ class NeuroApiProvider(ProveedorWhatsApp):
                 "text": {"body": texto, "preview_url": False},
             }
         )
+        return self._a_resultado(data)
+
+    async def enviar_media(
+        self,
+        destinatario: str,
+        tipo: str,
+        url: str,
+        nombre: str | None = None,
+        leyenda: str | None = None,
+    ) -> ResultadoEnvio:
+        data = await self._post(cuerpo_media(destinatario, tipo, url, nombre, leyenda))
         return self._a_resultado(data)
 
     async def enviar_plantilla(

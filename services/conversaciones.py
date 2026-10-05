@@ -19,13 +19,14 @@ mismo hilo, y para devolverle el control a la IA con un UPDATE que ese
 workflow ya sabe leer.
 """
 
+import secrets
 from uuid import UUID
 
 from fastapi import HTTPException, status
 
 from config import settings
-from services import meta, whatsapp
-from session import execute, fetch_all, fetch_one
+from services import adjuntos, meta, whatsapp
+from session import execute, fetch_all, fetch_one, transaccion
 
 # n8n arma el INSERT de `users` con expresiones de plantilla que, cuando el
 # dato de origen viene undefined, terminan guardando el texto literal
@@ -170,6 +171,8 @@ async def detalle(tenant_id: UUID, conversacion_id: UUID):
         """,
         conversacion_id,
     )
+    por_mensaje = await adjuntos_de_mensajes([m["id"] for m in mensajes])
+    mensajes = [{**dict(m), "adjuntos": por_mensaje.get(m["id"], [])} for m in mensajes]
     return cab, mensajes
 
 
@@ -269,17 +272,11 @@ _DESTINATARIO_COL = {
 }
 
 
-async def enviar_mensaje_humano(
-    tenant_id: UUID,
-    conversacion_id: UUID,
-    texto: str,
-    sender_portal_user_id: UUID,
-):
+async def _preparar_envio(tenant_id: UUID, conversacion_id: UUID):
     """
-    Manda `texto` al cliente por su canal y lo deja en `messages` como
-    role='human'. Solo tiene sentido mientras la IA no está contestando
-    (status='transferred') — mandar algo con la IA activa se pisaría con
-    su propia respuesta.
+    Validaciones comunes a todo envío manual: conversación del tenant en modo
+    humano, canal soportado, destinatario y credenciales del canal.
+    Devuelve (canal, destinatario, credenciales).
     """
     conv = await _conversacion_para_escritura(tenant_id, conversacion_id)
 
@@ -312,6 +309,22 @@ async def enviar_mensaje_humano(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"El canal {canal} no está conectado",
         )
+    return canal, destinatario, cred
+
+
+async def enviar_mensaje_humano(
+    tenant_id: UUID,
+    conversacion_id: UUID,
+    texto: str,
+    sender_portal_user_id: UUID,
+):
+    """
+    Manda `texto` al cliente por su canal y lo deja en `messages` como
+    role='human'. Solo tiene sentido mientras la IA no está contestando
+    (status='transferred') — mandar algo con la IA activa se pisaría con
+    su propia respuesta.
+    """
+    canal, destinatario, cred = await _preparar_envio(tenant_id, conversacion_id)
 
     if canal == "whatsapp" and cred["bsp_provider"] == "neuroapi":
         # El access_token de estas líneas es la API key de NeuroAPI, no un
@@ -351,6 +364,176 @@ async def enviar_mensaje_humano(
         conversacion_id,
     )
     return fila
+
+
+# ============================================================
+# Adjuntos (imágenes y documentos por WhatsApp)
+# ============================================================
+def url_publica_adjunto(token: str) -> str:
+    """URL HTTPS que NeuroAPI/Meta descargan (routers/media.py)."""
+    return f"{settings.BASE_URL_BACKEND}/api/media/{token}"
+
+
+async def _mandar_media(cred, destinatario: str, info, url: str, leyenda: str | None) -> None:
+    if cred["bsp_provider"] == "neuroapi":
+        proveedor = whatsapp.NeuroApiProvider(
+            api_key=cred["access_token"],
+            webhook_secret="",
+            base_url=settings.NEUROAPI_API_BASE_URL,
+            phone_number_id=cred["phone_number_id"] or "",
+        )
+        await proveedor.enviar_media(destinatario, info.tipo_wa, url, info.nombre, leyenda)
+        return
+
+    pnid = cred["phone_number_id"]
+    if not pnid:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Falta phone_number_id para enviar por WhatsApp",
+        )
+    cuerpo = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        **whatsapp.cuerpo_media(destinatario, info.tipo_wa, url, info.nombre, leyenda),
+    }
+    await meta.enviar_texto(f"{settings.graph_url}/{pnid}/messages", cred["access_token"], cuerpo)
+
+
+async def leer_subida(archivo) -> bytes:
+    """
+    Lee un UploadFile con tope: un byte más que el máximo permitido, para
+    saber que se excede sin cargar entero algo enorme en memoria.
+    """
+    tope = adjuntos.tope_absoluto()
+    contenido = await archivo.read(tope + 1)
+    if len(contenido) > tope:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"El archivo pesa más de {tope // (1024 * 1024)} MB.",
+        )
+    return contenido
+
+
+async def enviar_adjunto_humano(
+    tenant_id: UUID,
+    conversacion_id: UUID,
+    contenido: bytes,
+    nombre_archivo: str | None,
+    leyenda: str | None,
+    sender_portal_user_id: UUID,
+):
+    """
+    Manda una imagen o un documento por WhatsApp y lo deja en `messages`
+    (role='human') con su fila en `message_attachments`.
+
+    Valida el archivo ANTES de tocar al proveedor (tipo por firma de bytes y
+    tope de tamaño). Como el proveedor descarga el archivo de nuestra URL
+    pública, la fila se inserta antes de enviar y se borra si el envío falla:
+    no queda en el hilo un mensaje que el cliente nunca recibió.
+    """
+    try:
+        info = adjuntos.validar_adjunto(contenido, nombre_archivo)
+    except adjuntos.AdjuntoInvalido as e:
+        raise HTTPException(status_code=e.status_code, detail=e.mensaje)
+
+    canal, destinatario, cred = await _preparar_envio(tenant_id, conversacion_id)
+
+    if canal != "whatsapp":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Solo se pueden enviar archivos por WhatsApp",
+        )
+    if not settings.BASE_URL_BACKEND.startswith("https://"):
+        # El proveedor tiene que poder descargar el archivo: con http o
+        # localhost el envío fallaría después de haber guardado todo.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="BASE_URL_BACKEND debe ser una URL HTTPS pública para enviar archivos",
+        )
+
+    leyenda = (leyenda or "").strip() or None
+    token = secrets.token_urlsafe(32)
+
+    async with transaccion() as conn:
+        fila = await conn.fetchrow(
+            """
+            INSERT INTO messages (conversation_id, tenant_id, role, content, sender_portal_user_id)
+            VALUES ($1, $2, 'human', $3, $4)
+            RETURNING id, role, content, created_at
+            """,
+            conversacion_id,
+            tenant_id,
+            adjuntos.texto_mensaje(info, leyenda),
+            sender_portal_user_id,
+        )
+        adjunto = await conn.fetchrow(
+            """
+            INSERT INTO message_attachments
+                (tenant_id, message_id, direccion, mime, nombre, bytes, contenido, token_publico)
+            VALUES ($1, $2, 'out', $3, $4, $5, $6, $7)
+            RETURNING id, mime, nombre, bytes
+            """,
+            tenant_id,
+            fila["id"],
+            info.mime,
+            info.nombre,
+            len(contenido),
+            contenido,
+            token,
+        )
+
+    try:
+        await _mandar_media(cred, destinatario, info, url_publica_adjunto(token), leyenda)
+    except Exception as e:
+        # ON DELETE CASCADE se lleva también la fila del adjunto.
+        await execute("DELETE FROM messages WHERE id = $1", fila["id"])
+        if isinstance(e, whatsapp.ProveedorWhatsAppError):
+            raise whatsapp.a_http(e)
+        if isinstance(e, meta.MetaError):
+            raise meta.a_http(e)
+        raise
+
+    await execute(
+        "UPDATE conversations SET last_message_at = NOW() WHERE id = $1",
+        conversacion_id,
+    )
+    return fila, adjunto
+
+
+async def adjuntos_de_mensajes(mensaje_ids: list[UUID]) -> dict[UUID, list[dict]]:
+    """Adjuntos agrupados por mensaje (sin el contenido binario)."""
+    if not mensaje_ids:
+        return {}
+    filas = await fetch_all(
+        """
+        SELECT id, message_id, mime, nombre, bytes
+        FROM message_attachments
+        WHERE message_id = ANY($1::uuid[])
+        ORDER BY created_at
+        """,
+        mensaje_ids,
+    )
+    agrupados: dict[UUID, list[dict]] = {}
+    for f in filas:
+        agrupados.setdefault(f["message_id"], []).append(
+            {"id": f["id"], "mime": f["mime"], "nombre": f["nombre"], "bytes": f["bytes"]}
+        )
+    return agrupados
+
+
+async def obtener_adjunto(tenant_id: UUID, conversacion_id: UUID, adjunto_id: UUID):
+    """Adjunto con contenido; None si no es de esa conversación y tenant."""
+    return await fetch_one(
+        """
+        SELECT a.mime, a.nombre, a.contenido
+        FROM message_attachments a
+        JOIN messages m ON m.id = a.message_id
+        WHERE a.id = $1 AND m.conversation_id = $2 AND a.tenant_id = $3
+        """,
+        adjunto_id,
+        conversacion_id,
+        tenant_id,
+    )
 
 
 async def tomar_conversacion(tenant_id: UUID, conversacion_id: UUID):

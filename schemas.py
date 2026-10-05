@@ -393,6 +393,14 @@ class ConversacionOut(BaseModel):
     minutos_restantes_ventana: int | None = None
 
 
+class AdjuntoOut(BaseModel):
+    """Imagen o documento de un mensaje (sin el contenido binario)."""
+    id: UUID
+    mime: str
+    nombre: str
+    bytes: int
+
+
 class MensajeOut(BaseModel):
     id: UUID
     role: str
@@ -401,6 +409,7 @@ class MensajeOut(BaseModel):
     # Solo para role='human' (respuesta manual desde el portal): nombre o
     # correo de quien la mandó. None para 'user'/'assistant'.
     enviado_por: str | None = None
+    adjuntos: list[AdjuntoOut] = Field(default_factory=list)
 
 
 class EnviarMensajeIn(BaseModel):
@@ -954,6 +963,30 @@ class MensajeEntranteIn(BaseModel):
     mensaje: dict = Field(default_factory=dict)
 
 
+class AdjuntoEntranteIn(BaseModel):
+    """
+    Archivo que mandó el cliente por WhatsApp. n8n ya guardó el mensaje en
+    `messages` (con un texto como "[Imagen]") y descargó el media del
+    proveedor; acá solo lo asocia a ese mensaje.
+    """
+    tenant_id: UUID
+    mensaje_id: UUID
+    # Con la extensión que corresponda al tipo (el document.filename de
+    # WhatsApp). Si falta, se toma del final de `url`.
+    nombre: str | None = Field(default=None, max_length=255)
+    # Una de dos. `url`: el link HTTPS que NeuroAPI deja en el webhook (el
+    # backend lo descarga). `contenido_base64`: el archivo ya descargado; el
+    # tope es generoso (16 MB * 4/3), el real lo aplica validar_adjunto.
+    url: str | None = Field(default=None, max_length=2048)
+    contenido_base64: str | None = Field(default=None, min_length=1, max_length=23_000_000)
+
+    @model_validator(mode="after")
+    def _una_fuente(self):
+        if (self.url is None) == (self.contenido_base64 is None):
+            raise ValueError("Manda url o contenido_base64, una sola")
+        return self
+
+
 class MensajeEntranteOut(BaseModel):
     # Los dos flags que n8n necesita para decidir en su propio workflow si
     # sigue hacia el nodo del agente. La decisión vive allá, no acá.
@@ -1127,6 +1160,14 @@ class SuscripcionOut(BaseModel):
     # Se pidió cancelar al final del período: sigue vigente hasta
     # fecha_renovacion y después se pausa.
     cancela_al_vencer: bool = False
+    # Hay un Customer de Stripe: se puede abrir el Customer Portal para
+    # cancelar o gestionar el plan (POST /pagos/portal-cliente).
+    portal_disponible: bool = False
+
+
+class PortalClienteOut(BaseModel):
+    """URL de una sesión del Customer Portal de Stripe (vence en minutos)."""
+    url: str
 
 
 Herramienta = Literal["agente", "vendedores", "herramientas", "crm_campo", "calendario"]
@@ -1455,7 +1496,14 @@ class RevocarPruebaIn(BaseModel):
 
 
 # Eliminación definitiva de un negocio (services/eliminacion_tenant.py).
-CodigoBloqueoEliminacion = Literal["cuenta_activa", "suscripcion_vigente", "cuenta_propia"]
+CodigoBloqueoEliminacion = Literal[
+    "cuenta_activa",
+    "suscripcion_vigente",
+    "cuenta_propia",
+    # Solo en el borrado por el propio dueño (services/eliminacion_cuenta.py):
+    "adeudo_pendiente",
+    "adeudo_no_verificable",
+]
 
 
 class BloqueoEliminacionOut(BaseModel):
@@ -1482,6 +1530,34 @@ class EliminarTenantIn(BaseModel):
     # lo vuelve a comparar: una llamada suelta a la API no borra nada por
     # error.
     confirmacion: str = Field(min_length=1, max_length=255)
+
+
+# ------------------------------------------------------------
+# Borrado de cuenta por el propio dueño (routers/cuenta.py)
+# ------------------------------------------------------------
+class EliminacionCuentaOut(BaseModel):
+    """
+    Si el dueño puede borrar su cuenta (= su negocio entero) y, si no, por
+    qué. Lo demás se muestra en la confirmación y no bloquea.
+    """
+    eliminable: bool
+    bloqueos: list[BloqueoEliminacionOut]
+    # Suscripción ya cancelada que todavía tiene días pagados: se pierden al
+    # borrar. Advertencia, no bloqueo: se recomienda esperar a esta fecha.
+    pagado_hasta: datetime | None = None
+    creditos_disponibles: Decimal
+    usuarios_portal: int
+    conversaciones: int
+    # Cómo se re-autentica: con la contraseña o, en cuentas que entran solo
+    # con Google, con una credencial de Google recién emitida.
+    verificacion: Literal["password", "google"]
+
+
+class EliminarCuentaIn(BaseModel):
+    # Escrito a mano en el diálogo; el backend exige exactamente "ELIMINAR".
+    confirmacion: str = Field(min_length=1, max_length=50)
+    password: str | None = Field(default=None, max_length=256)
+    google_credential: str | None = Field(default=None, max_length=4096)
 
 
 class EntradaAuditoriaOut(BaseModel):

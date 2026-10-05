@@ -2,12 +2,13 @@
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 
 from deps import UsuarioActual, requiere_herramienta, tenant_actual, usuario_actual
 from realtime import emit_conversacion_estado, emit_mensaje
 from session import execute, fetch_one
 from schemas import (
+    AdjuntoOut,
     ContactoOut,
     ConversacionDetalleOut,
     ConversacionEstadoOut,
@@ -16,6 +17,7 @@ from schemas import (
     MensajeOut,
     MetricasOut,
 )
+from services import adjuntos
 from services import conversaciones as svc
 from services import meta
 
@@ -94,6 +96,56 @@ async def enviar_mensaje(
     mensaje = MensajeOut(**dict(fila), enviado_por=usuario.email)
     await emit_mensaje(tenant_id, conversacion_id, mensaje.model_dump(mode="json"))
     return mensaje
+
+
+@router.post(
+    "/{conversacion_id}/adjuntos",
+    response_model=MensajeOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def enviar_adjunto(
+    conversacion_id: UUID,
+    archivo: UploadFile = File(...),
+    leyenda: str | None = Form(None, max_length=1024),
+    usuario: UsuarioActual = Depends(usuario_actual),
+    tenant_id: UUID = Depends(tenant_actual),
+):
+    """
+    Imagen (JPG/PNG) o documento (PDF/DOCX) como respuesta manual por
+    WhatsApp. Errores de archivo: 413 pesa de más, 415 tipo no permitido o
+    extensión que no coincide, 422 vacío.
+    """
+    contenido = await svc.leer_subida(archivo)
+    fila, adjunto = await svc.enviar_adjunto_humano(
+        tenant_id, conversacion_id, contenido, archivo.filename, leyenda, usuario.id
+    )
+    mensaje = MensajeOut(
+        **dict(fila),
+        enviado_por=usuario.email,
+        adjuntos=[AdjuntoOut(**dict(adjunto))],
+    )
+    await emit_mensaje(tenant_id, conversacion_id, mensaje.model_dump(mode="json"))
+    return mensaje
+
+
+@router.get("/{conversacion_id}/adjuntos/{adjunto_id}")
+async def descargar_adjunto(
+    conversacion_id: UUID,
+    adjunto_id: UUID,
+    tenant_id: UUID = Depends(tenant_actual),
+):
+    """Contenido de un adjunto (enviado o recibido) de una conversación del tenant."""
+    fila = await svc.obtener_adjunto(tenant_id, conversacion_id, adjunto_id)
+    if fila is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Adjunto no encontrado",
+        )
+    return Response(
+        content=bytes(fila["contenido"]),
+        media_type=fila["mime"],
+        headers=adjuntos.cabeceras_descarga(fila["nombre"], privado=True),
+    )
 
 
 @router.post("/{conversacion_id}/tomar", response_model=ConversacionEstadoOut)

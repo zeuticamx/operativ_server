@@ -32,7 +32,7 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, status
 
 from config import settings
-from deps import UsuarioActual, gerencia_actual, tenant_actual
+from deps import UsuarioActual, gerencia_actual, tenant_actual, usuario_actual
 from schemas import (
     AccesoPlanOut,
     CatalogoPagosOut,
@@ -42,6 +42,7 @@ from schemas import (
     PaqueteCreditosOut,
     PlanHerramientasOut,
     PlanOut,
+    PortalClienteOut,
     SuscripcionOut,
     TransaccionOut,
 )
@@ -51,6 +52,7 @@ from services.pagos import (
     marcar_cancelada,
     procesar_pago_aprobado,
 )
+from services import stripe_portal
 from services.stripe_pagos import crear_checkout_session, crear_checkout_suscripcion
 from services.stripe_suscripciones import PreparacionCheckout, preparar_checkout_suscripcion
 from session import execute, fetch_all, fetch_one, fetch_value
@@ -545,7 +547,8 @@ async def suscripcion(tenant_id: UUID = Depends(tenant_actual)) -> SuscripcionOu
                COALESCE(c.creditos_gastados, 0)    AS creditos_gastados,
                COALESCE(s.stripe_subscription_id IS NOT NULL
                         AND s.cancelada_en IS NULL, false) AS suscripcion_recurrente,
-               COALESCE(s.cancela_al_vencer, false)        AS cancela_al_vencer
+               COALESCE(s.cancela_al_vencer, false)        AS cancela_al_vencer,
+               s.stripe_customer_id IS NOT NULL            AS portal_disponible
         FROM tenants t
         LEFT JOIN tenant_subscriptions s ON s.tenant_id = t.id
         LEFT JOIN tenant_credits      c ON c.tenant_id = t.id
@@ -561,6 +564,49 @@ async def suscripcion(tenant_id: UUID = Depends(tenant_actual)) -> SuscripcionOu
         )
 
     return SuscripcionOut(**dict(fila))
+
+
+@router.post("/portal-cliente", response_model=PortalClienteOut)
+async def portal_cliente(usuario: UsuarioActual = Depends(usuario_actual)) -> PortalClienteOut:
+    """
+    Abre una sesión del Customer Portal de Stripe para cancelar o gestionar
+    el plan. Solo el dueño: cancelar cambia lo que paga el negocio.
+
+    El Customer sale de la base por el tenant del JWT, nunca del body: no hay
+    forma de pedir el portal de otro negocio. La URL que devuelve Stripe es
+    de un solo uso y vence en minutos; el portal la abre de inmediato.
+
+      403 no es el dueño
+      409 el negocio no tiene Customer de Stripe (nunca pagó con Stripe)
+      502 Stripe no respondió o el portal no está configurado en el Dashboard
+    """
+    if usuario.role != "owner" or usuario.tenant_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo el dueño del negocio puede gestionar la suscripción",
+        )
+
+    fila = await fetch_one(
+        "SELECT stripe_customer_id FROM tenant_subscriptions WHERE tenant_id = $1",
+        usuario.tenant_id,
+    )
+    customer_id = fila["stripe_customer_id"] if fila else None
+    if not customer_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Tu negocio no tiene una suscripción de Stripe que gestionar",
+        )
+
+    try:
+        url = await stripe_portal.crear_sesion_portal(
+            customer_id, f"{settings.BASE_URL_FRONTEND}/suscripcion"
+        )
+    except stripe_portal.StripeNoDisponible:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="No se pudo abrir el portal de Stripe. Inténtalo de nuevo.",
+        )
+    return PortalClienteOut(url=url)
 
 
 @router.get("/acceso", response_model=AccesoPlanOut)

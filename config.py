@@ -128,6 +128,12 @@ class Settings:
     # antes de subir; el backend solo rechaza (no hay Pillow).
     PERFIL_FOTO_MAX_BYTES: int = int(os.getenv("PERFIL_FOTO_MAX_BYTES", str(2 * 1024 * 1024)))
     PERFIL_FOTO_MAX_PX: int = int(os.getenv("PERFIL_FOTO_MAX_PX", "642"))
+    # ---- Adjuntos de WhatsApp (services/adjuntos.py) ----
+    # Topes de WhatsApp Cloud API para imágenes (5 MB); para documentos el
+    # límite de Meta es 100 MB, pero se guardan en Postgres, así que se
+    # acota más.
+    WA_IMAGEN_MAX_BYTES: int = int(os.getenv("WA_IMAGEN_MAX_BYTES", str(5 * 1024 * 1024)))
+    WA_DOCUMENTO_MAX_BYTES: int = int(os.getenv("WA_DOCUMENTO_MAX_BYTES", str(16 * 1024 * 1024)))
     # Recordatorios de perfil incompleto (jobs/perfil_background.py): uno
     # cada 24 h durante los primeros PERFIL_RECORDATORIO_DIAS días naturales
     # desde la creación de la cuenta. El job corre cada
