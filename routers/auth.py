@@ -12,7 +12,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from config import settings
 from services.correo import ErrorEnvioCorreo, enviar_codigo_verificacion
 from services.google_login import TokenGoogleInvalido, verificar_credential
-from services import recuperacion_password
+from services import invitaciones, recuperacion_password
 from routers.perfil import version_foto
 from deps import UsuarioActual, usuario_actual
 from security import (
@@ -26,7 +26,10 @@ from security import (
 )
 from session import execute, fetch_one, get_pool
 from schemas import (
+    AceptarInvitacionIn,
     GoogleLoginIn,
+    InvitacionInfoOut,
+    InvitacionTokenIn,
     LoginIn,
     RecuperacionSolicitadaOut,
     RefreshIn,
@@ -699,6 +702,68 @@ async def restablecer_password(datos: RestablecerPasswordIn) -> None:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="El código es incorrecto o ya venció. Solicita uno nuevo.",
         )
+
+
+# ============================================================
+# Invitación al equipo de un negocio (lado del invitado)
+# ============================================================
+# El token viaja en el body y no en la URL: así no queda en logs de acceso.
+# Para cualquier invitación que no sirva (no existe, usada, revocada,
+# vencida) el mismo 410: distinguirlas no le aporta nada al invitado y sí a
+# quien pruebe tokens.
+def _invitacion_invalida() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="Esta invitación ya no es válida. Pídele al negocio que te envíe una nueva.",
+    )
+
+
+@router.post("/invitacion/revisar", response_model=InvitacionInfoOut)
+async def revisar_invitacion(datos: InvitacionTokenIn):
+    """A qué negocio y con qué rol entra el invitado, antes de pedirle contraseña."""
+    async with get_pool().acquire() as conn:
+        try:
+            info = await invitaciones.leer(conn, datos.token)
+        except invitaciones.InvitacionInvalida:
+            raise _invitacion_invalida()
+    return InvitacionInfoOut(**vars(info))
+
+
+@router.post("/invitacion/aceptar", response_model=TokenOut, status_code=201)
+async def aceptar_invitacion(datos: AceptarInvitacionIn):
+    """
+    Crea la cuenta del invitado con la contraseña que eligió y lo deja con
+    sesión iniciada. El correo no se vuelve a verificar: llegar con el enlace
+    ya prueba que lo lee.
+
+      410 la invitación no sirve
+      409 el correo ya tiene cuenta, o la ficha de vendedor dejó de estar
+          disponible (desactivada o ligada a otra cuenta)
+    """
+    pwd_hash = hash_password(datos.password)
+    try:
+        async with get_pool().acquire() as conn:
+            async with conn.transaction():
+                cuenta = await invitaciones.aceptar(
+                    conn, datos.token, pwd_hash, settings.TERMINOS_VERSION
+                )
+    except invitaciones.InvitacionInvalida:
+        raise _invitacion_invalida()
+    except invitaciones.CorreoYaRegistrado:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Ese correo ya tiene una cuenta en OperativAI. Inicia sesión con ella.",
+        )
+    except invitaciones.FichaNoDisponible:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Tu ficha de vendedor ya no está disponible. Pídele al negocio que te invite de nuevo.",
+        )
+
+    return TokenOut(
+        access_token=crear_access_token(cuenta.id, cuenta.tenant_id, cuenta.role),
+        refresh_token=crear_refresh_token(cuenta.id),
+    )
 
 
 @router.get("/yo", response_model=UsuarioOut)

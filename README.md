@@ -108,7 +108,124 @@ POST   /api/auth/recuperar/restablecer  Código + contraseña nueva (204; cierra
 POST   /api/auth/login
 POST   /api/auth/refresh
 GET    /api/auth/yo
+POST   /api/auth/invitacion/revisar     A qué negocio y con qué rol invita un enlace
+POST   /api/auth/invitacion/aceptar     Enlace + contraseña → crea la cuenta (TokenOut)
 ```
+
+### Roles dentro de un negocio
+
+`portal_users.role`. El JWT solo lleva `sub`: el rol se relee de BD en cada
+petición (`deps.usuario_actual`), así que cambiarlo o desactivar a alguien
+surte efecto en su siguiente llamada.
+
+| Rol | Cómo nace | Ve | Configura |
+|---|---|---|---|
+| `owner` | `/auth/registro` (o Google) | Todo el negocio | Todo |
+| `superadmin` | a mano | Todo el negocio | Todo |
+| `member` ("colaborador") | invitación | Conversaciones, embudo, agenda, métricas | Nada (agente, canales, herramientas, equipo, pagos) |
+| `vendedor` | invitación ligada a su ficha | **Solo lo suyo**: su ficha, sus leads, su cartera de campo | Nada |
+| `proveedor` | invitación ligada a su ficha del calendario | **Solo lo suyo**: su agenda y las conversaciones de sus clientes | Sus descansos y días libres |
+
+Las guardas, de la más amplia a la más estrecha:
+
+- `deps.negocio_actual`: lista blanca `ROLES_NEGOCIO` (owner/superadmin/member).
+  Va a nivel de router en `agente`, `canales`, `herramientas`,
+  `conversaciones` y `calendario`, y por endpoint en las vistas completas del
+  embudo (`/tenants/{id}/pipeline`, `/metricas*`, `/vendedores`,
+  `/config-vendedores`) y en `/pagos/suscripcion|historial|catalogo`.
+  `/pagos/acceso` queda abierto a todos: el portal reducido también lo usa.
+- `deps.gerencia_actual` (owner/superadmin): toda escritura de configuración
+  (agente, canales, herramientas, alta/edición de vendedores, servicios,
+  reparto, etapas, agenda, equipo).
+- Vendedor: `deps.vendedor_actual` / `crm.acceso_crm` lo limitan a su ficha.
+  En el embudo, `GET /vendedores/{id}/pipeline|historial`,
+  `PATCH /pipeline/{user_id}/estado` y `GET /pipeline/{user_id}/historial`
+  responden **403** si el id o el lead es de un compañero (403 y no 404: es
+  del mismo negocio). Asignar leads no puede.
+- Proveedor: `deps.permitir_a_proveedor(...)` va a nivel de router en
+  `calendario` y `conversaciones`. Deja pasar a ROLES_NEGOCIO a todo y al
+  proveedor solo a los endpoints nombrados (lista blanca por nombre de
+  función: uno nuevo queda cerrado hasta que se lo sume). Cada uno de esos
+  endpoints lo acota con `deps.proveedor_actual` (ver "Proveedor con
+  cuenta" abajo).
+- WebSocket (`realtime.py`): vendedor y proveedor no entran a la room del
+  negocio, solo a la suya (`usuario_{id}`), y solo marcan leídas sus alertas
+  personales. Al proveedor le llegan copias personales de lo suyo
+  (`avisar_a_proveedor`): reserva nueva o cancelada de sus citas, chat de su
+  cliente que pide una persona, y los mensajes en vivo de esos chats.
+
+`tests/test_roles.py` y `tests/test_proveedor_cuenta.py` recorren esta
+matriz por HTTP.
+
+### Proveedor con cuenta (`sql/37_proveedor_cuenta.sql`)
+
+El dueño le da acceso desde Calendario › Proveedores (invitación con
+`role: proveedor` y `proveedor_id`; al aceptarla se llena
+`proveedores.portal_user_id`). Con su cuenta:
+
+| Puede | No puede |
+|---|---|
+| Ver solo su columna de la agenda: `/calendario/proveedores` le devuelve su ficha y `/reservas` le fuerza `proveedor_id` | Crear, reprogramar o cambiar de barbero una cita |
+| Cancelar sus citas y marcarlas completada / no asistió | Tocar citas de otro proveedor (403) |
+| Leer su horario base | Cambiar su horario base, ni poner un "horario especial" (excepción con `disponible=true`) |
+| Poner y quitar sus descansos y días libres | Ver el corte diario, la bitácora, el cupo, otros proveedores |
+| Ver, responder, tomar y devolver a la IA las conversaciones de sus clientes | Ver métricas de conversaciones ni editar el contacto |
+
+**De quién es una conversación**: del proveedor de la cita **más reciente**
+(por `reservas.creado_en`, cancelada incluida) de ese cliente
+(`services/conversaciones._PROVEEDOR_DEL_CLIENTE`). Un cliente que reservó
+con dos proveedores es solo del último: una conversación nunca tiene dos
+dueños. Un cliente que nunca reservó no es de ningún proveedor.
+
+**Cupo**: `planes.max_proveedores` limita las fichas de proveedor
+**activas**, igual que `max_vendedores` (402 `cupo_proveedores` al dar de alta
+o reactivar; `GET /tenants/{id}/calendario/proveedores/cupo`). Todos los
+planes quedan en NULL (sin tope) hasta que gerencia de plataforma lo defina en
+`/gerencia/planes`.
+
+**Citas vencidas**: `jobs/reservas_background.py` (cada
+`RESERVAS_VENCIDAS_INTERVALO_MINUTOS`, 15) da por `no_asistio` toda cita
+`confirmada` cuya hora de fin pasó hace más de
+`RESERVAS_VENCIDAS_GRACIA_MINUTOS` (0). Deja el renglón en
+`reserva_auditoria` con `origen = 'sistema'`. Si en realidad sí vino, se
+corrige a `completada` (con su cobro) desde el portal: el cambio de estado no
+restringe desde qué estado se llega.
+
+### Equipo: cuentas por invitación
+```
+GET    /api/equipo/usuarios                    Cuentas del negocio (gerencia)
+PATCH  /api/equipo/usuarios/{id}               {activo}: quitar o devolver el acceso
+GET    /api/equipo/invitaciones                Sin aceptar (marca las vencidas)
+POST   /api/equipo/invitaciones                {email, role: member|vendedor|proveedor, vendedor_id?, proveedor_id?}
+POST   /api/equipo/invitaciones/{id}/reenviar  Enlace nuevo; el anterior muere
+DELETE /api/equipo/invitaciones/{id}           Revocar
+```
+
+El dueño nunca ve ni pone contraseñas: al invitado le llega un enlace
+(`{FRONTEND_ORIGINS[0]}/invitacion#t=<token>`) y la elige él. El token va en
+el **fragmento** para que no quede en logs del portal, y viaja al backend en
+el body. En la base solo queda su SHA-256 (`sql/36_invitaciones_equipo.sql`);
+el enlace en claro sale una sola vez, en la respuesta de crear/reenviar, por
+si el correo no llega y el dueño lo manda por WhatsApp (`correo_enviado`).
+
+- Rol y tenant salen de la invitación, nunca del invitado.
+- Vigencia 7 días, un solo uso. Una sola invitación viva por correo y por
+  ficha en cada negocio: invitar de nuevo revoca la anterior.
+- `role = vendedor` exige `vendedor_id`, y `role = proveedor` exige
+  `proveedor_id` (ficha activa, del negocio, sin cuenta). Al aceptar, en la
+  misma transacción se crea el `portal_user`, se llena el `portal_user_id`
+  de la ficha y se cierra la invitación; si la ficha dejó de estar
+  disponible, 409 y no se crea nada.
+- Cualquier enlace que no sirva (no existe, usado, revocado, vencido) da el
+  mismo **410**.
+- El correo de `portal_users` es único en toda la plataforma: invitar uno que
+  ya tiene cuenta es 409.
+- Quitar el acceso (`activo: false`) no toca la ficha: el vendedor sigue en
+  el reparto con sus leads y el proveedor en la agenda recibiendo citas. Para
+  sacarlos se desactiva la ficha.
+  Al dueño no se le quita el acceso desde acá.
+
+`tests/test_equipo.py` cubre el flujo completo.
 
 ## Alta con verificación de correo
 
@@ -389,12 +506,15 @@ PATCH  /api/tenants/{id}/servicios          Enciende/apaga módulos (gerencia)
 GET    /api/tenants/{id}/config-vendedores  Estrategia de reparto
 PATCH  /api/tenants/{id}/config-vendedores  carga | round_robin | manual (gerencia)
 
-POST   /api/vendedores                      Alta
+POST   /api/vendedores                      Alta (gerencia; respeta el cupo del plan)
 GET    /api/tenants/{id}/vendedores         Listado (?activo=true) — sin exigir el flag
-PATCH  /api/vendedores/{id}                 Activar / desactivar / editar
-GET    /api/vendedores/{id}/pipeline        Su embudo
+GET    /api/tenants/{id}/vendedores/cupo    Activos contra planes.max_vendedores
+PATCH  /api/vendedores/{id}                 Activar / desactivar / editar (gerencia)
+GET    /api/vendedores/yo                   La ficha del vendedor que llama (rol vendedor)
+GET    /api/vendedores/{id}/pipeline        Su embudo (un vendedor, solo el suyo)
 POST   /api/vendedores/{id}/reasignar-pendientes   Reparte sus leads abiertos
 
+POST   /api/pipeline                        Alta manual de un lead en el embudo
 POST   /api/pipeline/{user_id}/asignar      Asignar o reasignar
 PATCH  /api/pipeline/{user_id}/estado       Mover de etapa
 GET    /api/pipeline/{user_id}/historial    Bitácora del lead
@@ -448,6 +568,16 @@ del endpoint:
 
 Sin vendedores activos **no es un error**: el lead se crea con
 `vendedor_id = NULL` y sale en el panel como pendiente de asignar.
+
+**Cupo del plan.** `planes.max_vendedores` (None = sin tope) limita las
+fichas **activas**, tengan o no cuenta: lo que el plan vende es gente
+recibiendo leads. Dar de alta o reactivar más allá del tope responde
+**402** con `detail.codigo = "cupo_vendedores"` (y `mensaje`, `maximo`,
+`activos`) — sin `herramienta`, así el portal muestra el mensaje y no el
+modal de plan. Desactivar libera el lugar. El conteo va con un
+`pg_advisory_xact_lock` por tenant dentro de la transacción del alta, para
+que dos altas simultáneas no pasen las dos (`acceso_plan.exigir_cupo_vendedor`).
+Invitar a una ficha que ya existe no consume cupo.
 
 Desactivar a un vendedor **no** reparte su cartera: deja de recibir leads
 nuevos y nada más. Mover los que ya tiene es una llamada aparte y explícita
@@ -537,13 +667,21 @@ ya no trabaja ahí.
 
 | Rol | Ve | Escribe |
 |---|---|---|
-| `vendedor` | Solo su cartera y sus visitas/tareas | Check-ins y sus tareas |
-| `owner` / `superadmin` | Todo el tenant | Alta y edición de clientes, reportes |
-| `member` | Todo el tenant | Nada |
+| `vendedor` | Solo su cartera y sus visitas/tareas | Check-ins, sus tareas y **alta de clientes** |
+| `owner` / `superadmin` | Todo el tenant | Alta, edición y reasignación de clientes, reportes |
+| `member` | Todo el tenant | Nada (ver "Roles dentro de un negocio") |
 
 Un `vendedor_id` en el query string se **ignora** cuando quien llama es un
 vendedor: el filtro se fuerza a su propio id, así que el parámetro no
 sirve para asomarse a la cartera de un compañero.
+
+Lo mismo en el alta: un vendedor puede dar de alta un cliente (lo captura
+en campo, con su pin de GPS) y le queda asignado a él — el `vendedor_id`
+del body se ignora, porque si se respetara serviría para colgarle cartera
+a un compañero. Gerencia sí elige a quién se lo asigna, y es la única que
+puede **editar, reasignar y desasignar** (`exigir_gerencia_crm`): mover el
+pin o cambiar el radio de una geocerca cambia cómo se validan las visitas
+futuras de todo el equipo, no solo las de quien lo capturó.
 
 Dos errores distintos a propósito:
 
@@ -1123,8 +1261,6 @@ Se puede desarrollar y probar todo hoy con las páginas propias.
 - **Revocación**: si el usuario quita el acceso desde Facebook, se entera
   hasta que falla un envío con error 190. Meta tiene un webhook de
   desautorización que valdría la pena escuchar.
-- **Multi-usuario por tenant**: el schema lo soporta (varios `portal_users`
-  con el mismo `tenant_id`), pero no hay endpoints de invitación todavía.
 - **WhatsApp**: el alta pasa hoy por Kontesta (`services/whatsapp.py`), que
   es un intermediario temporal mientras la app de Meta no tenga Acceso
   Avanzado aprobado. La cuenta de Kontesta es una sola, la de OperativAI:

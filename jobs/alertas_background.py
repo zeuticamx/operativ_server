@@ -25,6 +25,8 @@ from jobs.gerencia_background import JOB_ID as JOB_ID_CONSUMO
 from jobs.gerencia_background import job_consumo_anomalo
 from jobs.perfil_background import JOB_ID as JOB_ID_PERFIL
 from jobs.perfil_background import job_recordatorio_perfil
+from jobs.reservas_background import JOB_ID as JOB_ID_RESERVAS
+from jobs.reservas_background import job_reservas_vencidas
 from realtime import broadcast_alerta
 from services.correo import ErrorEnvioCorreo, enviar_resumen_alertas
 from services.pipeline_estados import ESTADOS_CERRADOS
@@ -246,6 +248,16 @@ def iniciar_scheduler() -> AsyncIOScheduler:
         hours=settings.PERFIL_RECORDATORIO_INTERVALO_HORAS,
         id=JOB_ID_PERFIL,
         name="Recordatorio de perfil incompleto",
+        max_instances=1,
+        coalesce=True,
+    )
+    # Citas confirmadas que ya pasaron -> 'no_asistio' (jobs/reservas_background.py).
+    scheduler.add_job(
+        job_reservas_vencidas,
+        "interval",
+        minutes=settings.RESERVAS_VENCIDAS_INTERVALO_MINUTOS,
+        id=JOB_ID_RESERVAS,
+        name="Dar por no asistidas las citas vencidas",
         max_instances=1,
         coalesce=True,
     )

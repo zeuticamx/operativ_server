@@ -25,6 +25,7 @@ from routers import (
     clientes,
     conversaciones,
     cuenta,
+    equipo,
     eventos,
     gerencia,
     gerencia_operacion,
@@ -80,6 +81,8 @@ app.include_router(auth.router, prefix="/api")
 # Perfil personal (datos + foto) del usuario de la sesión, desde /preferencias.
 app.include_router(perfil.router, prefix="/api")
 app.include_router(cuenta.router, prefix="/api")
+# Cuentas de member/vendedor por invitación (el lado del invitado está en auth).
+app.include_router(equipo.router, prefix="/api")
 app.include_router(incidencias.router, prefix="/api")
 app.include_router(canales.router, prefix="/api")
 # Alta de WhatsApp vía NeuroAPI Connect Sessions: el único endpoint del
@@ -97,7 +100,6 @@ app.include_router(herramientas.router, prefix="/api")
 app.include_router(vendedores.router_vendedores, prefix="/api")
 app.include_router(vendedores.router_tenants, prefix="/api")
 app.include_router(vendedores.router_pipeline, prefix="/api")
-app.include_router(vendedores.router_clientes, prefix="/api")
 app.include_router(pipeline_config.router, prefix="/api")
 app.include_router(alertas.router, prefix="/api")
 

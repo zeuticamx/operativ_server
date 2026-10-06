@@ -13,11 +13,16 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from realtime import broadcast_alerta
+from realtime import avisar_a_proveedor, broadcast_alerta
 from deps import (
+    ROL_PROVEEDOR,
+    ROLES_GERENCIA,
     UsuarioActual,
     gerencia_actual,
+    permitir_a_proveedor,
+    proveedor_actual,
     tenant_en_ruta,
+    usuario_actual,
     verificar_acceso_tenant,
 )
 from services import calendario
@@ -26,6 +31,7 @@ from schemas import (
     CambiarEstadoReservaIn,
     CancelarReservaIn,
     CorteDiarioOut,
+    CupoOut,
     DescansoCrearIn,
     DescansoOut,
     EstadoReserva,
@@ -46,9 +52,75 @@ from schemas import (
     ServicioCrearIn,
     ServicioOut,
 )
-from session import fetch_all, fetch_one
+from services.acceso_plan import cupo_proveedores, exigir_cupo_proveedor
+from session import fetch_all, fetch_one, transaccion
 
-router_calendario = APIRouter(prefix="/tenants", tags=["calendario"])
+# La agenda tiene nombres y teléfonos de clientes de todo el negocio: el
+# vendedor no la ve. Leer, cualquiera del equipo; escribir, gerencia.
+#
+# El proveedor con cuenta (37_proveedor_cuenta.sql) entra SOLO a los
+# endpoints de esta lista, y cada uno lo acota a lo suyo: sus citas (verlas,
+# cancelarlas, marcarlas), su horario (solo leerlo) y sus descansos y días
+# libres. Servicios se lee para pintar la agenda. Lo demás (crear o mover
+# citas, otros proveedores, corte diario, bitácora) le da 403.
+router_calendario = APIRouter(
+    prefix="/tenants",
+    tags=["calendario"],
+    dependencies=[
+        Depends(
+            permitir_a_proveedor(
+                "listar_proveedores",
+                "listar_servicios",
+                "leer_horarios",
+                "leer_excepciones",
+                "crear_excepcion",
+                "eliminar_excepcion",
+                "leer_descansos",
+                "crear_descanso",
+                "eliminar_descanso",
+                "listar_reservas",
+                "cancelar_reserva",
+                "cambiar_estado_reserva",
+            )
+        )
+    ],
+)
+
+
+async def _proveedor_propio(usuario: UsuarioActual) -> UUID | None:
+    """El id de proveedor de quien llama, o None si es del equipo del negocio."""
+    if usuario.role != ROL_PROVEEDOR:
+        return None
+    return (await proveedor_actual(usuario)).id
+
+
+def _solo_lo_suyo(propio: UUID | None, proveedor_id: UUID) -> None:
+    """
+    403 y no 404 cuando un proveedor pide lo de un compañero: es del mismo
+    negocio y la ficha existe. Mismo criterio que con el vendedor.
+    """
+    if propio is not None and propio != proveedor_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo puedes ver o cambiar tu propia agenda",
+        )
+
+
+async def _gestiona(usuario: UsuarioActual, proveedor_id: UUID) -> UUID | None:
+    """
+    Para escrituras que comparten gerencia y el propio proveedor: gerencia
+    sobre cualquiera, el proveedor solo sobre sí mismo, 'member' sobre
+    nadie (como antes, cuando estas rutas exigían gerencia_actual).
+    Devuelve el id propio si quien llama es proveedor.
+    """
+    propio = await _proveedor_propio(usuario)
+    if propio is None and usuario.role not in ROLES_GERENCIA:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Hace falta ser dueño o administrador del negocio",
+        )
+    _solo_lo_suyo(propio, proveedor_id)
+    return propio
 
 
 # ============================================================
@@ -78,16 +150,21 @@ def _a_servicio_out(s: calendario.Servicio) -> ServicioOut:
 async def listar_proveedores(
     tenant_id: UUID = Depends(modulo_en_ruta),
     activo: bool | None = Query(None),
+    usuario: UsuarioActual = Depends(usuario_actual),
 ):
+    # Un proveedor solo se ve a sí mismo: la agenda le pinta una columna.
+    propio = await _proveedor_propio(usuario)
     filas = await fetch_all(
         """
-        SELECT id, tenant_id, nombre, color, activo, orden, creado_en
+        SELECT id, tenant_id, nombre, color, activo, orden, creado_en, portal_user_id
         FROM proveedores
         WHERE tenant_id = $1 AND ($2::boolean IS NULL OR activo = $2)
+          AND ($3::uuid IS NULL OR id = $3)
         ORDER BY orden, creado_en
         """,
         tenant_id,
         activo,
+        propio,
     )
     return [_a_proveedor_out(calendario.Proveedor.desde_fila(f)) for f in filas]
 
@@ -103,18 +180,30 @@ async def crear_proveedor(
     verificar_acceso_tenant(usuario, tenant_id)
     await verificar_calendario_activo(tenant_id)
 
-    fila = await fetch_one(
-        """
-        INSERT INTO proveedores (tenant_id, nombre, color, orden)
-        VALUES ($1, $2, $3, $4)
-        RETURNING id, tenant_id, nombre, color, activo, orden, creado_en
-        """,
-        tenant_id,
-        datos.nombre,
-        datos.color,
-        datos.orden,
-    )
+    # Nace activo, así que cuenta contra planes.max_proveedores.
+    async with transaccion() as conn:
+        await exigir_cupo_proveedor(tenant_id, conn)
+        fila = await conn.fetchrow(
+            """
+            INSERT INTO proveedores (tenant_id, nombre, color, orden)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, tenant_id, nombre, color, activo, orden, creado_en, portal_user_id
+            """,
+            tenant_id,
+            datos.nombre,
+            datos.color,
+            datos.orden,
+        )
     return _a_proveedor_out(calendario.Proveedor.desde_fila(fila))
+
+
+@router_calendario.get(
+    "/{tenant_id}/calendario/proveedores/cupo", response_model=CupoOut
+)
+async def leer_cupo_proveedores(tenant_id: UUID = Depends(modulo_en_ruta)):
+    """Proveedores activos contra planes.max_proveedores (None = sin tope)."""
+    actual = await cupo_proveedores(tenant_id)
+    return CupoOut(plan=actual.plan, maximo=actual.maximo, activos=actual.activos)
 
 
 @router_calendario.patch(
@@ -128,25 +217,29 @@ async def actualizar_proveedor(
 ):
     verificar_acceso_tenant(usuario, tenant_id)
     await verificar_calendario_activo(tenant_id)
-    await _exigir_proveedor(proveedor_id, tenant_id)
+    actual = await _exigir_proveedor(proveedor_id, tenant_id)
 
-    fila = await fetch_one(
-        """
-        UPDATE proveedores SET
-            nombre = COALESCE($3, nombre),
-            color  = COALESCE($4, color),
-            activo = COALESCE($5, activo),
-            orden  = COALESCE($6, orden)
-        WHERE id = $1 AND tenant_id = $2
-        RETURNING id, tenant_id, nombre, color, activo, orden, creado_en
-        """,
-        proveedor_id,
-        tenant_id,
-        datos.nombre,
-        datos.color,
-        datos.activo,
-        datos.orden,
-    )
+    async with transaccion() as conn:
+        # Reactivar ocupa un lugar del plan; desactivar o editar, no.
+        if datos.activo is True and not actual.activo:
+            await exigir_cupo_proveedor(tenant_id, conn)
+        fila = await conn.fetchrow(
+            """
+            UPDATE proveedores SET
+                nombre = COALESCE($3, nombre),
+                color  = COALESCE($4, color),
+                activo = COALESCE($5, activo),
+                orden  = COALESCE($6, orden)
+            WHERE id = $1 AND tenant_id = $2
+            RETURNING id, tenant_id, nombre, color, activo, orden, creado_en, portal_user_id
+            """,
+            proveedor_id,
+            tenant_id,
+            datos.nombre,
+            datos.color,
+            datos.activo,
+            datos.orden,
+        )
     return _a_proveedor_out(calendario.Proveedor.desde_fila(fila))
 
 
@@ -313,7 +406,12 @@ async def actualizar_servicio(
     "/{tenant_id}/calendario/proveedores/{proveedor_id}/horarios",
     response_model=list[HorarioSemanalOut],
 )
-async def leer_horarios(proveedor_id: UUID, tenant_id: UUID = Depends(modulo_en_ruta)):
+async def leer_horarios(
+    proveedor_id: UUID,
+    tenant_id: UUID = Depends(modulo_en_ruta),
+    usuario: UsuarioActual = Depends(usuario_actual),
+):
+    _solo_lo_suyo(await _proveedor_propio(usuario), proveedor_id)
     await _exigir_proveedor(proveedor_id, tenant_id)
     filas = await calendario.listar_horarios_out(proveedor_id)
     return [HorarioSemanalOut(**f) for f in filas]
@@ -361,7 +459,9 @@ async def leer_excepciones(
     desde: date = Query(...),
     hasta: date = Query(...),
     tenant_id: UUID = Depends(modulo_en_ruta),
+    usuario: UsuarioActual = Depends(usuario_actual),
 ):
+    _solo_lo_suyo(await _proveedor_propio(usuario), proveedor_id)
     await _exigir_proveedor(proveedor_id, tenant_id)
     filas = await calendario.listar_excepciones_out(proveedor_id, desde, hasta)
     return [ExcepcionOut(**f) for f in filas]
@@ -375,11 +475,19 @@ async def crear_excepcion(
     proveedor_id: UUID,
     datos: ExcepcionCrearIn,
     tenant_id: UUID,
-    usuario: UsuarioActual = Depends(gerencia_actual),
+    usuario: UsuarioActual = Depends(usuario_actual),
 ):
     verificar_acceso_tenant(usuario, tenant_id)
     await verificar_calendario_activo(tenant_id)
+    propio = await _gestiona(usuario, proveedor_id)
     await _exigir_proveedor(proveedor_id, tenant_id)
+    # El proveedor marca sus días libres; un horario especial (atender en
+    # otro horario ese día) cambia su jornada, y eso lo fija el dueño.
+    if propio is not None and datos.disponible:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo puedes marcar días libres. Un horario especial lo fija el dueño del negocio.",
+        )
 
     fila = await calendario.guardar_excepcion(
         proveedor_id, tenant_id, datos.fecha, datos.disponible, datos.hora_inicio, datos.hora_fin
@@ -393,10 +501,23 @@ async def crear_excepcion(
 async def eliminar_excepcion(
     excepcion_id: UUID,
     tenant_id: UUID,
-    usuario: UsuarioActual = Depends(gerencia_actual),
+    usuario: UsuarioActual = Depends(usuario_actual),
 ):
     verificar_acceso_tenant(usuario, tenant_id)
     await verificar_calendario_activo(tenant_id)
+    fila = await fetch_one(
+        "SELECT proveedor_id, disponible FROM proveedor_excepciones WHERE id = $1 AND tenant_id = $2",
+        excepcion_id,
+        tenant_id,
+    )
+    if fila is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Excepción no encontrada")
+    propio = await _gestiona(usuario, fila["proveedor_id"])
+    if propio is not None and fila["disponible"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Ese horario especial lo fijó el dueño del negocio",
+        )
     borrado = await calendario.eliminar_excepcion(excepcion_id, tenant_id)
     if not borrado:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Excepción no encontrada")
@@ -409,7 +530,12 @@ async def eliminar_excepcion(
     "/{tenant_id}/calendario/proveedores/{proveedor_id}/descansos",
     response_model=list[DescansoOut],
 )
-async def leer_descansos(proveedor_id: UUID, tenant_id: UUID = Depends(modulo_en_ruta)):
+async def leer_descansos(
+    proveedor_id: UUID,
+    tenant_id: UUID = Depends(modulo_en_ruta),
+    usuario: UsuarioActual = Depends(usuario_actual),
+):
+    _solo_lo_suyo(await _proveedor_propio(usuario), proveedor_id)
     await _exigir_proveedor(proveedor_id, tenant_id)
     filas = await calendario.listar_descansos_out(proveedor_id)
     return [DescansoOut(**f) for f in filas]
@@ -424,10 +550,11 @@ async def crear_descanso(
     proveedor_id: UUID,
     datos: DescansoCrearIn,
     tenant_id: UUID,
-    usuario: UsuarioActual = Depends(gerencia_actual),
+    usuario: UsuarioActual = Depends(usuario_actual),
 ):
     verificar_acceso_tenant(usuario, tenant_id)
     await verificar_calendario_activo(tenant_id)
+    await _gestiona(usuario, proveedor_id)
     await _exigir_proveedor(proveedor_id, tenant_id)
 
     fila, motivo = await calendario.guardar_descanso(
@@ -451,10 +578,18 @@ async def crear_descanso(
 async def eliminar_descanso(
     descanso_id: UUID,
     tenant_id: UUID,
-    usuario: UsuarioActual = Depends(gerencia_actual),
+    usuario: UsuarioActual = Depends(usuario_actual),
 ):
     verificar_acceso_tenant(usuario, tenant_id)
     await verificar_calendario_activo(tenant_id)
+    dueno = await fetch_one(
+        "SELECT proveedor_id FROM proveedor_descansos WHERE id = $1 AND tenant_id = $2",
+        descanso_id,
+        tenant_id,
+    )
+    if dueno is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Descanso no encontrado")
+    await _gestiona(usuario, dueno["proveedor_id"])
     borrado = await calendario.eliminar_descanso(descanso_id, tenant_id)
     if not borrado:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Descanso no encontrado")
@@ -469,7 +604,13 @@ async def listar_reservas(
     hasta: datetime = Query(...),
     proveedor_id: UUID | None = Query(None),
     tenant_id: UUID = Depends(modulo_en_ruta),
+    usuario: UsuarioActual = Depends(usuario_actual),
 ):
+    # Al proveedor se le fuerza el filtro a sí mismo: el parámetro no sirve
+    # para asomarse a la agenda de un compañero.
+    propio = await _proveedor_propio(usuario)
+    if propio is not None:
+        proveedor_id = propio
     reservas = await calendario.listar_reservas(tenant_id, desde, hasta, proveedor_id)
     return [_a_reserva_out(r) for r in reservas]
 
@@ -563,11 +704,12 @@ async def cancelar_reserva(
     reserva_id: UUID,
     datos: CancelarReservaIn,
     tenant_id: UUID,
-    usuario: UsuarioActual = Depends(gerencia_actual),
+    usuario: UsuarioActual = Depends(usuario_actual),
 ):
     verificar_acceso_tenant(usuario, tenant_id)
     await verificar_calendario_activo(tenant_id)
-    await _exigir_reserva(reserva_id, tenant_id)
+    actual = await _exigir_reserva(reserva_id, tenant_id)
+    await _gestiona(usuario, actual.proveedor_id)
 
     reserva = await calendario.cancelar_reserva(
         reserva_id, tenant_id, datos.motivo, actor_desde_portal(usuario.id, usuario.email)
@@ -575,13 +717,18 @@ async def cancelar_reserva(
     if reserva is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reserva no encontrada")
 
-    await broadcast_alerta(
-        tenant_id,
+    alerta = (
         "reserva_cancelada",
         "Reserva cancelada",
         f"Se canceló la cita de {reserva.cliente_nombre or 'un cliente'} con {reserva.proveedor_nombre}",
-        datos={"reserva_id": str(reserva.id)},
+        {"reserva_id": str(reserva.id)},
     )
+    await broadcast_alerta(tenant_id, *alerta)
+    # Al proveedor solo si la canceló otro: avisarle de lo que él mismo hizo
+    # no le informa nada.
+    cuenta = await calendario.cuenta_del_proveedor(reserva.proveedor_id)
+    if cuenta != usuario.id:
+        await avisar_a_proveedor(tenant_id, cuenta, *alerta)
     return _a_reserva_out(reserva)
 
 
@@ -592,11 +739,12 @@ async def cambiar_estado_reserva(
     reserva_id: UUID,
     datos: CambiarEstadoReservaIn,
     tenant_id: UUID,
-    usuario: UsuarioActual = Depends(gerencia_actual),
+    usuario: UsuarioActual = Depends(usuario_actual),
 ):
     verificar_acceso_tenant(usuario, tenant_id)
     await verificar_calendario_activo(tenant_id)
-    await _exigir_reserva(reserva_id, tenant_id)
+    actual = await _exigir_reserva(reserva_id, tenant_id)
+    await _gestiona(usuario, actual.proveedor_id)
 
     reserva = await calendario.cambiar_estado_reserva(
         reserva_id,

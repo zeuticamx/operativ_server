@@ -350,3 +350,56 @@ async def enviar_recordatorio_perfil(
             cierre=html_mod.escape(cierre),
         ),
     )
+
+
+# ============================================================
+# Invitación al equipo de un negocio (services/invitaciones.py)
+# ============================================================
+_TEXTO_INVITACION = """Hola.
+
+{invitador} te invitó a unirte al equipo de {negocio} en OperativAI como {rol}.
+
+Para crear tu acceso, abre este enlace y elige tu contraseña:
+
+    {enlace}
+
+El enlace vence en {dias} días y solo sirve una vez.
+
+Si no esperabas esta invitación, ignora este correo: sin el enlace no se
+crea ninguna cuenta.
+"""
+
+_HTML_INVITACION = """\
+<div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1c1c1c">
+  <p style="margin:0 0 16px;font-size:14px">
+    <strong>{invitador}</strong> te invitó a unirte al equipo de <strong>{negocio}</strong>
+    en OperativAI como <strong>{rol}</strong>.
+  </p>
+  <p style="margin:0 0 24px">
+    <a href="{enlace}" style="display:inline-block;padding:10px 16px;border-radius:6px;background:#1c1c1c;color:#fff;font-size:14px;text-decoration:none">
+      Crear mi acceso
+    </a>
+  </p>
+  <p style="margin:0 0 16px;font-size:13px;color:#666">
+    El enlace vence en {dias} días y solo sirve una vez.
+  </p>
+  <p style="margin:0;font-size:12px;color:#888">
+    Si no esperabas esta invitación, ignora este correo: sin el enlace no se crea ninguna cuenta.
+  </p>
+</div>"""
+
+
+async def enviar_invitacion(
+    destino: str, invitador: str, negocio: str, rol: str, enlace: str, dias: int
+) -> None:
+    """Lanza ErrorEnvioCorreo si el SMTP falla."""
+    datos = {"invitador": invitador, "negocio": negocio, "rol": rol, "enlace": enlace, "dias": dias}
+    await enviar_correo(
+        destino,
+        asunto=f"Te invitaron al equipo de {negocio} en OperativAI",
+        texto=_TEXTO_INVITACION.format(**datos),
+        # El nombre del negocio y el del invitador los escribe un usuario.
+        html=_HTML_INVITACION.format(
+            **{k: html_mod.escape(str(v)) for k, v in datos.items()}
+        ),
+    )

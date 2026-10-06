@@ -83,6 +83,9 @@ class Proveedor:
     activo: bool
     orden: int
     creado_en: datetime
+    # Cuenta del portal del proveedor (37_proveedor_cuenta.sql). None = no
+    # tiene acceso: solo existe en la agenda.
+    portal_user_id: Optional[UUID] = None
 
     @classmethod
     def desde_fila(cls, fila) -> "Proveedor":
@@ -169,14 +172,14 @@ def _con_proveedor_y_servicio(fila: asyncpg.Record, proveedor: Proveedor, servic
 @dataclass(frozen=True)
 class ActorAuditoria:
     """
-    Quién disparó el evento. Los proveedores nunca son actor: no tienen
-    cuenta propia (decisión de producto — ver plan del módulo), así que todo
-    lo que les pasa a sus citas lo dispara gerencia desde el portal o un
-    cliente que escribió por WhatsApp/IG/FB y por el que actuó n8n.
+    Quién disparó el evento: alguien desde el portal (gerencia, o el propio
+    proveedor con cuenta desde 37_proveedor_cuenta.sql), un cliente que
+    escribió por WhatsApp/IG/FB y por el que actuó n8n, o el sistema (el
+    job que da por 'no_asistio' las citas vencidas).
     """
 
-    origen: str  # 'portal' | 'n8n'
-    actor: str  # texto legible: el email de gerencia, o "Cliente: <nombre>"
+    origen: str  # 'portal' | 'n8n' | 'sistema'
+    actor: str  # texto legible: el email de quien entró, o "Cliente: <nombre>"
     portal_user_id: Optional[UUID] = None
     user_id: Optional[UUID] = None
 
@@ -303,7 +306,7 @@ async def proveedor_del_tenant(
     proveedor_id: UUID, tenant_id: UUID, conn: Optional[asyncpg.Connection] = None
 ) -> Optional[Proveedor]:
     sql = """
-        SELECT id, tenant_id, nombre, color, activo, orden, creado_en
+        SELECT id, tenant_id, nombre, color, activo, orden, creado_en, portal_user_id
         FROM proveedores
         WHERE id = $1 AND tenant_id = $2
     """
@@ -335,7 +338,7 @@ async def proveedores_activos(
     tenant_id: UUID, conn: Optional[asyncpg.Connection] = None
 ) -> list[Proveedor]:
     sql = """
-        SELECT id, tenant_id, nombre, color, activo, orden, creado_en
+        SELECT id, tenant_id, nombre, color, activo, orden, creado_en, portal_user_id
         FROM proveedores
         WHERE tenant_id = $1 AND activo = true
         ORDER BY orden, creado_en
@@ -1380,3 +1383,64 @@ async def registrar_edicion_servicio(
         actor_email,
         actor_portal_user_id,
     )
+
+
+# ============================================================
+# Citas vencidas sin marcar (jobs/reservas_background.py)
+# ============================================================
+ACTOR_SISTEMA = "Sistema: la cita pasó sin marcarse"
+
+
+async def marcar_vencidas_no_asistio(gracia_minutos: int = 0) -> int:
+    """
+    Da por 'no_asistio' toda cita 'confirmada' cuya hora de fin ya pasó (más
+    la gracia), y deja el renglón en la bitácora con origen 'sistema'.
+    Devuelve cuántas marcó.
+
+    Un solo statement (UPDATE + INSERT en un CTE): o quedan marcadas y
+    auditadas todas, o ninguna — y dos corridas simultáneas no auditan dos
+    veces la misma cita, porque la segunda ya no la ve 'confirmada'.
+
+    Quien la atendió y no la marcó puede corregirla a 'completada' después:
+    cambiar_estado_reserva no restringe desde qué estado se llega.
+    """
+    filas = await fetch_all(
+        """
+        WITH vencidas AS (
+            UPDATE reservas
+               SET estado = 'no_asistio', actualizado_en = NOW()
+             WHERE estado = 'confirmada'
+               AND hora_fin <= NOW() - make_interval(mins => $1)
+            RETURNING id, tenant_id
+        )
+        INSERT INTO reserva_auditoria
+            (tenant_id, reserva_id, evento, estado_anterior, estado_nuevo, motivo,
+             datos_nuevos, origen, actor)
+        SELECT tenant_id, id, 'no_asistio', 'confirmada', 'no_asistio',
+               'La hora de la cita pasó y nadie la marcó como completada',
+               '{}'::jsonb, 'sistema', $2
+        FROM vencidas
+        RETURNING reserva_id
+        """,
+        gracia_minutos,
+        ACTOR_SISTEMA,
+    )
+    return len(filas)
+
+
+async def cuenta_del_proveedor(proveedor_id: UUID) -> Optional[UUID]:
+    """
+    El portal_user de un proveedor, si tiene cuenta y la ficha y la cuenta
+    están activas. Para mandarle sus avisos personales (realtime.py): el
+    proveedor no está en la room del negocio.
+    """
+    fila = await fetch_one(
+        """
+        SELECT p.portal_user_id
+        FROM proveedores p
+        JOIN portal_users pu ON pu.id = p.portal_user_id
+        WHERE p.id = $1 AND p.activo AND pu.is_active
+        """,
+        proveedor_id,
+    )
+    return fila["portal_user_id"] if fila else None

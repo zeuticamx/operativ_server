@@ -26,6 +26,22 @@ ROLES_GERENCIA = frozenset({"owner", "superadmin"})
 # admitirlo no necesitó migración.
 ROL_VENDEDOR = "vendedor"
 
+# Barbero/estilista del calendario con cuenta propia (37_proveedor_cuenta.sql).
+# Como el vendedor, solo ve lo suyo: sus citas, su disponibilidad y las
+# conversaciones de sus clientes (proveedor_actual).
+ROL_PROVEEDOR = "proveedor"
+
+# Quién ve el negocio completo: conversaciones, el embudo entero, la agenda,
+# las métricas. 'member' sí (mira y opera, no configura); vendedor y
+# proveedor no: solo ven lo suyo (vendedor_actual / proveedor_actual). Es lista
+# blanca a propósito: un rol nuevo o mal escrito queda fuera hasta que
+# alguien decida qué le toca.
+ROLES_NEGOCIO = frozenset({"owner", "superadmin", "member"})
+
+# Roles que el dueño puede invitar (routers/equipo.py). owner y superadmin
+# no se reparten por invitación.
+ROLES_INVITABLES = frozenset({"member", ROL_VENDEDOR, ROL_PROVEEDOR})
+
 # Lo único que puede hacer una sesión de "ver como" (impersonación de
 # plataforma). Todo lo demás es una escritura sobre los datos de un cliente
 # hecha por alguien que no es el cliente.
@@ -269,6 +285,27 @@ async def gerencia_actual(
     return usuario
 
 
+async def negocio_actual(
+    usuario: UsuarioActual = Depends(usuario_actual),
+) -> UsuarioActual:
+    """
+    Para todo lo que es "del negocio" y no "lo mío": conversaciones, el
+    embudo completo, la agenda, la configuración del agente. Deja pasar a
+    gerencia y a 'member'; al vendedor no.
+
+    Se cuelga a nivel de APIRouter donde todo el router es del negocio, por
+    lo mismo que requiere_herramienta: una ruta nueva queda cubierta sin
+    acordarse. 403 y no 404: el vendedor es del mismo negocio, sabe que la
+    sección existe; lo que le falta es el permiso.
+    """
+    if usuario.role not in ROLES_NEGOCIO:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Esta sección no está disponible para tu rol",
+        )
+    return usuario
+
+
 async def gerencia_plataforma_actual(
     usuario: UsuarioActual = Depends(usuario_actual),
 ) -> UsuarioActual:
@@ -351,6 +388,86 @@ async def vendedor_actual(
         portal_user_id=usuario.id,
         email=usuario.email,
     )
+
+
+@dataclass
+class ProveedorActual:
+    """El proveedor del calendario detrás del portal_user que está llamando."""
+
+    id: UUID
+    tenant_id: UUID
+    nombre: str
+    portal_user_id: UUID
+    email: str
+
+
+async def proveedor_actual(
+    usuario: UsuarioActual = Depends(usuario_actual),
+) -> ProveedorActual:
+    """
+    Resuelve el proveedor de la petición. Mismo criterio que
+    `vendedor_actual`: el JWT solo trae `sub`, la ficha se relee en cada
+    petición y una desactivada deja de pasar en la siguiente llamada.
+    """
+    if usuario.role != ROL_PROVEEDOR:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Esta sección es solo para proveedores",
+        )
+
+    fila = await fetch_one(
+        "SELECT id, tenant_id, nombre, activo FROM proveedores WHERE portal_user_id = $1",
+        usuario.id,
+    )
+    if fila is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tu cuenta tiene el rol de proveedor pero no está ligada a una ficha de proveedor",
+        )
+    if not fila["activo"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tu cuenta de proveedor está desactivada",
+        )
+
+    return ProveedorActual(
+        id=fila["id"],
+        tenant_id=fila["tenant_id"],
+        nombre=fila["nombre"],
+        portal_user_id=usuario.id,
+        email=usuario.email,
+    )
+
+
+def permitir_a_proveedor(*endpoints: str):
+    """
+    Dependency de router para los routers del negocio que el proveedor
+    comparte a medias (calendario, conversaciones): deja pasar a
+    ROLES_NEGOCIO a todo, y al proveedor SOLO a los endpoints nombrados.
+
+    Es lista blanca por nombre de función a propósito: un endpoint nuevo
+    que alguien agregue al router queda cerrado para el proveedor hasta que
+    se lo sume acá, igual que negocio_actual hace con cualquier rol nuevo.
+    Cada endpoint de la lista tiene que acotar él mismo los datos a lo del
+    proveedor (`proveedor_actual`): esto solo decide si puede entrar.
+    """
+    permitidos = frozenset(endpoints)
+
+    async def dependencia(
+        request: Request,
+        usuario: UsuarioActual = Depends(usuario_actual),
+    ) -> UsuarioActual:
+        if usuario.role in ROLES_NEGOCIO:
+            return usuario
+        endpoint = request.scope.get("endpoint")
+        if usuario.role == ROL_PROVEEDOR and getattr(endpoint, "__name__", None) in permitidos:
+            return usuario
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Esta sección no está disponible para tu rol",
+        )
+
+    return dependencia
 
 
 async def llamada_interna(

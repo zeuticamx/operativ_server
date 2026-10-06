@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
 
+import asyncpg
 from fastapi import HTTPException, status
 
 from session import fetch_all, fetch_one
@@ -223,6 +224,113 @@ def detalle_bloqueo(
         "planes_que_la_incluyen": planes,
         "mensaje": _mensaje(codigo, herramienta, planes) if codigo else "",
     }
+
+
+# ============================================================
+# Cupos del plan: vendedores y proveedores activos
+# ============================================================
+@dataclass(frozen=True)
+class Cupo:
+    plan: str | None
+    # None = sin tope (enterprise, piloto sin plan, o un plan al que gerencia
+    # todavía no le fijó límite).
+    maximo: int | None
+    activos: int
+
+    @property
+    def disponible(self) -> bool:
+        return self.maximo is None or self.activos < self.maximo
+
+
+# Qué se cuenta para cada cupo: (tabla de fichas, columna de `planes`,
+# código del 402, cómo se nombran en el mensaje). Nombres fijos, nunca
+# entrada del usuario: van interpolados en el SQL.
+_CUPOS: dict[str, tuple[str, str, str, str]] = {
+    "vendedores": ("vendedores", "max_vendedores", "cupo_vendedores", "vendedores"),
+    "proveedores": ("proveedores", "max_proveedores", "cupo_proveedores", "proveedores"),
+}
+
+
+async def cupo(que: str, tenant_id: UUID, conn: asyncpg.Connection | None = None) -> Cupo:
+    """
+    Cuántas fichas ACTIVAS (de vendedores o de proveedores) deja tener el
+    plan y cuántas hay.
+
+    Cuenta fichas, no cuentas de portal: lo que el plan vende es gente
+    trabajando (recibiendo leads, atendiendo citas), tenga o no acceso.
+    Las desactivadas no cuentan, así que dar de baja a alguien libera el
+    lugar.
+
+    Sin suscripción no hay tope que aplicar acá: a ese negocio ya lo frena
+    exigir_herramienta antes, salvo el piloto, que es todo abierto a
+    propósito (ver `evaluar`).
+    """
+    tabla, columna, _, _ = _CUPOS[que]
+    consulta = f"""
+        SELECT s.plan, p.{columna} AS maximo,
+               (SELECT COUNT(*) FROM {tabla} f
+                 WHERE f.tenant_id = t.id AND f.activo) AS activos
+        FROM tenants t
+        LEFT JOIN tenant_subscriptions s ON s.tenant_id = t.id
+        LEFT JOIN planes               p ON p.nombre    = s.plan
+        WHERE t.id = $1
+    """
+    fila = await (conn.fetchrow(consulta, tenant_id) if conn else fetch_one(consulta, tenant_id))
+    if fila is None:
+        return Cupo(plan=None, maximo=None, activos=0)
+    return Cupo(plan=fila["plan"], maximo=fila["maximo"], activos=fila["activos"])
+
+
+async def exigir_cupo(que: str, tenant_id: UUID, conn: asyncpg.Connection) -> Cupo:
+    """
+    402 si sumar una ficha activa más pasaría el tope del plan.
+
+    Va dentro de la transacción que inserta o reactiva, con un candado por
+    tenant y por cupo: sin él, dos altas simultáneas leerían el mismo
+    conteo y las dos pasarían. El `codigo` es distinto al de las
+    herramientas (no trae `herramienta`), así el portal muestra el mensaje
+    y no el modal de plan.
+    """
+    _, _, codigo, nombre = _CUPOS[que]
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtext($1 || ':' || $2::text))",
+        codigo,
+        str(tenant_id),
+    )
+    actual = await cupo(que, tenant_id, conn)
+    if actual.disponible:
+        return actual
+
+    plan = actual.plan.capitalize() if actual.plan else "actual"
+    raise HTTPException(
+        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        detail={
+            "codigo": codigo,
+            "mensaje": (
+                f"Tu plan {plan} permite {actual.maximo} {nombre} activos y ya los tienes. "
+                "Desactiva uno o mejora tu plan para sumar más."
+            ),
+            "plan_actual": actual.plan,
+            "maximo": actual.maximo,
+            "activos": actual.activos,
+        },
+    )
+
+
+async def cupo_vendedores(tenant_id: UUID, conn: asyncpg.Connection | None = None) -> Cupo:
+    return await cupo("vendedores", tenant_id, conn)
+
+
+async def exigir_cupo_vendedor(tenant_id: UUID, conn: asyncpg.Connection) -> Cupo:
+    return await exigir_cupo("vendedores", tenant_id, conn)
+
+
+async def cupo_proveedores(tenant_id: UUID, conn: asyncpg.Connection | None = None) -> Cupo:
+    return await cupo("proveedores", tenant_id, conn)
+
+
+async def exigir_cupo_proveedor(tenant_id: UUID, conn: asyncpg.Connection) -> Cupo:
+    return await exigir_cupo("proveedores", tenant_id, conn)
 
 
 async def exigir_herramienta(tenant_id: UUID, herramienta: str) -> AccesoPlan:

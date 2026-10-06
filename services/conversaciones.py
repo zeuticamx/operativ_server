@@ -56,6 +56,53 @@ _MINUTOS_VENTANA = (
     f"ELSE (1440 - EXTRACT(EPOCH FROM (NOW() - {_ULTIMO_CLIENTE})) / 60)::int END"
 )
 
+# De qué proveedor del calendario es una conversación: del de la cita MÁS
+# RECIENTE (por fecha de alta, cancelada incluida) de ese cliente. Una sola
+# respuesta a propósito: si el cliente reservó con dos barberos, la
+# conversación es del último y no aparece en la bandeja de ambos.
+# Ver sql/37_proveedor_cuenta.sql (índice idx_reservas_tenant_user_creada).
+_PROVEEDOR_DEL_CLIENTE = (
+    "(SELECT r.proveedor_id FROM reservas r "
+    "WHERE r.tenant_id = c.tenant_id AND r.user_id = c.user_id "
+    "ORDER BY r.creado_en DESC LIMIT 1)"
+)
+
+
+async def es_de_proveedor(tenant_id: UUID, conversacion_id: UUID, proveedor_id: UUID) -> bool | None:
+    """None si la conversación no existe en este tenant; si existe, si le toca a ese proveedor."""
+    fila = await fetch_one(
+        f"""
+        SELECT {_PROVEEDOR_DEL_CLIENTE} = $3 AS suya
+        FROM conversations c
+        WHERE c.id = $2 AND c.tenant_id = $1
+        """,
+        tenant_id,
+        conversacion_id,
+        proveedor_id,
+    )
+    if fila is None:
+        return None
+    return bool(fila["suya"])
+
+
+async def cuenta_del_proveedor(conversacion_id: UUID) -> UUID | None:
+    """
+    El portal_user del proveedor dueño de la conversación, si tiene cuenta
+    activa y ficha activa. Para avisarle en vivo (realtime.py): el proveedor
+    no está en la room del negocio.
+    """
+    fila = await fetch_one(
+        f"""
+        SELECT p.portal_user_id
+        FROM conversations c
+        JOIN proveedores p ON p.id = {_PROVEEDOR_DEL_CLIENTE}
+        JOIN portal_users pu ON pu.id = p.portal_user_id
+        WHERE c.id = $1 AND p.activo AND pu.is_active
+        """,
+        conversacion_id,
+    )
+    return fila["portal_user_id"] if fila else None
+
 
 # ============================================================
 # Lectura
@@ -67,7 +114,9 @@ async def listar(
     buscar: str | None,
     limite: int,
     offset: int,
+    proveedor_id: UUID | None = None,
 ):
+    """Con `proveedor_id`, solo las conversaciones de sus clientes (_PROVEEDOR_DEL_CLIENTE)."""
     return await fetch_all(
         f"""
         SELECT
@@ -96,6 +145,7 @@ async def listar(
             OR u.display_name ILIKE '%' || $4 || '%'
             OR {_HANDLE} ILIKE '%' || $4 || '%'
           )
+          AND ($7::uuid IS NULL OR {_PROVEEDOR_DEL_CLIENTE} = $7)
         ORDER BY c.last_message_at DESC
         LIMIT $5 OFFSET $6
         """,
@@ -105,6 +155,7 @@ async def listar(
         buscar,
         limite,
         offset,
+        proveedor_id,
     )
 
 

@@ -4,7 +4,15 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 
-from deps import UsuarioActual, requiere_herramienta, tenant_actual, usuario_actual
+from deps import (
+    ROL_PROVEEDOR,
+    UsuarioActual,
+    permitir_a_proveedor,
+    proveedor_actual,
+    requiere_herramienta,
+    tenant_actual,
+    usuario_actual,
+)
 from realtime import emit_conversacion_estado, emit_mensaje
 from session import execute, fetch_one
 from schemas import (
@@ -26,8 +34,55 @@ from services import meta
 router = APIRouter(
     prefix="/conversaciones",
     tags=["conversaciones"],
-    dependencies=[Depends(requiere_herramienta("agente", lectura_sin_plan=True))],
+    # Las conversaciones son del negocio entero: el vendedor no las ve. El
+    # proveedor del calendario entra solo a estos endpoints, y cada uno lo
+    # acota a las conversaciones de sus clientes (conversacion_visible).
+    # Ni métricas del negocio ni editar el contacto.
+    dependencies=[
+        Depends(
+            permitir_a_proveedor(
+                "listar",
+                "detalle",
+                "enviar_mensaje",
+                "enviar_adjunto",
+                "descargar_adjunto",
+                "tomar",
+                "volver_a_ia",
+            )
+        ),
+        Depends(requiere_herramienta("agente", lectura_sin_plan=True)),
+    ],
 )
+
+
+async def _proveedor_propio(usuario: UsuarioActual) -> UUID | None:
+    """El id de proveedor de quien llama, o None si es del equipo del negocio (ve todo)."""
+    if usuario.role != ROL_PROVEEDOR:
+        return None
+    return (await proveedor_actual(usuario)).id
+
+
+async def conversacion_visible(
+    conversacion_id: UUID,
+    usuario: UsuarioActual = Depends(usuario_actual),
+    tenant_id: UUID = Depends(tenant_actual),
+) -> None:
+    """
+    Para un proveedor: 404 si la conversación no existe en el negocio, 403 si
+    es de un cliente de otro proveedor (es del mismo negocio, no se esconde
+    que existe — mismo criterio que con el vendedor y sus leads).
+    """
+    propio = await _proveedor_propio(usuario)
+    if propio is None:
+        return
+    suya = await svc.es_de_proveedor(tenant_id, conversacion_id, propio)
+    if suya is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversación no encontrada")
+    if not suya:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Esta conversación es de un cliente de otro proveedor",
+        )
 
 
 @router.get("", response_model=list[ConversacionOut])
@@ -38,8 +93,10 @@ async def listar(
     buscar: str | None = Query(None, max_length=100),
     limite: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    usuario: UsuarioActual = Depends(usuario_actual),
 ):
-    filas = await svc.listar(tenant_id, canal, estado, buscar, limite, offset)
+    propio = await _proveedor_propio(usuario)
+    filas = await svc.listar(tenant_id, canal, estado, buscar, limite, offset, proveedor_id=propio)
     return [ConversacionOut(**dict(f)) for f in filas]
 
 
@@ -56,6 +113,7 @@ async def metricas(tenant_id: UUID = Depends(tenant_actual)):
 async def detalle(
     conversacion_id: UUID,
     tenant_id: UUID = Depends(tenant_actual),
+    _: None = Depends(conversacion_visible),
 ):
     # El filtro por tenant_id va en el WHERE, no como validación aparte:
     # así es imposible leer la conversación de otro tenant aunque se
@@ -83,6 +141,7 @@ async def enviar_mensaje(
     datos: EnviarMensajeIn,
     usuario: UsuarioActual = Depends(usuario_actual),
     tenant_id: UUID = Depends(tenant_actual),
+    _: None = Depends(conversacion_visible),
 ):
     """
     Respuesta manual mientras la conversación está transferida a un humano
@@ -109,6 +168,7 @@ async def enviar_adjunto(
     leyenda: str | None = Form(None, max_length=1024),
     usuario: UsuarioActual = Depends(usuario_actual),
     tenant_id: UUID = Depends(tenant_actual),
+    _: None = Depends(conversacion_visible),
 ):
     """
     Imagen (JPG/PNG) o documento (PDF/DOCX) como respuesta manual por
@@ -133,6 +193,7 @@ async def descargar_adjunto(
     conversacion_id: UUID,
     adjunto_id: UUID,
     tenant_id: UUID = Depends(tenant_actual),
+    _: None = Depends(conversacion_visible),
 ):
     """Contenido de un adjunto (enviado o recibido) de una conversación del tenant."""
     fila = await svc.obtener_adjunto(tenant_id, conversacion_id, adjunto_id)
@@ -152,6 +213,7 @@ async def descargar_adjunto(
 async def tomar(
     conversacion_id: UUID,
     tenant_id: UUID = Depends(tenant_actual),
+    _: None = Depends(conversacion_visible),
 ):
     """Un humano toma el control: la IA deja de contestar (inversa de volver-a-ia)."""
     fila = await svc.tomar_conversacion(tenant_id, conversacion_id)
@@ -163,6 +225,7 @@ async def tomar(
 async def volver_a_ia(
     conversacion_id: UUID,
     tenant_id: UUID = Depends(tenant_actual),
+    _: None = Depends(conversacion_visible),
 ):
     """Le devuelve el control a la IA (Escenario 4)."""
     fila = await svc.volver_a_ia(tenant_id, conversacion_id)

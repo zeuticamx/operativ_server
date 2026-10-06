@@ -19,14 +19,22 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from realtime import broadcast_alerta
 from services import herramientas_calendario, pipeline_estados
-from services.acceso_plan import acceso_plan, exigir_herramienta
+from services.acceso_plan import (
+    acceso_plan,
+    cupo_vendedores,
+    exigir_cupo_vendedor,
+    exigir_herramienta,
+)
 from services.asignacion import asignar_vendedor_automatico, leer_config
 from deps import (
+    ROL_VENDEDOR,
     UsuarioActual,
     gerencia_actual,
+    negocio_actual,
     tenant_actual,
     tenant_en_ruta,
     usuario_actual,
+    vendedor_actual,
     verificar_acceso_tenant,
 )
 from services.pipeline import (
@@ -44,6 +52,7 @@ from schemas import (
     ConversionEtapaOut,
     ConversionPipelineOut,
     CrearClienteIn,
+    CupoOut,
     HistorialOut,
     HistorialVendedorOut,
     MetricaEtapaOut,
@@ -71,9 +80,6 @@ router_tenants = APIRouter(prefix="/tenants", tags=["vendedores"])
 # distintas. Compartir el sustantivo hacía que pasar el UUID equivocado
 # diera un 404 sin ninguna pista de por qué.
 router_pipeline = APIRouter(prefix="/pipeline", tags=["vendedores"])
-
-# Crear nuevos clientes en el embudo (ruta separada para claridad).
-router_clientes = APIRouter(prefix="/clientes", tags=["vendedores"])
 
 
 # ============================================================
@@ -169,6 +175,45 @@ async def _vendedor_del_tenant(vendedor_id: UUID, tenant_id: UUID):
     return fila
 
 
+async def _vendedor_propio(usuario: UsuarioActual) -> UUID | None:
+    """
+    El vendedor_id de quien llama si es un vendedor; None si es del equipo
+    del negocio (gerencia o 'member'), que ve todo.
+
+    Un vendedor solo puede tocar lo suyo: su ficha, sus leads, su
+    bitácora. vendedor_actual relee la ficha en cada petición, así que uno
+    desactivado deja de pasar en la siguiente llamada.
+    """
+    if usuario.role != ROL_VENDEDOR:
+        return None
+    return (await vendedor_actual(usuario)).id
+
+
+def _solo_lo_suyo(propio: UUID | None, vendedor_id: UUID | None) -> None:
+    """
+    403 y no 404 cuando un vendedor pide lo de un compañero: es gente del
+    mismo negocio, la ficha existe y lo sabe. Mismo criterio que
+    services/crm.cargar_cliente con la cartera de campo.
+    """
+    if propio is not None and propio != vendedor_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo puedes ver o mover tus propios clientes",
+        )
+
+
+_SELECT_VENDEDOR = """
+    SELECT
+        v.id, v.tenant_id, v.portal_user_id, v.nombre, v.telefono,
+        v.activo, v.creado_en,
+        (SELECT COUNT(*)
+           FROM client_pipeline p
+          WHERE p.vendedor_id = v.id
+            AND p.estado <> ALL($2::text[])) AS clientes_activos
+    FROM vendedores v
+"""
+
+
 # ============================================================
 # SERVICIOS DEL TENANT
 # ============================================================
@@ -224,7 +269,10 @@ async def actualizar_servicios(
 # CONFIG DE ASIGNACIÓN
 # ============================================================
 @router_tenants.get("/{tenant_id}/config-vendedores", response_model=ConfigAsignacionOut)
-async def leer_config_asignacion(tenant_id: UUID = Depends(modulo_en_ruta)):
+async def leer_config_asignacion(
+    tenant_id: UUID = Depends(modulo_en_ruta),
+    _: UsuarioActual = Depends(negocio_actual),
+):
     async with conexion() as conn:
         config = await leer_config(conn, tenant_id)
     return ConfigAsignacionOut(
@@ -263,7 +311,7 @@ async def actualizar_config_asignacion(
 @router_vendedores.post("", response_model=VendedorOut, status_code=201)
 async def crear_vendedor(
     datos: VendedorCrearIn,
-    usuario: UsuarioActual = Depends(usuario_actual),
+    usuario: UsuarioActual = Depends(gerencia_actual),
 ):
     # El tenant sale del token salvo que venga explícito en el body, que es
     # el caso de un superadmin dando de alta en nombre de otro negocio.
@@ -292,18 +340,52 @@ async def crear_vendedor(
                 detail="Ese usuario de portal no pertenece a este negocio",
             )
 
-    fila = await fetch_one(
-        """
-        INSERT INTO vendedores (tenant_id, portal_user_id, nombre, telefono)
-        VALUES ($1, $2, $3, $4)
-        RETURNING id, tenant_id, portal_user_id, nombre, telefono, activo, creado_en
-        """,
-        tenant_id,
-        datos.portal_user_id,
-        datos.nombre,
-        datos.telefono,
-    )
+    # Todo vendedor nace activo, así que cuenta contra el cupo del plan.
+    async with transaccion() as conn:
+        await exigir_cupo_vendedor(tenant_id, conn)
+        fila = await conn.fetchrow(
+            """
+            INSERT INTO vendedores (tenant_id, portal_user_id, nombre, telefono)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, tenant_id, portal_user_id, nombre, telefono, activo, creado_en
+            """,
+            tenant_id,
+            datos.portal_user_id,
+            datos.nombre,
+            datos.telefono,
+        )
     return VendedorOut(**dict(fila), clientes_activos=0)
+
+
+@router_vendedores.get("/yo", response_model=VendedorOut)
+async def mi_ficha(usuario: UsuarioActual = Depends(usuario_actual)):
+    """
+    La ficha del vendedor que llama: de acá saca su `id` el portal reducido
+    (y la app de vendedores) para pedir /vendedores/{id}/pipeline. Solo
+    para el rol vendedor: gerencia no tiene ficha propia.
+    """
+    propio = await _vendedor_propio(usuario)
+    if propio is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Esta sección es solo para vendedores",
+        )
+    fila = await fetch_one(
+        f"{_SELECT_VENDEDOR} WHERE v.id = $1",
+        propio,
+        list(ESTADOS_CERRADOS),
+    )
+    return VendedorOut(**dict(fila))
+
+
+@router_tenants.get("/{tenant_id}/vendedores/cupo", response_model=CupoOut)
+async def leer_cupo_vendedores(
+    tenant_id: UUID = Depends(tenant_en_ruta),
+    _: UsuarioActual = Depends(negocio_actual),
+):
+    """Vendedores activos contra el tope del plan, para el contador de Equipo."""
+    cupo = await cupo_vendedores(tenant_id)
+    return CupoOut(plan=cupo.plan, maximo=cupo.maximo, activos=cupo.activos)
 
 
 @router_tenants.get("/{tenant_id}/vendedores", response_model=list[VendedorOut])
@@ -312,26 +394,21 @@ async def listar_vendedores(
     # DOS módulos que cuelgan de `vendedores` — el embudo de chat (que sí
     # depende del flag) y el CRM de campo (que no). Gatearlo dejaba la
     # pantalla de cartera sin poder llenar su filtro de vendedor.
+    # El vendedor no: la lista trae el teléfono de cada compañero.
     tenant_id: UUID = Depends(tenant_en_ruta),
+    _: UsuarioActual = Depends(negocio_actual),
     activo: bool | None = Query(None),
 ):
     filas = await fetch_all(
-        """
-        SELECT
-            v.id, v.tenant_id, v.portal_user_id, v.nombre, v.telefono,
-            v.activo, v.creado_en,
-            (SELECT COUNT(*)
-               FROM client_pipeline p
-              WHERE p.vendedor_id = v.id
-                AND p.estado <> ALL($3::text[])) AS clientes_activos
-        FROM vendedores v
+        f"""
+        {_SELECT_VENDEDOR}
         WHERE v.tenant_id = $1
-          AND ($2::boolean IS NULL OR v.activo = $2)
+          AND ($3::boolean IS NULL OR v.activo = $3)
         ORDER BY v.activo DESC, v.creado_en
         """,
         tenant_id,
-        activo,
         list(ESTADOS_CERRADOS),
+        activo,
     )
     return [VendedorOut(**dict(f)) for f in filas]
 
@@ -341,6 +418,7 @@ async def actualizar_vendedor(
     vendedor_id: UUID,
     datos: VendedorActualizarIn,
     tenant_id: UUID = Depends(modulo_actual),
+    _: UsuarioActual = Depends(gerencia_actual),
 ):
     """
     Activa, desactiva o corrige los datos de un vendedor.
@@ -351,28 +429,32 @@ async def actualizar_vendedor(
     que deba pasar de callado por tocar un switch. Lo que sí cambia de
     inmediato es que deja de recibir leads nuevos.
     """
-    await _vendedor_del_tenant(vendedor_id, tenant_id)
+    actual = await _vendedor_del_tenant(vendedor_id, tenant_id)
 
-    fila = await fetch_one(
-        """
-        UPDATE vendedores SET
-            nombre   = COALESCE($3, nombre),
-            telefono = COALESCE($4, telefono),
-            activo   = COALESCE($5, activo)
-        WHERE id = $1 AND tenant_id = $2
-        RETURNING id, tenant_id, portal_user_id, nombre, telefono, activo, creado_en,
-                  (SELECT COUNT(*)
-                     FROM client_pipeline p
-                    WHERE p.vendedor_id = vendedores.id
-                      AND p.estado <> ALL($6::text[])) AS clientes_activos
-        """,
-        vendedor_id,
-        tenant_id,
-        datos.nombre,
-        datos.telefono,
-        datos.activo,
-        list(ESTADOS_CERRADOS),
-    )
+    async with transaccion() as conn:
+        # Reactivar ocupa un lugar del plan; desactivar o editar, no.
+        if datos.activo is True and not actual["activo"]:
+            await exigir_cupo_vendedor(tenant_id, conn)
+        fila = await conn.fetchrow(
+            """
+            UPDATE vendedores SET
+                nombre   = COALESCE($3, nombre),
+                telefono = COALESCE($4, telefono),
+                activo   = COALESCE($5, activo)
+            WHERE id = $1 AND tenant_id = $2
+            RETURNING id, tenant_id, portal_user_id, nombre, telefono, activo, creado_en,
+                      (SELECT COUNT(*)
+                         FROM client_pipeline p
+                        WHERE p.vendedor_id = vendedores.id
+                          AND p.estado <> ALL($6::text[])) AS clientes_activos
+            """,
+            vendedor_id,
+            tenant_id,
+            datos.nombre,
+            datos.telefono,
+            datos.activo,
+            list(ESTADOS_CERRADOS),
+        )
     return VendedorOut(**dict(fila))
 
 
@@ -380,9 +462,13 @@ async def actualizar_vendedor(
 async def pipeline_de_vendedor(
     vendedor_id: UUID,
     tenant_id: UUID = Depends(modulo_actual),
+    usuario: UsuarioActual = Depends(usuario_actual),
     estado: str | None = Query(None),
     incluir_cerrados: bool = Query(True),
 ):
+    # El vendedor llega acá con su propio id (GET /vendedores/yo) a ver su
+    # cartera del embudo; el de un compañero, no.
+    _solo_lo_suyo(await _vendedor_propio(usuario), vendedor_id)
     await _vendedor_del_tenant(vendedor_id, tenant_id)
 
     filas = await fetch_all(
@@ -407,6 +493,7 @@ async def pipeline_de_vendedor(
 async def historial_de_vendedor(
     vendedor_id: UUID,
     tenant_id: UUID = Depends(modulo_actual),
+    usuario: UsuarioActual = Depends(usuario_actual),
     limite: int = Query(50, ge=1, le=200),
 ):
     """
@@ -416,6 +503,7 @@ async def historial_de_vendedor(
     ya se reasignó a otra persona sigue apareciendo con lo que pasó
     mientras fue de este vendedor.
     """
+    _solo_lo_suyo(await _vendedor_propio(usuario), vendedor_id)
     await _vendedor_del_tenant(vendedor_id, tenant_id)
 
     filas = await fetch_all(
@@ -562,7 +650,9 @@ async def asignar_cliente(
     user_id: UUID,
     datos: AsignarClienteIn,
     tenant_id: UUID = Depends(modulo_actual),
-    usuario: UsuarioActual = Depends(usuario_actual),
+    # Repartir leads es del equipo del negocio; un vendedor no se asigna ni
+    # le quita clientes a nadie.
+    usuario: UsuarioActual = Depends(negocio_actual),
 ):
     """
     Pone (o cambia) el vendedor de un cliente.
@@ -625,7 +715,11 @@ async def cambiar_estado(
     Mueve un lead de etapa, validando la transición contra la máquina de
     estados. El UPDATE y la anotación en la bitácora van en una sola
     transacción: no puede quedar un estado cambiado sin su registro.
+
+    Lo usa sobre todo el vendedor desde su app, y solo sobre sus propios
+    leads. Gerencia y 'member' pueden mover cualquiera.
     """
+    propio = await _vendedor_propio(usuario)
     if not pipeline_estados.es_estado_valido(datos.estado):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -642,7 +736,7 @@ async def cambiar_estado(
         # en uno al que no se llegaba desde ahí.
         actual = await conn.fetchrow(
             """
-            SELECT id, estado FROM client_pipeline
+            SELECT id, estado, vendedor_id FROM client_pipeline
             WHERE tenant_id = $1 AND user_id = $2
             FOR UPDATE
             """,
@@ -655,6 +749,10 @@ async def cambiar_estado(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Este cliente no está en el embudo",
             )
+
+        # Con el candado ya tomado: si gerencia lo reasignó un instante
+        # antes, el vendedor anterior ya no lo puede mover.
+        _solo_lo_suyo(propio, actual["vendedor_id"])
 
         estado_anterior = actual["estado"]
 
@@ -743,7 +841,22 @@ async def cambiar_estado(
 async def historial_cliente(
     user_id: UUID,
     tenant_id: UUID = Depends(modulo_actual),
+    usuario: UsuarioActual = Depends(usuario_actual),
 ):
+    propio = await _vendedor_propio(usuario)
+    if propio is not None:
+        dueno = await fetch_one(
+            "SELECT vendedor_id FROM client_pipeline WHERE tenant_id = $1 AND user_id = $2",
+            tenant_id,
+            user_id,
+        )
+        if dueno is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Este cliente no está en el embudo",
+            )
+        _solo_lo_suyo(propio, dueno["vendedor_id"])
+
     filas = await fetch_all(
         """
         SELECT h.estado_anterior, h.estado_nuevo, h.vendedor_id,
@@ -766,6 +879,7 @@ async def historial_cliente(
 @router_tenants.get("/{tenant_id}/pipeline", response_model=list[PipelineOut])
 async def pipeline_completo(
     tenant_id: UUID = Depends(modulo_en_ruta),
+    _: UsuarioActual = Depends(negocio_actual),
     estado: str | None = Query(None),
     vendedor_id: UUID | None = Query(None),
     sin_vendedor: bool = Query(False, description="Solo leads sin vendedor asignado"),
@@ -795,6 +909,7 @@ async def pipeline_completo(
 @router_tenants.get("/{tenant_id}/metricas", response_model=MetricasPipelineOut)
 async def metricas_pipeline(
     tenant_id: UUID = Depends(modulo_en_ruta),
+    _: UsuarioActual = Depends(negocio_actual),
     desde: datetime | None = Query(
         None, description="Inclusivo. Filtra por fecha de alta en el embudo, no por actualizado_en"
     ),
@@ -960,6 +1075,7 @@ def _restar_meses(fecha: datetime, meses: int) -> datetime:
 @router_tenants.get("/{tenant_id}/metricas/tendencia", response_model=TendenciaPipelineOut)
 async def tendencia_pipeline(
     tenant_id: UUID = Depends(modulo_en_ruta),
+    _: UsuarioActual = Depends(negocio_actual),
     meses: int = Query(12, ge=1, le=24, description="Cuántos meses hacia atrás, incluido el actual"),
 ):
     """
@@ -1034,6 +1150,7 @@ _ETAPAS_WATERFALL = tuple(e for e in pipeline_estados.ESTADOS if e != "perdido")
 @router_tenants.get("/{tenant_id}/metricas/conversion", response_model=ConversionPipelineOut)
 async def conversion_pipeline(
     tenant_id: UUID = Depends(modulo_en_ruta),
+    _: UsuarioActual = Depends(negocio_actual),
     desde: datetime | None = Query(None, description="Inclusivo. Filtra por fecha de alta en el embudo"),
     hasta: datetime | None = Query(None, description="Exclusivo. Ver `desde`"),
 ):
@@ -1091,10 +1208,10 @@ async def conversion_pipeline(
 # ============================================================
 # CREAR CLIENTE MANUALMENTE EN EL EMBUDO
 # ============================================================
-@router_clientes.post("", response_model=PipelineOut, status_code=201)
+@router_pipeline.post("", response_model=PipelineOut, status_code=201)
 async def crear_cliente(
     datos: CrearClienteIn,
-    usuario: UsuarioActual = Depends(usuario_actual),
+    usuario: UsuarioActual = Depends(negocio_actual),
 ):
     """
     Crea un nuevo cliente en el embudo con asignación automática según

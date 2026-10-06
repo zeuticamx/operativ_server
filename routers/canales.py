@@ -20,7 +20,13 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from config import settings
-from deps import requiere_herramienta, tenant_actual
+from deps import (
+    UsuarioActual,
+    gerencia_actual,
+    negocio_actual,
+    requiere_herramienta,
+    tenant_actual,
+)
 from session import execute, fetch_all, fetch_one
 from schemas import (
     ActivarCanalesIn,
@@ -37,7 +43,9 @@ log = logging.getLogger("operativai.canales")
 router = APIRouter(
     prefix="/canales",
     tags=["canales"],
-    dependencies=[Depends(requiere_herramienta("agente"))],
+    # Ver el estado de los canales: todo el equipo del negocio. Conectar,
+    # activar o desconectar: solo gerencia (cada endpoint lo pide).
+    dependencies=[Depends(negocio_actual), Depends(requiere_herramienta("agente"))],
 )
 
 
@@ -66,6 +74,7 @@ async def listar_canales(tenant_id: UUID = Depends(tenant_actual)):
 async def conectar_meta(
     datos: ConectarMetaIn,
     tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(gerencia_actual),
 ):
     redirect_uri = datos.redirect_uri or settings.META_REDIRECT_URI
     if not redirect_uri:
@@ -101,7 +110,10 @@ async def conectar_meta(
 # Paso 2: qué páginas autorizó
 # ============================================================
 @router.get("/meta/paginas", response_model=list[PaginaDisponible])
-async def listar_paginas(tenant_id: UUID = Depends(tenant_actual)):
+async def listar_paginas(
+    tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(gerencia_actual),
+):
     conexion = await fetch_one("SELECT * FROM get_meta_connection($1)", tenant_id)
     if conexion is None:
         raise HTTPException(
@@ -144,6 +156,7 @@ async def listar_paginas(tenant_id: UUID = Depends(tenant_actual)):
 async def activar_canales(
     datos: ActivarCanalesIn,
     tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(gerencia_actual),
 ):
     conexion = await fetch_one("SELECT * FROM get_meta_connection($1)", tenant_id)
     if conexion is None:
@@ -235,6 +248,7 @@ async def activar_canales(
 async def conectar_whatsapp(
     datos: ConectarWhatsAppIn,
     tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(gerencia_actual),
 ):
     """
     Registra qué línea de Kontesta corresponde a este tenant.
@@ -298,7 +312,10 @@ async def conectar_whatsapp(
 # WhatsApp (vía NeuroAPI Connect Sessions — Embedded Signup)
 # ============================================================
 @router.post("/whatsapp/neuroapi/iniciar", response_model=IniciarNeuroApiConnectOut)
-async def iniciar_neuroapi_connect(tenant_id: UUID = Depends(tenant_actual)):
+async def iniciar_neuroapi_connect(
+    tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(gerencia_actual),
+):
     """
     Crea una NeuroAPI Connect Session y devuelve la URL a la que el frontend
     debe redirigir para que el negocio autorice su propia cuenta de WhatsApp
@@ -341,6 +358,7 @@ async def iniciar_neuroapi_connect(tenant_id: UUID = Depends(tenant_actual)):
 async def desconectar_canal(
     channel_type: str,
     tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(gerencia_actual),
 ):
     if channel_type not in ("facebook", "instagram", "whatsapp"):
         raise HTTPException(

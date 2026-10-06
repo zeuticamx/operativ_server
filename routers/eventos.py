@@ -15,6 +15,7 @@ import base64
 import binascii
 import logging
 import secrets
+from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -24,7 +25,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from services.acceso_pagos import acceso_pagos
 from services.asignacion import asignar_vendedor_automatico
 from deps import llamada_interna
-from realtime import broadcast_alerta
+from realtime import avisar_a_proveedor, broadcast_alerta
 from services import calendario, creditos
 from services.calendario import actor_desde_chat, verificar_calendario_activo
 from services.gerencia import registrar_uso_tokens
@@ -52,6 +53,7 @@ from schemas import (
     UsoTokensOut,
 )
 from services import adjuntos as adjuntos_svc
+from services import conversaciones as conversaciones_svc
 from session import fetch_one, transaccion
 
 log = logging.getLogger("operativai.eventos")
@@ -243,15 +245,19 @@ async def conversacion_transferida(datos: ConversacionTransferidaIn):
     if datos.motivo:
         detalle.append(f"— {datos.motivo}")
 
-    await broadcast_alerta(
-        datos.tenant_id,
+    alerta = (
         "conversacion_transferida",
         "Cliente esperando atención humana",
         " ".join(detalle),
-        datos={
-            "conversation_id": str(datos.conversation_id),
-            "canal": datos.canal,
-        },
+        {"conversation_id": str(datos.conversation_id), "canal": datos.canal},
+    )
+    await broadcast_alerta(datos.tenant_id, *alerta)
+    # Y al proveedor dueño del chat (su cliente), que no está en la room
+    # del negocio.
+    await avisar_a_proveedor(
+        datos.tenant_id,
+        await conversaciones_svc.cuenta_del_proveedor(datos.conversation_id),
+        *alerta,
     )
     return ConversacionTransferidaOut(registrado=True)
 
@@ -287,11 +293,32 @@ async def calendario_disponibilidad(datos: ConsultarDisponibilidadIn):
     tiene sesión de portal para ponerlo en la ruta).
     """
     await verificar_calendario_activo(datos.tenant_id, desde_chat=True)
+
+    # Un rango en el pasado no es "sin disponibilidad": es un error del
+    # agente (p. ej. se equivocó de año). Con 422 y la fecha de hoy en el
+    # mensaje puede corregirse en vez de decirle al cliente que no hay lugar.
+    tenant_servicios = await get_tenant_servicios(datos.tenant_id)
+    hoy = datetime.now(ZoneInfo(tenant_servicios.zona_horaria)).date()
+    if datos.fecha_hasta < datos.fecha_desde:
+        raise HTTPException(
+            status_code=422,
+            detail="fecha_hasta no puede ser anterior a fecha_desde.",
+        )
+    if datos.fecha_hasta < hoy:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"El rango {datos.fecha_desde} a {datos.fecha_hasta} ya pasó. "
+                f"Hoy es {hoy} ({tenant_servicios.zona_horaria}); consulta fechas "
+                f"desde hoy en formato YYYY-MM-DD."
+            ),
+        )
+
     slots = await calendario.consultar_disponibilidad(
         datos.tenant_id,
         datos.servicio_id,
         datos.proveedor_id,
-        datos.fecha_desde,
+        max(datos.fecha_desde, hoy),
         datos.fecha_hasta,
     )
     return ConsultarDisponibilidadOut(
@@ -348,16 +375,19 @@ async def calendario_crear_reserva(datos: CrearReservaEventoIn):
     if servicio and servicio.precio is not None:
         detalle.append(f"— ${servicio.precio:.2f}")
 
-    await broadcast_alerta(
-        datos.tenant_id,
+    alerta = (
         "reserva_creada",
         "Nueva reserva",
         " ".join(detalle),
-        datos={
+        {
             "reserva_id": str(reserva.id),
             "proveedor_id": str(reserva.proveedor_id),
             "hora_inicio": reserva.hora_inicio.isoformat(),
         },
+    )
+    await broadcast_alerta(datos.tenant_id, *alerta)
+    await avisar_a_proveedor(
+        datos.tenant_id, await calendario.cuenta_del_proveedor(reserva.proveedor_id), *alerta
     )
     return CrearReservaEventoOut(creado=True, reserva=ReservaOut(**vars(reserva)))
 
@@ -372,12 +402,15 @@ async def calendario_cancelar_reserva(datos: CancelarReservaEventoIn):
     if reserva is None:
         raise HTTPException(status_code=404, detail="Reserva no encontrada")
 
-    await broadcast_alerta(
-        datos.tenant_id,
+    alerta = (
         "reserva_cancelada",
         "Reserva cancelada",
         f"Se canceló la cita de {reserva.cliente_nombre or 'un cliente'} con {reserva.proveedor_nombre}",
-        datos={"reserva_id": str(reserva.id)},
+        {"reserva_id": str(reserva.id)},
+    )
+    await broadcast_alerta(datos.tenant_id, *alerta)
+    await avisar_a_proveedor(
+        datos.tenant_id, await calendario.cuenta_del_proveedor(reserva.proveedor_id), *alerta
     )
     return ReservaOut(**vars(reserva))
 

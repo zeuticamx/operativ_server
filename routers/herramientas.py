@@ -10,7 +10,14 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.concurrency import run_in_threadpool
 
-from deps import UsuarioActual, requiere_herramienta, tenant_actual, usuario_actual
+from deps import (
+    UsuarioActual,
+    gerencia_actual,
+    negocio_actual,
+    requiere_herramienta,
+    tenant_actual,
+    usuario_actual,
+)
 from session import execute, fetch_all, fetch_one
 from schemas import (
     ActualizarHerramientaIn,
@@ -27,7 +34,9 @@ from services import google_tools, herramientas_calendario
 router = APIRouter(
     prefix="/herramientas",
     tags=["herramientas"],
-    dependencies=[Depends(requiere_herramienta("herramientas"))],
+    # Ver la lista: todo el equipo del negocio. Conectar, editar o borrar:
+    # solo gerencia (cada endpoint lo pide).
+    dependencies=[Depends(negocio_actual), Depends(requiere_herramienta("herramientas"))],
 )
 
 
@@ -145,6 +154,7 @@ async def _tool_key_disponible(tenant_id: UUID, base: str) -> str:
 async def conectar_sheet(
     datos: ConectarGoogleSheetIn,
     tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(gerencia_actual),
 ):
     try:
         spreadsheet_id = google_tools.extraer_id_de_url(datos.url)
@@ -199,6 +209,7 @@ async def conectar_sheet(
 async def conectar_doc(
     datos: ConectarGoogleDocIn,
     tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(gerencia_actual),
 ):
     try:
         document_id = google_tools.extraer_id_de_url(datos.url)
@@ -247,7 +258,11 @@ async def conectar_doc(
 
 
 @router.post("/{tool_key}/verificar", response_model=HerramientaOut)
-async def verificar(tool_key: str, tenant_id: UUID = Depends(tenant_actual)):
+async def verificar(
+    tool_key: str,
+    tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(gerencia_actual),
+):
     fila = await fetch_one(
         """
         SELECT tool_type, display_name, description, is_enabled, config
@@ -312,6 +327,7 @@ async def actualizar(
     tool_key: str,
     datos: ActualizarHerramientaIn,
     tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(gerencia_actual),
 ):
     fila = await fetch_one(
         """
@@ -348,7 +364,11 @@ async def actualizar(
 
 
 @router.delete("/{tool_key}", status_code=204)
-async def eliminar(tool_key: str, tenant_id: UUID = Depends(tenant_actual)):
+async def eliminar(
+    tool_key: str,
+    tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(gerencia_actual),
+):
     # Las del calendario las vuelve a crear el sistema (al encender el
     # módulo o al arrancar): borrarlas no serviría. Pausarlas sí.
     if herramientas_calendario.es_gestionada(tool_key):

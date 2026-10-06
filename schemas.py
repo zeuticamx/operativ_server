@@ -502,6 +502,18 @@ class VendedorOut(BaseModel):
     clientes_activos: int = 0
 
 
+class CupoOut(BaseModel):
+    """
+    Fichas activas contra el tope del plan: planes.max_vendedores o
+    planes.max_proveedores (services/acceso_plan.cupo).
+    """
+    plan: str | None
+    # None = sin tope.
+    maximo: int | None
+    activos: int
+
+
+
 class ReasignacionOut(BaseModel):
     """Resultado de POST /vendedores/{id}/reasignar-pendientes."""
     vendedor_id: UUID
@@ -1099,6 +1111,7 @@ class PlanOut(BaseModel):
     precio_annual: Decimal | None
     # None = sin tope (enterprise).
     max_vendedores: int | None
+    max_proveedores: int | None = None
     max_leads_mensuales: int | None
     creditos_incluidos_mensual: Decimal
     agente_ia_activo: bool
@@ -1696,6 +1709,7 @@ class PlanGerenciaOut(BaseModel):
     precio_monthly: Decimal
     precio_annual: Decimal | None
     max_vendedores: int | None
+    max_proveedores: int | None
     max_leads_mensuales: int | None
     creditos_incluidos_mensual: Decimal
     agente_ia_activo: bool
@@ -1723,6 +1737,8 @@ class PlanCrearIn(BaseModel):
     precio_annual: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
     # None = sin tope (plan tipo enterprise).
     max_vendedores: int | None = Field(default=None, ge=0, le=32767)
+    # Proveedores activos del calendario (37_proveedor_cuenta.sql). None = sin tope.
+    max_proveedores: int | None = Field(default=None, ge=0, le=32767)
     max_leads_mensuales: int | None = Field(default=None, ge=0)
     creditos_incluidos_mensual: Decimal = Field(
         default=Decimal(100), ge=0, max_digits=12, decimal_places=2
@@ -1757,6 +1773,7 @@ class PlanActualizarIn(BaseModel):
     precio_monthly: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
     precio_annual: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
     max_vendedores: int | None = Field(default=None, ge=0, le=32767)
+    max_proveedores: int | None = Field(default=None, ge=0, le=32767)
     max_leads_mensuales: int | None = Field(default=None, ge=0)
     creditos_incluidos_mensual: Decimal | None = Field(
         default=None, ge=0, max_digits=12, decimal_places=2
@@ -1813,6 +1830,8 @@ class ProveedorOut(BaseModel):
     activo: bool
     orden: int
     creado_en: datetime
+    # Cuenta del portal ligada (37_proveedor_cuenta.sql). None = sin acceso.
+    portal_user_id: UUID | None = None
 
 
 class ServicioCrearIn(BaseModel):
@@ -2167,3 +2186,98 @@ class ReporteGerenciaOut(BaseModel):
 
 class ReporteEstadoIn(BaseModel):
     estado: EstadoReporte
+
+
+# ============================================================
+# EQUIPO: cuentas de member/vendedor por invitación (routers/equipo.py)
+# ============================================================
+RolInvitable = Literal["member", "vendedor", "proveedor"]
+
+
+class InvitacionCrearIn(BaseModel):
+    email: EmailStr
+    role: RolInvitable
+    # La cuenta se liga a una ficha: vendedor_id para 'vendedor',
+    # proveedor_id (calendario) para 'proveedor'. 'member' no lleva ninguna.
+    vendedor_id: UUID | None = None
+    proveedor_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def _ficha_segun_rol(self) -> "InvitacionCrearIn":
+        if (self.role == "vendedor") != (self.vendedor_id is not None):
+            raise ValueError("vendedor_id va solo, y siempre, en una invitación de vendedor")
+        if (self.role == "proveedor") != (self.proveedor_id is not None):
+            raise ValueError("proveedor_id va solo, y siempre, en una invitación de proveedor")
+        return self
+
+
+class InvitacionOut(BaseModel):
+    id: UUID
+    email: str
+    role: RolInvitable
+    vendedor_id: UUID | None
+    vendedor_nombre: str | None
+    proveedor_id: UUID | None = None
+    proveedor_nombre: str | None = None
+    creada_en: datetime
+    expira_en: datetime
+    # Sigue listada para que el dueño la reenvíe, pero el enlace ya no sirve.
+    vencida: bool
+
+
+class InvitacionCreadaOut(InvitacionOut):
+    """
+    Solo al crear o reenviar: el enlace en claro no se guarda, así que esta
+    es la única vez que se puede devolver. Sirve para que el dueño lo mande
+    por WhatsApp si el correo no llega (`correo_enviado` false).
+    """
+    enlace: str
+    correo_enviado: bool
+
+
+class UsuarioEquipoOut(BaseModel):
+    id: UUID
+    email: str
+    role: str
+    activo: bool
+    nombre: str | None
+    vendedor_id: UUID | None
+    vendedor_nombre: str | None
+    proveedor_id: UUID | None = None
+    proveedor_nombre: str | None = None
+    ultimo_acceso: datetime | None
+    # Quien está mirando: el portal no le ofrece desactivarse a sí mismo.
+    es_tu_cuenta: bool
+
+
+class UsuarioEquipoActualizarIn(BaseModel):
+    activo: bool
+
+
+class InvitacionTokenIn(BaseModel):
+    # El token es de 43 caracteres (32 bytes en base64url); el margen es
+    # solo para no rechazar por largo antes de buscarlo.
+    token: str = Field(min_length=20, max_length=200)
+
+
+class InvitacionInfoOut(BaseModel):
+    """Lo que ve el invitado antes de aceptar: a qué negocio y con qué rol."""
+    email: str
+    role: RolInvitable
+    nombre_negocio: str
+    vendedor_nombre: str | None
+    proveedor_nombre: str | None = None
+    expira_en: datetime
+
+
+class AceptarInvitacionIn(InvitacionTokenIn):
+    password: str = Field(min_length=8, max_length=128)
+    # Mismo criterio que RegistroIn: sin aceptación no se crea la cuenta.
+    acepta_terminos: Annotated[bool, Field(strict=True)]
+
+    @field_validator("acepta_terminos")
+    @classmethod
+    def _debe_aceptar(cls, v: bool) -> bool:
+        if v is not True:
+            raise ValueError("Debes aceptar los Términos y Condiciones para crear tu cuenta")
+        return v

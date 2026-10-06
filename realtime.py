@@ -40,6 +40,7 @@ import jwt
 import socketio
 
 from config import settings
+from deps import ROLES_NEGOCIO
 from routers.alertas import crear_alerta
 from security import decodificar_token
 from session import execute, fetch_all, fetch_one
@@ -62,6 +63,9 @@ _solo_lectura: set[str] = set()
 # pueden pedir, con `ver_tenant`, sumarse a la room de un tenant que no es
 # el suyo — ver el panel de /gerencia/conversaciones.
 _gerencia_plataforma: set[str] = set()
+# sids de vendedores: no están en la room del negocio, así que tampoco
+# pueden marcar leídas las alertas del negocio, solo las suyas.
+_solo_personales: set[str] = set()
 
 
 def _sala(tenant_id: UUID) -> str:
@@ -165,7 +169,15 @@ async def connect(sid: str, environ: dict, auth: Optional[dict] = None) -> None:
 
     _conexiones[sid] = tenant_id
     _usuarios[sid] = usuario["id"]
-    await sio.enter_room(sid, _sala(tenant_id))
+    # La room del negocio lleva las alertas de todos (leads con nombre,
+    # reservas, conversaciones que piden una persona): el vendedor ve solo
+    # lo suyo, así que se queda únicamente con su room personal. Mismo
+    # criterio que deps.ROLES_NEGOCIO en HTTP.
+    ve_negocio = usuario["role"] in ROLES_NEGOCIO
+    if ve_negocio:
+        await sio.enter_room(sid, _sala(tenant_id))
+    else:
+        _solo_personales.add(sid)
     await sio.enter_room(sid, _sala_usuario(usuario["id"]))
     logger.info("WS conectado: sid=%s tenant=%s role=%s", sid, tenant_id, usuario["role"])
 
@@ -176,12 +188,13 @@ async def connect(sid: str, environ: dict, auth: Optional[dict] = None) -> None:
         SELECT id, tenant_id, tipo, titulo, mensaje, datos, leido, creado_en
         FROM alertas
         WHERE tenant_id = $1 AND leido = false
-          AND (portal_user_id IS NULL OR portal_user_id = $2)
+          AND ((portal_user_id IS NULL AND $3) OR portal_user_id = $2)
         ORDER BY creado_en DESC
         LIMIT 10
         """,
         tenant_id,
         usuario["id"],
+        ve_negocio,
     )
     await sio.emit("alertas_pendientes", [_serializar(f) for f in pendientes], room=sid)
 
@@ -192,6 +205,7 @@ async def disconnect(sid: str) -> None:
     _usuarios.pop(sid, None)
     _solo_lectura.discard(sid)
     _gerencia_plataforma.discard(sid)
+    _solo_personales.discard(sid)
     logger.info("WS desconectado: sid=%s tenant=%s", sid, tenant_id)
 
 
@@ -241,17 +255,18 @@ async def marcar_leida(sid: str, data: Optional[dict]) -> None:
         return
 
     # Una personal solo la marca su dueño; la del negocio, cualquiera de la
-    # room (como siempre).
+    # room (como siempre) — el vendedor no está en esa room.
     fila = await fetch_one(
         """
         UPDATE alertas SET leido = true
          WHERE id = $1 AND tenant_id = $2
-           AND (portal_user_id IS NULL OR portal_user_id = $3)
+           AND ((portal_user_id IS NULL AND $4) OR portal_user_id = $3)
         RETURNING portal_user_id
         """,
         alerta_id,
         tenant_id,
         _usuarios.get(sid),
+        sid not in _solo_personales,
     )
     if fila is None:
         return
@@ -293,6 +308,21 @@ async def broadcast_alerta(
     )
 
 
+async def _salas_de_conversacion(tenant_id: UUID, conversation_id: UUID) -> list[str]:
+    """
+    La room del negocio y, si la conversación es de un cliente de un
+    proveedor con cuenta, la room personal de ese proveedor (que no está en
+    la del negocio: ver `connect`).
+    """
+    from services.conversaciones import cuenta_del_proveedor
+
+    salas = [_sala(tenant_id)]
+    proveedor = await cuenta_del_proveedor(conversation_id)
+    if proveedor is not None:
+        salas.append(_sala_usuario(proveedor))
+    return salas
+
+
 async def emit_mensaje(tenant_id: UUID, conversation_id: UUID, mensaje: dict[str, Any]) -> None:
     """
     Empuja un mensaje nuevo (respuesta manual de handoff) a quien tenga
@@ -303,7 +333,7 @@ async def emit_mensaje(tenant_id: UUID, conversation_id: UUID, mensaje: dict[str
     await sio.emit(
         "mensaje_nuevo",
         {"conversation_id": str(conversation_id), **mensaje},
-        room=_sala(tenant_id),
+        room=await _salas_de_conversacion(tenant_id, conversation_id),
     )
 
 
@@ -312,5 +342,24 @@ async def emit_conversacion_estado(tenant_id: UUID, conversation_id: UUID, statu
     await sio.emit(
         "conversacion_actualizada",
         {"conversation_id": str(conversation_id), "status": status},
-        room=_sala(tenant_id),
+        room=await _salas_de_conversacion(tenant_id, conversation_id),
     )
+
+
+async def avisar_a_proveedor(
+    tenant_id: UUID,
+    portal_user_id: Optional[UUID],
+    tipo: str,
+    titulo: str,
+    mensaje: str,
+    datos: Optional[dict] = None,
+) -> None:
+    """
+    Copia personal de una alerta del negocio para el proveedor al que le
+    toca (su cita, el chat de su cliente). Con `portal_user_id` None (el
+    proveedor no tiene cuenta, o está inactiva) no hace nada. La alerta del
+    negocio se manda aparte, como siempre, con broadcast_alerta.
+    """
+    if portal_user_id is None:
+        return
+    await broadcast_alerta(tenant_id, tipo, titulo, mensaje, datos, portal_user_id=portal_user_id)

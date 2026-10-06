@@ -153,6 +153,30 @@ async def test_disponibilidad_devuelve_los_slots_del_horario(
     assert all(s["proveedor_id"] == proveedor["id"] for s in body["slots"])
 
 
+@pytest.mark.asyncio
+async def test_disponibilidad_rechaza_rango_en_el_pasado(
+    http_client, tenant_y_usuario, headers_autenticado, monkeypatch
+):
+    tenant_id = tenant_y_usuario["tenant_id"]
+    await _encender_calendario(tenant_id)
+    servicio = await _crear_servicio(http_client, headers_autenticado, tenant_id, duracion=30)
+
+    headers = _cabeceras_internas(monkeypatch)
+    ayer = date.today() - timedelta(days=2)
+    r = await http_client.post(
+        "/api/eventos/calendario/disponibilidad",
+        json={
+            "tenant_id": str(tenant_id),
+            "servicio_id": servicio["id"],
+            "fecha_desde": str(ayer),
+            "fecha_hasta": str(ayer),
+        },
+        headers=headers,
+    )
+    assert r.status_code == 422
+    assert "Hoy es" in r.json()["detail"]
+
+
 # ------------------------------------------------------------
 # Crear reserva (n8n) — idempotencia y traslape
 # ------------------------------------------------------------

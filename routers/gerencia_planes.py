@@ -44,7 +44,7 @@ router = APIRouter(
 # alias a los nombres de columna que espera PlanGerenciaOut.
 _COLUMNAS = """
     nombre, descripcion, precio_monthly, precio_annual,
-    max_vendedores, max_leads_mensuales, creditos_incluidos_mensual,
+    max_vendedores, max_proveedores, max_leads_mensuales, creditos_incluidos_mensual,
     agente_ia_activo, gestion_vendedores_activo,
     herramientas_activo, crm_campo_activo, calendario_activo, activo, orden,
     stripe_price_id,
@@ -82,8 +82,8 @@ async def crear_plan(
                      max_vendedores, max_leads_mensuales, creditos_incluidos_mensual,
                      agente_ia_activo, gestion_vendedores_activo,
                      herramientas_activo, crm_campo_activo, calendario_activo,
-                     activo, orden, stripe_price_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                     activo, orden, stripe_price_id, max_proveedores)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
                 """,
                 datos.nombre,
                 datos.descripcion,
@@ -100,6 +100,7 @@ async def crear_plan(
                 datos.activo,
                 datos.orden,
                 datos.stripe_price_id,
+                datos.max_proveedores,
             )
         except asyncpg.UniqueViolationError:
             raise HTTPException(
@@ -158,6 +159,9 @@ async def actualizar_plan(
             "max_vendedores": (
                 anterior["max_vendedores"] if datos.max_vendedores is None else datos.max_vendedores
             ),
+            "max_proveedores": (
+                anterior["max_proveedores"] if datos.max_proveedores is None else datos.max_proveedores
+            ),
             "max_leads_mensuales": (
                 anterior["max_leads_mensuales"]
                 if datos.max_leads_mensuales is None
@@ -209,6 +213,7 @@ async def actualizar_plan(
                 activo = $13,
                 orden = $14,
                 stripe_price_id = $15,
+                max_proveedores = $16,
                 updated_at = NOW()
             WHERE nombre = $1
             """,
@@ -227,6 +232,7 @@ async def actualizar_plan(
             nuevo["activo"],
             nuevo["orden"],
             nuevo["stripe_price_id"],
+            nuevo["max_proveedores"],
         )
 
         cambios = datos.model_dump(exclude_none=True)

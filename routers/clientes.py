@@ -1,9 +1,10 @@
 """
 Cartera de clientes del CRM de campo.
 
-Un vendedor solo ve y toca su propia cartera; gerencia ve la del negocio
-entero y es la única que da de alta o edita. El `tenant_id` sale del
-usuario autenticado, nunca del cliente HTTP.
+Un vendedor solo ve y toca su propia cartera, y puede dar de alta en ella
+(el cliente nuevo le queda asignado a él). Editar, reasignar y desasignar
+siguen siendo de gerencia, que además ve la cartera del negocio entero.
+El `tenant_id` sale del usuario autenticado, nunca del cliente HTTP.
 """
 
 from uuid import UUID
@@ -94,10 +95,26 @@ async def detalle(
 @router.post("", response_model=ClienteOut, status_code=201)
 async def crear(
     datos: ClienteCrearIn,
-    acceso: AccesoCRM = Depends(exigir_gerencia_crm),
+    acceso: AccesoCRM = Depends(acceso_crm),
 ):
-    if datos.vendedor_id is not None:
-        await vendedor_del_tenant(datos.vendedor_id, acceso.tenant_id)
+    """
+    Da de alta un cliente en la cartera.
+
+    Un vendedor puede crearlo y le queda asignado a él: el `vendedor_id` del
+    body se ignora, por lo mismo que en el listado — si se respetara, serviría
+    para colgarle cartera a un compañero. Gerencia sí elige a quién se lo
+    asigna, o lo deja sin asignar para repartirlo después.
+
+    El vendedor que viene de `acceso` ya salió de `vendedor_actual`, que releyó
+    su ficha y comprobó el tenant, así que ese id no se vuelve a validar; el que
+    manda gerencia sí, porque es un UUID del cliente HTTP.
+    """
+    if acceso.es_vendedor:
+        vendedor_id = acceso.vendedor_id
+    else:
+        vendedor_id = datos.vendedor_id
+        if vendedor_id is not None:
+            await vendedor_del_tenant(vendedor_id, acceso.tenant_id)
 
     creado = await fetch_one(
         """
@@ -110,7 +127,7 @@ async def crear(
         RETURNING id
         """,
         acceso.tenant_id,
-        datos.vendedor_id,
+        vendedor_id,
         datos.nombre_negocio,
         datos.contacto_nombre,
         datos.telefono,

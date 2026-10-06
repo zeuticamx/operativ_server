@@ -32,7 +32,7 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, status
 
 from config import settings
-from deps import UsuarioActual, gerencia_actual, tenant_actual, usuario_actual
+from deps import UsuarioActual, gerencia_actual, negocio_actual, tenant_actual, usuario_actual
 from schemas import (
     AccesoPlanOut,
     CatalogoPagosOut,
@@ -114,12 +114,15 @@ def _headers_mp() -> dict[str, str]:
 # CATÁLOGO
 # ============================================================
 @router.get("/catalogo", response_model=CatalogoPagosOut)
-async def catalogo(_tenant_id: UUID = Depends(tenant_actual)) -> CatalogoPagosOut:
+async def catalogo(
+    _tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(negocio_actual),
+) -> CatalogoPagosOut:
     """Planes y paquetes de créditos para pintar la pantalla de suscripción."""
     filas_planes = await fetch_all(
         """
         SELECT nombre, descripcion, precio_monthly, precio_annual,
-               max_vendedores, max_leads_mensuales, creditos_incluidos_mensual,
+               max_vendedores, max_proveedores, max_leads_mensuales, creditos_incluidos_mensual,
                agente_ia_activo, gestion_vendedores_activo,
                herramientas_activo, crm_campo_activo, calendario_activo
         FROM planes
@@ -531,7 +534,10 @@ async def webhook(
 # CONSULTAS DEL PORTAL
 # ============================================================
 @router.get("/suscripcion", response_model=SuscripcionOut)
-async def suscripcion(tenant_id: UUID = Depends(tenant_actual)) -> SuscripcionOut:
+async def suscripcion(
+    tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(negocio_actual),
+) -> SuscripcionOut:
     """Estado de cobros del negocio: plan vigente y saldo de créditos."""
     fila = await fetch_one(
         """
@@ -615,6 +621,10 @@ async def acceso(tenant_id: UUID = Depends(tenant_actual)) -> AccesoPlanOut:
     Qué herramientas del portal puede usar el negocio ahora (ver
     services/acceso_plan.py). Nunca responde 402: es justo lo que el portal
     consulta para explicar un bloqueo, así que tiene que contestar siempre.
+
+    Abierto a todos los roles, vendedor incluido (a diferencia de
+    /suscripcion o /historial): el portal reducido del vendedor también
+    necesita saber qué pantallas tapar.
     """
     actual = await acceso_plan(tenant_id)
     catalogo = await herramientas_por_plan()
@@ -634,7 +644,10 @@ async def acceso(tenant_id: UUID = Depends(tenant_actual)) -> AccesoPlanOut:
 
 
 @router.get("/historial", response_model=list[TransaccionOut])
-async def historial(tenant_id: UUID = Depends(tenant_actual)) -> list[TransaccionOut]:
+async def historial(
+    tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(negocio_actual),
+) -> list[TransaccionOut]:
     """Los últimos cobros del negocio, del más reciente al más viejo."""
     filas = await fetch_all(
         """

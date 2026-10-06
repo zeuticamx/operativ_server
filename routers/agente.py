@@ -4,14 +4,21 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from deps import requiere_herramienta, tenant_actual
+from deps import (
+    UsuarioActual,
+    gerencia_actual,
+    negocio_actual,
+    requiere_herramienta,
+    tenant_actual,
+)
 from session import fetch_one
 from schemas import AgenteConfigIn, AgenteConfigOut
 
 router = APIRouter(
     prefix="/agente",
     tags=["agente"],
-    dependencies=[Depends(requiere_herramienta("agente"))],
+    # Leer la config: todo el equipo del negocio. Cambiarla: solo gerencia.
+    dependencies=[Depends(negocio_actual), Depends(requiere_herramienta("agente"))],
 )
 
 # Lista blanca: si un tenant guarda un nombre de modelo inventado, el
@@ -49,6 +56,7 @@ async def obtener(tenant_id: UUID = Depends(tenant_actual)):
 async def actualizar(
     datos: AgenteConfigIn,
     tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(gerencia_actual),
 ):
     if datos.model and datos.model not in MODELOS_PERMITIDOS:
         raise HTTPException(

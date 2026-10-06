@@ -143,6 +143,16 @@ class Settings:
         os.getenv("PERFIL_RECORDATORIO_INTERVALO_HORAS", "1")
     )
 
+    # Citas vencidas (jobs/reservas_background.py): una cita 'confirmada'
+    # cuya hora de fin ya pasó (más la gracia) se da por 'no_asistio'. Se
+    # puede corregir a 'completada' después, desde el portal.
+    RESERVAS_VENCIDAS_INTERVALO_MINUTOS: int = int(
+        os.getenv("RESERVAS_VENCIDAS_INTERVALO_MINUTOS", "15")
+    )
+    RESERVAS_VENCIDAS_GRACIA_MINUTOS: int = int(
+        os.getenv("RESERVAS_VENCIDAS_GRACIA_MINUTOS", "0")
+    )
+
     # ---- Reportes de incidencias (services/reportes.py) ----
     # Tope por usuario y hora: un formulario abierto a todos los roles no
     # debe servir para inundar el buzón del equipo.
