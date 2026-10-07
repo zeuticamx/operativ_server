@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from routers import (
+    agenda,
     agente,
     alertas,
     auth,
@@ -117,6 +118,9 @@ app.include_router(clientes.router, prefix="/api")
 app.include_router(visitas.router, prefix="/api")
 app.include_router(tareas.router, prefix="/api")
 app.include_router(reportes.router, prefix="/api")
+# Agenda de ventas: tareas de campo + seguimientos del embudo en un solo
+# calendario. Lee de los dos módulos de arriba según cuál esté encendido.
+app.include_router(agenda.router, prefix="/api")
 
 # Módulo de calendarios: reservas para barberías/salones. Independiente de
 # los dos módulos de arriba, aunque comparte el mismo patrón de flag en

@@ -19,6 +19,7 @@ from fastapi import Depends, HTTPException, status
 
 from deps import (
     ROLES_GERENCIA,
+    ROLES_NEGOCIO,
     ROL_VENDEDOR,
     UsuarioActual,
     usuario_actual,
@@ -43,6 +44,9 @@ class AccesoCRM:
     es_gerencia: bool
     # Para dejar rastro de quién hizo qué en notas y comentarios.
     etiqueta: str
+    # La cuenta del portal detrás de la petición (bitácora de la agenda).
+    # Opcional para no obligar a los que arman un AccesoCRM a mano.
+    portal_user_id: Optional[UUID] = None
 
     @property
     def es_vendedor(self) -> bool:
@@ -66,6 +70,16 @@ async def acceso_crm(
             vendedor_id=v.id,
             es_gerencia=False,
             etiqueta=v.nombre,
+            portal_user_id=v.portal_user_id,
+        )
+
+    # Lista blanca, igual que deps.negocio_actual: un proveedor del
+    # calendario (o cualquier rol que se agregue mañana) no es "gerencia sin
+    # ficha" — sin esto caía en la rama de abajo y veía la cartera entera.
+    if usuario.role not in ROLES_NEGOCIO:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tu rol no tiene acceso al CRM del negocio",
         )
 
     if usuario.tenant_id is None:
@@ -79,6 +93,7 @@ async def acceso_crm(
         vendedor_id=None,
         es_gerencia=usuario.role in ROLES_GERENCIA,
         etiqueta=usuario.email,
+        portal_user_id=usuario.id,
     )
 
 
@@ -101,13 +116,24 @@ _COLUMNAS_CLIENTE = """
     c.id, c.tenant_id, c.vendedor_id, c.nombre_negocio, c.contacto_nombre,
     c.telefono, c.direccion, c.latitud, c.longitud,
     c.radio_tolerancia_metros, c.estado, c.prioridad, c.notas,
-    c.creado_en, c.actualizado_en
+    c.user_id, c.creado_en, c.actualizado_en
 """
 
 SELECT_CLIENTE = f"""
-    SELECT {_COLUMNAS_CLIENTE}, v.nombre AS vendedor_nombre
+    SELECT
+        {_COLUMNAS_CLIENTE},
+        v.nombre AS vendedor_nombre,
+        -- Solo para mostrar algo reconocible del lead vinculado, no para
+        -- decidir nada: lo mismo que arma leads_disponibles en routers/clientes.py.
+        NULLIF(NULLIF(TRIM(u.display_name), ''), 'null') AS lead_nombre,
+        COALESCE(
+            NULLIF(NULLIF(TRIM(u.whatsapp_id), ''), 'null'),
+            NULLIF(NULLIF(TRIM(u.instagram_id), ''), 'null'),
+            NULLIF(NULLIF(TRIM(u.facebook_id), ''), 'null')
+        ) AS lead_handle
     FROM clientes c
     LEFT JOIN vendedores v ON v.id = c.vendedor_id
+    LEFT JOIN users u ON u.id = c.user_id
 """
 
 

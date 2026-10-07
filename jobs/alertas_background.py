@@ -27,6 +27,8 @@ from jobs.perfil_background import JOB_ID as JOB_ID_PERFIL
 from jobs.perfil_background import job_recordatorio_perfil
 from jobs.reservas_background import JOB_ID as JOB_ID_RESERVAS
 from jobs.reservas_background import job_reservas_vencidas
+from jobs.tareas_background import JOB_ID as JOB_ID_TAREAS
+from jobs.tareas_background import job_tareas_vencidas
 from realtime import broadcast_alerta
 from services.correo import ErrorEnvioCorreo, enviar_resumen_alertas
 from services.pipeline_estados import ESTADOS_CERRADOS
@@ -258,6 +260,17 @@ def iniciar_scheduler() -> AsyncIOScheduler:
         minutes=settings.RESERVAS_VENCIDAS_INTERVALO_MINUTOS,
         id=JOB_ID_RESERVAS,
         name="Dar por no asistidas las citas vencidas",
+        max_instances=1,
+        coalesce=True,
+    )
+    # Tareas de seguimiento pendientes cuya fecha pasó -> 'vencida'
+    # (jobs/tareas_background.py).
+    scheduler.add_job(
+        job_tareas_vencidas,
+        "interval",
+        minutes=settings.TAREAS_VENCIDAS_INTERVALO_MINUTOS,
+        id=JOB_ID_TAREAS,
+        name="Marcar vencidas las tareas de seguimiento",
         max_instances=1,
         coalesce=True,
     )

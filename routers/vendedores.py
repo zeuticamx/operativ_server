@@ -102,7 +102,8 @@ _SELECT_PIPELINE = f"""
         {_HANDLE_CLIENTE} AS cliente_handle,
         p.vendedor_id,
         v.nombre AS vendedor_nombre,
-        p.estado, p.monto_estimado, p.motivo_perdida, p.actualizado_en
+        p.estado, p.monto_estimado, p.motivo_perdida, p.actualizado_en,
+        p.proximo_seguimiento, p.seguimiento_nota
     FROM client_pipeline p
     JOIN users u ON u.id = p.user_id
     LEFT JOIN vendedores v ON v.id = p.vendedor_id

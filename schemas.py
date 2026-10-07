@@ -565,6 +565,10 @@ class PipelineOut(BaseModel):
     # A dónde puede moverse desde acá. El frontend arma el selector con esto
     # en vez de repetir la máquina de estados.
     transiciones_posibles: list[str] = Field(default_factory=list)
+    # Próximo seguimiento agendado (sql/39_agenda.sql). Campos nuevos y
+    # opcionales: la app de vendedores que ya consume este schema los ignora.
+    proximo_seguimiento: datetime | None = None
+    seguimiento_nota: str | None = None
 
 
 class HistorialOut(BaseModel):
@@ -790,8 +794,31 @@ class ClienteOut(BaseModel):
     estado: str
     prioridad: str
     notas: str | None
+    # Enlace opcional con el embudo de chat: el `id` de un `users` que ya
+    # escribió por WhatsApp/IG/FB. None es lo normal — la mayoría de los
+    # clientes de campo nunca escribieron. Ver sql/38_clientes_lead.sql.
+    user_id: UUID | None
+    # Solo para mostrar algo reconocible del lead vinculado (nombre o
+    # whatsapp/ig/fb id); siempre None si user_id es None.
+    lead_nombre: str | None = None
+    lead_handle: str | None = None
     creado_en: datetime
     actualizado_en: datetime
+
+
+class ContactoLeadOut(BaseModel):
+    """Un candidato para vincular, al buscar en `users` desde la cartera de clientes."""
+    user_id: UUID
+    nombre: str | None
+    handle: str | None
+    # Si ya tiene fila en client_pipeline: gerencia lo ve en el embudo apenas
+    # se vincule. Si no, puede que nunca haya llegado a asignarse (p. ej. el
+    # módulo de vendedores estaba apagado cuando escribió la primera vez).
+    tiene_pipeline: bool
+
+
+class ClienteVincularLeadIn(BaseModel):
+    user_id: UUID
 
 
 # ============================================================
@@ -938,6 +965,65 @@ class TareaOut(BaseModel):
 
 
 # ============================================================
+# AGENDA (tareas de campo + seguimientos del embudo)
+# ============================================================
+TipoPendiente = Literal["tarea", "seguimiento"]
+
+
+class SeguimientoIn(BaseModel):
+    """
+    PUT /agenda/seguimientos/{user_id}. `fecha` None = marcarlo hecho (o
+    quitarlo): el lead se queda sin nada agendado.
+    """
+
+    fecha: datetime | None
+    nota: str | None = Field(default=None, max_length=500)
+
+
+class AgendaItemOut(BaseModel):
+    """
+    Un pendiente en el calendario, venga de donde venga.
+
+    `id` es el de su tabla (tareas_seguimiento.id o client_pipeline.id) y
+    `cliente_id` el que usa su propio módulo para abrir la ficha:
+    clientes.id para una tarea, users.id para un seguimiento. Son UUIDs de
+    espacios distintos: `tipo` dice cuál es cuál.
+    """
+
+    tipo: TipoPendiente
+    id: UUID
+    titulo: str
+    descripcion: str | None
+    fecha: datetime
+    # Para un seguimiento se calcula al leer (fecha pasada = vencida): no
+    # tiene columna de estado, "hecho" es quitarle la fecha.
+    estado: Literal["pendiente", "completada", "vencida"]
+    vendedor_id: UUID | None
+    vendedor_nombre: str | None
+    cliente_id: UUID
+    cliente_nombre: str | None
+    # Solo seguimientos: la etapa del lead en el embudo.
+    etapa: str | None = None
+
+
+class AgendaOut(BaseModel):
+    # Qué módulos entraron en la respuesta. Uno apagado o fuera del plan no
+    # es un error de la agenda: simplemente no aporta pendientes.
+    tareas_disponibles: bool
+    seguimientos_disponibles: bool
+    items: list[AgendaItemOut]
+
+
+class ReprogramacionOut(BaseModel):
+    id: UUID
+    fecha_anterior: datetime | None
+    fecha_nueva: datetime | None
+    actor_etiqueta: str
+    vendedor_nombre: str | None
+    creado_en: datetime
+
+
+# ============================================================
 # CRM DE CAMPO — REPORTES
 # ============================================================
 class ActividadVendedorOut(BaseModel):
@@ -1024,6 +1110,7 @@ class TipoAlerta(str, Enum):
     reserva_cancelada = "reserva_cancelada"
     conversacion_transferida = "conversacion_transferida"
     perfil_incompleto = "perfil_incompleto"
+    agenda_reprogramada = "agenda_reprogramada"
 
 class AlertaOut(BaseModel):
     id: UUID

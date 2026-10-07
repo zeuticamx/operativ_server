@@ -9,6 +9,7 @@ El `tenant_id` sale del usuario autenticado, nunca del cliente HTTP.
 
 from uuid import UUID
 
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from deps import requiere_herramienta
@@ -20,7 +21,13 @@ from services.crm import (
     exigir_gerencia_crm,
     vendedor_del_tenant,
 )
-from schemas import ClienteActualizarIn, ClienteCrearIn, ClienteOut
+from schemas import (
+    ClienteActualizarIn,
+    ClienteCrearIn,
+    ClienteOut,
+    ClienteVincularLeadIn,
+    ContactoLeadOut,
+)
 from session import fetch_all, fetch_one
 
 router = APIRouter(
@@ -81,6 +88,122 @@ async def listar(
         offset,
     )
     return [ClienteOut(**dict(f)) for f in filas]
+
+
+@router.get("/leads-disponibles", response_model=list[ContactoLeadOut])
+async def leads_disponibles(
+    buscar: str = Query(..., min_length=2, max_length=100),
+    acceso: AccesoCRM = Depends(exigir_gerencia_crm),
+):
+    """
+    Busca contactos de chat (`users`) para vincular a un cliente de campo.
+
+    Registrado ANTES de `GET /{cliente_id}` a propósito: si fuera después,
+    "leads-disponibles" caería en esa ruta e intentaría parsearse como UUID.
+
+    Excluye a los que ya están vinculados a otro cliente — el índice único
+    parcial de la migración no deja vincular dos veces, así que ofrecerlos
+    solo llevaría a un 409 al intentarlo.
+    """
+    filas = await fetch_all(
+        """
+        SELECT
+            u.id AS user_id,
+            NULLIF(NULLIF(TRIM(u.display_name), ''), 'null') AS nombre,
+            COALESCE(
+                NULLIF(NULLIF(TRIM(u.whatsapp_id), ''), 'null'),
+                NULLIF(NULLIF(TRIM(u.instagram_id), ''), 'null'),
+                NULLIF(NULLIF(TRIM(u.facebook_id), ''), 'null')
+            ) AS handle,
+            EXISTS(
+                SELECT 1 FROM client_pipeline p
+                WHERE p.user_id = u.id AND p.tenant_id = u.tenant_id
+            ) AS tiene_pipeline
+        FROM users u
+        WHERE u.tenant_id = $1
+          AND NOT EXISTS (SELECT 1 FROM clientes c WHERE c.user_id = u.id)
+          AND (
+            NULLIF(NULLIF(TRIM(u.display_name), ''), 'null') ILIKE '%' || $2 || '%'
+            OR u.whatsapp_id  ILIKE '%' || $2 || '%'
+            OR u.instagram_id ILIKE '%' || $2 || '%'
+            OR u.facebook_id  ILIKE '%' || $2 || '%'
+          )
+        ORDER BY nombre NULLS LAST
+        LIMIT 20
+        """,
+        acceso.tenant_id,
+        buscar,
+    )
+    return [ContactoLeadOut(**dict(f)) for f in filas]
+
+
+@router.patch("/{cliente_id}/vincular-lead", response_model=ClienteOut)
+async def vincular_lead(
+    cliente_id: UUID,
+    datos: ClienteVincularLeadIn,
+    acceso: AccesoCRM = Depends(exigir_gerencia_crm),
+):
+    """
+    Enlaza este cliente con un contacto de chat que ya existe.
+
+    No crea nada en `users` ni en `client_pipeline` — eso sigue siendo
+    exclusivo de n8n (primer mensaje) o de `POST /pipeline/{user_id}/asignar`.
+    Esto solo apunta el cliente de campo hacia un lead que ya está ahí.
+    """
+    await cargar_cliente(cliente_id, acceso)
+
+    contacto = await fetch_one(
+        "SELECT id FROM users WHERE id = $1 AND tenant_id = $2",
+        datos.user_id,
+        acceso.tenant_id,
+    )
+    if contacto is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Contacto no encontrado",
+        )
+
+    try:
+        await fetch_one(
+            """
+            UPDATE clientes SET user_id = $3, actualizado_en = NOW()
+            WHERE id = $1 AND tenant_id = $2
+            RETURNING id
+            """,
+            cliente_id,
+            acceso.tenant_id,
+            datos.user_id,
+        )
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Ese contacto ya está vinculado a otro cliente de la cartera",
+        )
+
+    fila = await fetch_one(f"{SELECT_CLIENTE} WHERE c.id = $1", cliente_id)
+    return ClienteOut(**dict(fila))
+
+
+@router.post("/{cliente_id}/desvincular-lead", response_model=ClienteOut)
+async def desvincular_lead(
+    cliente_id: UUID,
+    acceso: AccesoCRM = Depends(exigir_gerencia_crm),
+):
+    """Quita el enlace con el embudo. El lead en sí no se toca."""
+    await cargar_cliente(cliente_id, acceso)
+
+    await fetch_one(
+        """
+        UPDATE clientes SET user_id = NULL, actualizado_en = NOW()
+        WHERE id = $1 AND tenant_id = $2
+        RETURNING id
+        """,
+        cliente_id,
+        acceso.tenant_id,
+    )
+
+    fila = await fetch_one(f"{SELECT_CLIENTE} WHERE c.id = $1", cliente_id)
+    return ClienteOut(**dict(fila))
 
 
 @router.get("/{cliente_id}", response_model=ClienteOut)

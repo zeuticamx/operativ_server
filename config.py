@@ -153,6 +153,12 @@ class Settings:
         os.getenv("RESERVAS_VENCIDAS_GRACIA_MINUTOS", "0")
     )
 
+    # Tareas de seguimiento vencidas (jobs/tareas_background.py): una
+    # 'pendiente' cuya fecha ya pasó se marca 'vencida'.
+    TAREAS_VENCIDAS_INTERVALO_MINUTOS: int = int(
+        os.getenv("TAREAS_VENCIDAS_INTERVALO_MINUTOS", "15")
+    )
+
     # ---- Reportes de incidencias (services/reportes.py) ----
     # Tope por usuario y hora: un formulario abierto a todos los roles no
     # debe servir para inundar el buzón del equipo.

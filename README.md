@@ -643,6 +643,7 @@ PUT    /api/tareas/{id}
 POST   /api/tareas/{id}/completar       Sella completado_en
 POST   /api/tareas/{id}/reabrir
 DELETE /api/tareas/{id}
+GET    /api/tareas/{id}/reprogramaciones  Bitácora de cambios de fecha (ver "Agenda de ventas")
 
 GET    /api/reportes/actividad          Visitas y tareas por vendedor (gerencia)
 ```
@@ -670,6 +671,10 @@ ya no trabaja ahí.
 | `vendedor` | Solo su cartera y sus visitas/tareas | Check-ins, sus tareas y **alta de clientes** |
 | `owner` / `superadmin` | Todo el tenant | Alta, edición y reasignación de clientes, reportes |
 | `member` | Todo el tenant | Nada (ver "Roles dentro de un negocio") |
+
+Cualquier otro rol (`proveedor` del calendario, o uno desconocido) recibe
+**403**: `acceso_crm` es lista blanca (`ROLES_NEGOCIO` + vendedor), igual que
+`deps.negocio_actual`.
 
 Un `vendedor_id` en el query string se **ignora** cuando quien llama es un
 vendedor: el filtro se fuerza a su propio id, así que el parámetro no
@@ -733,6 +738,47 @@ elemento. Un 4xx global obligaría a la app a descartar el lote entero por
 un solo check-in malo. Y cada elemento va en su propia transacción: un
 cliente borrado mientras el teléfono estaba sin señal no puede costar el
 resto de la cola.
+
+### Agenda de ventas (`sql/39_agenda.sql`)
+
+Un calendario que junta las **tareas** del CRM de campo y los **seguimientos**
+de los leads del embudo. Lo usan `/vendedores/agenda` (negocio) y
+`/mi-cartera` (vendedor) en el portal; arrastrar un pendiente a otro día lo
+reprograma.
+
+```
+GET  /api/agenda?desde&hasta[&vendedor_id]           Pendientes del rango, de las dos fuentes
+PUT  /api/agenda/seguimientos/{user_id}              Poner / mover / quitar (fecha null) el seguimiento de un lead
+GET  /api/agenda/seguimientos/{user_id}/reprogramaciones
+```
+
+- **Cada módulo por su lado.** `GET /agenda` no responde 402 si falta uno:
+  trae tareas si el plan incluye `crm_campo`, y seguimientos si incluye
+  `vendedores` **y** el módulo está encendido. `tareas_disponibles` /
+  `seguimientos_disponibles` dicen cuál entró. Rango máximo: 100 días.
+- **Un lead tiene un solo próximo seguimiento**: `client_pipeline.proximo_seguimiento`
+  (+ `seguimiento_nota`). Agendarlo **no** toca `actualizado_en`, que es
+  "cuándo se movió de etapa" y alimenta la alerta de lead sin actividad. No
+  se puede agendar uno en un lead ganado/perdido (409). Va aparte de
+  `/api/pipeline/*` para no tocar el contrato de la app de vendedores;
+  `PipelineOut` solo suma los dos campos, opcionales.
+- **Mover una tarea sigue siendo `PUT /tareas/{id}`.** Si cambia la fecha y
+  no viene `estado`, se recalcula: futura → `pendiente`, pasada → `vencida`;
+  una `completada` se queda completada. Un job (`jobs/tareas_background.py`,
+  cada `TAREAS_VENCIDAS_INTERVALO_MINUTOS`, 15 por defecto) marca `vencida`
+  la pendiente cuya fecha pasó — antes ese estado existía pero nadie lo
+  escribía.
+- **Bitácora**: `agenda_reprogramaciones`, un renglón por cambio de fecha de
+  una tarea o de un seguimiento (quién, de qué fecha a cuál), en la misma
+  transacción que el UPDATE. Editar solo el título no escribe nada.
+- **Aviso personal al vendedor** (alerta `agenda_reprogramada`, a su room de
+  usuario) cuando otro le mueve, le asigna o le agenda un pendiente. Si se
+  lo mueve él mismo, o no tiene cuenta del portal, no hay aviso. Es
+  best-effort, después del commit.
+
+Permisos: los de `acceso_crm`. El vendedor ve y mueve solo lo suyo (403 con
+lo de un compañero, 404 si el lead no es del negocio); el `vendedor_id` del
+query se ignora para él. Reasignar una tarea sigue siendo de gerencia.
 
 ### Panel de plataforma (nivel gerencia)
 

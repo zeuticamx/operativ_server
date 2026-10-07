@@ -5,15 +5,16 @@ Un vendedor ve, crea y completa las suyas; gerencia ve las del negocio
 entero y puede asignarlas a cualquiera de su equipo.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import UUID
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from deps import requiere_herramienta
+from services import agenda
 from services.crm import AccesoCRM, acceso_crm, cargar_cliente, vendedor_del_tenant
-from schemas import TareaActualizarIn, TareaCrearIn, TareaOut
+from schemas import ReprogramacionOut, TareaActualizarIn, TareaCrearIn, TareaOut
 from session import conexion, fetch_all, transaccion
 
 router = APIRouter(
@@ -160,7 +161,29 @@ async def crear(
         )
         fila = await conn.fetchrow(f"{SELECT_TAREA} WHERE t.id = $1", creada["id"])
 
+    await agenda.avisar_reprogramacion(
+        acceso.tenant_id,
+        vendedor_id=fila["vendedor_id"],
+        actor_portal_user_id=acceso.portal_user_id,
+        actor_etiqueta=acceso.etiqueta,
+        titulo=fila["titulo"],
+        fecha_nueva=fila["fecha_programada"],
+        datos={"tipo": "tarea", "tarea_id": str(fila["id"])},
+        asignada=True,
+    )
     return TareaOut(**dict(fila))
+
+
+@router.get("/{tarea_id}/reprogramaciones", response_model=list[ReprogramacionOut])
+async def reprogramaciones(tarea_id: UUID, acceso: AccesoCRM = Depends(acceso_crm)):
+    """
+    Cada cambio de fecha de la tarea, el más reciente primero: de qué día a
+    cuál y quién la movió (sql/39_agenda.sql). Mismos permisos que ver la
+    tarea.
+    """
+    await _cargar_tarea(tarea_id, acceso)
+    filas = await agenda.reprogramaciones_de_tarea(acceso.tenant_id, tarea_id)
+    return [ReprogramacionOut(**dict(f)) for f in filas]
 
 
 @router.put("/{tarea_id}", response_model=TareaOut)
@@ -175,9 +198,27 @@ async def actualizar(
     Reasignarla a otro vendedor es cosa de gerencia. Y 'completada' no se
     pone por acá — para eso está POST /tareas/{id}/completar, que sella
     `completado_en` junto con el estado en un solo paso.
+
+    Cambiar la fecha es reprogramarla (lo que hace el calendario del portal
+    al arrastrarla): queda en la bitácora de la agenda y, si no viene un
+    `estado` explícito, el estado se recalcula con la fecha nueva — una
+    vencida que se pasa al jueves vuelve a pendiente.
     """
     async with transaccion() as conn:
-        await _cargar_tarea(tarea_id, acceso, conn)
+        actual = await _cargar_tarea(tarea_id, acceso, conn)
+
+        estado = datos.estado
+        reprogramada = (
+            datos.fecha_programada is not None
+            and datos.fecha_programada != actual["fecha_programada"]
+        )
+        if reprogramada and estado is None:
+            estado = agenda.estado_tras_reprogramar(
+                actual["estado"], datos.fecha_programada, datetime.now(timezone.utc)
+            )
+            # Una completada se queda igual: no hace falta reescribirla.
+            if estado == actual["estado"]:
+                estado = None
 
         if datos.vendedor_id is not None:
             if not acceso.es_gerencia:
@@ -202,10 +243,36 @@ async def actualizar(
             datos.titulo,
             datos.descripcion,
             datos.fecha_programada,
-            datos.estado,
+            estado,
             datos.vendedor_id,
         )
         fila = await conn.fetchrow(f"{SELECT_TAREA} WHERE t.id = $1", tarea_id)
+
+        if reprogramada:
+            await agenda.registrar_reprogramacion(
+                conn,
+                tenant_id=acceso.tenant_id,
+                tarea_id=tarea_id,
+                vendedor_id=fila["vendedor_id"],
+                fecha_anterior=actual["fecha_programada"],
+                fecha_nueva=fila["fecha_programada"],
+                actor_portal_user_id=acceso.portal_user_id,
+                actor_etiqueta=acceso.etiqueta,
+            )
+
+    # Después del commit: el aviso es best-effort y no puede deshacer nada.
+    reasignada = fila["vendedor_id"] != actual["vendedor_id"]
+    if reprogramada or reasignada:
+        await agenda.avisar_reprogramacion(
+            acceso.tenant_id,
+            vendedor_id=fila["vendedor_id"],
+            actor_portal_user_id=acceso.portal_user_id,
+            actor_etiqueta=acceso.etiqueta,
+            titulo=fila["titulo"],
+            fecha_nueva=fila["fecha_programada"],
+            datos={"tipo": "tarea", "tarea_id": str(tarea_id)},
+            asignada=reasignada,
+        )
 
     return TareaOut(**dict(fila))
 

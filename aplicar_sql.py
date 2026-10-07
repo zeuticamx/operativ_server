@@ -44,6 +44,7 @@ TABLAS = [
     ("clientes", "portal"),
     ("visitas", "portal"),
     ("tareas_seguimiento", "portal"),
+    ("agenda_reprogramaciones", "portal"),
     ("gerencia_users", "portal"),
     ("tenant_estado_plataforma", "portal"),
     ("tenant_token_usage", "portal"),

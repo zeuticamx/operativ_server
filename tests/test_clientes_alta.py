@@ -69,6 +69,7 @@ class BaseFalsa:
             "estado": "prospecto",
             "prioridad": "media",
             "notas": None,
+            "user_id": None,
             "creado_en": "2026-10-06T12:00:00+00:00",
             "actualizado_en": "2026-10-06T12:00:00+00:00",
         }
