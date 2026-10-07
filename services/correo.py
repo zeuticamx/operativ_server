@@ -204,14 +204,8 @@ _HTML_ALERTA = """\
 
 
 def _url_panel() -> str:
-    """
-    Primer origen configurado en FRONTEND_ORIGINS: es el dominio real del
-    panel en producción (localhost en dev), no un valor hardcodeado aparte
-    que se puede desincronizar de settings.FRONTEND_ORIGINS.
-    """
-    if settings.FRONTEND_ORIGINS:
-        return f"{settings.FRONTEND_ORIGINS[0]}/vendedores"
-    return "/vendedores"
+    """URL pública del panel (BASE_URL_FRONTEND; localhost solo en dev)."""
+    return f"{settings.BASE_URL_FRONTEND}/vendedores"
 
 
 async def enviar_alerta_critica(destino: str, titulo: str, mensaje: str) -> None:

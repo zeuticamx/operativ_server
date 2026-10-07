@@ -52,7 +52,9 @@ def _hash(token: str) -> str:
 
 
 def enlace(token: str) -> str:
-    base = settings.FRONTEND_ORIGINS[0] if settings.FRONTEND_ORIGINS else ""
+    # BASE_URL_FRONTEND es la URL pública explícita del portal; FRONTEND_ORIGINS
+    # es una lista de CORS (puede traer localhost primero) y no sirve de enlace.
+    base = settings.BASE_URL_FRONTEND
     return f"{base}/invitacion#t={token}"
 
 
