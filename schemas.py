@@ -2059,7 +2059,7 @@ class ReservaAuditoriaOut(BaseModel):
     motivo: str | None
     datos_anteriores: dict | None
     datos_nuevos: dict | None
-    origen: Literal["portal", "n8n"]
+    origen: Literal["portal", "n8n", "sistema"]
     actor: str
     actor_portal_user_id: UUID | None
     actor_user_id: UUID | None
