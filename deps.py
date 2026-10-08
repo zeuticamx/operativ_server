@@ -12,6 +12,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from config import settings
 from security import decodificar_token, emitido_antes_de
 from services.acceso_plan import exigir_herramienta
+from services.gerencia import registrar_auditoria
 from session import fetch_one
 
 bearer = HTTPBearer(auto_error=False)
@@ -42,6 +43,16 @@ ROLES_NEGOCIO = frozenset({"owner", "superadmin", "member"})
 # no se reparten por invitación.
 ROLES_INVITABLES = frozenset({"member", ROL_VENDEDOR, ROL_PROVEEDOR})
 
+# A quién se le puede asignar una conversación (services/asignacion_conversaciones.py).
+# Lista blanca, como ROLES_NEGOCIO: un rol nuevo no recibe conversaciones hasta
+# que alguien lo sume acá. El owner está porque es el destino de respaldo
+# cuando la asignación automática no encuentra a nadie.
+ROLES_ASIGNABLES = frozenset({"owner", "superadmin", "member", ROL_VENDEDOR, ROL_PROVEEDOR})
+
+# Roles que ven en conversaciones solo lo asignado a ellos (más lo que su
+# ficha les hace propio mientras nadie lo tenga: ver services/conversaciones.py).
+ROLES_ACOTADOS_CONVERSACIONES = frozenset({ROL_VENDEDOR, ROL_PROVEEDOR})
+
 # Lo único que puede hacer una sesión de "ver como" (impersonación de
 # plataforma). Todo lo demás es una escritura sobre los datos de un cliente
 # hecha por alguien que no es el cliente.
@@ -58,29 +69,54 @@ class UsuarioActual:
     # Solo en sesiones de "ver como": el correo del gerente que está
     # mirando y cuándo vence el token. None en una sesión normal.
     impersonado_por: str | None = None
+    impersonado_por_id: UUID | None = None
     impersonacion_expira: datetime | None = None
+    # Solo en "ver como": hasta cuándo el dueño autorizó escribir (None =
+    # solo lectura). Sale de BD en cada petición, no del token.
+    impersonacion_escritura_hasta: datetime | None = None
 
     @property
     def es_superadmin(self) -> bool:
         return self.role == "superadmin"
 
 
-async def _validar_impersonacion(payload: dict, request: Request) -> str:
-    """
-    Revalida una sesión de "ver como" y devuelve el correo del gerente.
+# Lo único que una sesión de "ver como" de solo lectura puede escribir: pedir
+# o retirar el permiso de edición al dueño. El endpoint además exige que la
+# sesión sea una impersonación (routers/acceso_soporte.py).
+RUTAS_ESCRITURA_SIEMPRE_PERMITIDAS = frozenset(
+    {"/api/acceso-soporte/solicitar", "/api/acceso-soporte/cancelar"}
+)
 
-    Dos controles, en este orden:
+
+async def _validar_impersonacion(
+    payload: dict, request: Request, tenant_id: UUID | None
+) -> tuple[str, datetime | None]:
+    """
+    Revalida una sesión de "ver como" y devuelve el correo del gerente y,
+    si el dueño autorizó escribir, hasta cuándo.
+
+    Controles, en este orden:
 
     1. El gerente sigue siendo gerente. El token dura poco, pero si a
        alguien lo sacan de gerencia_users a mitad de una impersonación, la
        sesión tiene que morir en la siguiente petición — mismo criterio que
        usuario_actual aplica a todo lo demás.
-    2. Solo lectura. Se bloquea acá, en la dependencia que usan todos los
-       endpoints del portal, y no endpoint por endpoint: una lista de
-       permitidos que alguien olvida actualizar es una escritura que se
-       cuela. 403 y no 401: el token es válido, lo que falta es el permiso,
-       y un 401 haría que el portal intentara refrescar en vano.
+    2. Solo lectura, salvo concesión del dueño. Se decide acá, en la
+       dependencia que usan todos los endpoints del portal, y no endpoint por
+       endpoint: una lista de permitidos que alguien olvida actualizar es
+       una escritura que se cuela. La concesión sale de BD en cada petición
+       (services/acceso_soporte.py): si el dueño la revoca o se vence, la
+       siguiente escritura ya es 403. 403 y no 401: el token es válido, lo
+       que falta es el permiso, y un 401 haría que el portal intentara
+       refrescar en vano.
+    3. Con concesión, lo sensible sigue cerrado (contraseña, equipo, pagos,
+       credenciales de canales, borrar la cuenta) y cada escritura queda en
+       la bitácora de gerencia.
     """
+    # Import perezoso: acceso_soporte importa realtime, que importa deps.
+    from services import acceso_soporte
+
+    gerente_id = UUID(payload["imp"])
     gerente = await fetch_one(
         """
         SELECT pu.email
@@ -88,7 +124,7 @@ async def _validar_impersonacion(payload: dict, request: Request) -> str:
         JOIN gerencia_users gu ON LOWER(gu.email) = LOWER(pu.email)
         WHERE pu.id = $1 AND pu.is_active
         """,
-        UUID(payload["imp"]),
+        gerente_id,
     )
     if gerente is None:
         raise HTTPException(
@@ -96,13 +132,33 @@ async def _validar_impersonacion(payload: dict, request: Request) -> str:
             detail="La sesión de 'ver como' ya no es válida",
         )
 
+    escritura_hasta = (
+        await acceso_soporte.concesion_vigente(gerente_id, tenant_id) if tenant_id else None
+    )
+
     if request.method not in METODOS_SOLO_LECTURA:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Modo solo lectura: estás viendo el portal como este negocio",
+        path = request.url.path.rstrip("/") or "/"
+        if path in RUTAS_ESCRITURA_SIEMPRE_PERMITIDAS:
+            return gerente["email"], escritura_hasta
+        if escritura_hasta is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Modo solo lectura: estás viendo el portal como este negocio",
+            )
+        if acceso_soporte.ruta_sensible(path):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Esta acción no está permitida desde 'ver como', ni con permiso de edición",
+            )
+        await registrar_auditoria(
+            actor_email=gerente["email"],
+            actor_portal_user_id=gerente_id,
+            accion="impersonacion_escritura",
+            tenant_id=tenant_id,
+            detalle={"metodo": request.method, "ruta": path},
         )
 
-    return gerente["email"]
+    return gerente["email"], escritura_hasta
 
 
 async def usuario_actual(
@@ -166,7 +222,9 @@ async def usuario_actual(
         )
 
     if "imp" in payload:
-        impersonado_por = await _validar_impersonacion(payload, request)
+        impersonado_por, escritura_hasta = await _validar_impersonacion(
+            payload, request, fila["tenant_id"]
+        )
         return UsuarioActual(
             id=fila["id"],
             tenant_id=fila["tenant_id"],
@@ -177,7 +235,9 @@ async def usuario_actual(
             # desde el "ver como" se podría volver a entrar a /gerencia.
             es_gerencia_plataforma=False,
             impersonado_por=impersonado_por,
+            impersonado_por_id=UUID(payload["imp"]),
             impersonacion_expira=datetime.fromtimestamp(payload["exp"], tz=timezone.utc),
+            impersonacion_escritura_hasta=escritura_hasta,
         )
 
     return UsuarioActual(
@@ -439,6 +499,26 @@ async def proveedor_actual(
     )
 
 
+def _permitir_a_roles(roles: frozenset[str], endpoints: tuple[str, ...]):
+    permitidos = frozenset(endpoints)
+
+    async def dependencia(
+        request: Request,
+        usuario: UsuarioActual = Depends(usuario_actual),
+    ) -> UsuarioActual:
+        if usuario.role in ROLES_NEGOCIO:
+            return usuario
+        endpoint = request.scope.get("endpoint")
+        if usuario.role in roles and getattr(endpoint, "__name__", None) in permitidos:
+            return usuario
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Esta sección no está disponible para tu rol",
+        )
+
+    return dependencia
+
+
 def permitir_a_proveedor(*endpoints: str):
     """
     Dependency de router para los routers del negocio que el proveedor
@@ -451,23 +531,17 @@ def permitir_a_proveedor(*endpoints: str):
     Cada endpoint de la lista tiene que acotar él mismo los datos a lo del
     proveedor (`proveedor_actual`): esto solo decide si puede entrar.
     """
-    permitidos = frozenset(endpoints)
+    return _permitir_a_roles(frozenset({ROL_PROVEEDOR}), endpoints)
 
-    async def dependencia(
-        request: Request,
-        usuario: UsuarioActual = Depends(usuario_actual),
-    ) -> UsuarioActual:
-        if usuario.role in ROLES_NEGOCIO:
-            return usuario
-        endpoint = request.scope.get("endpoint")
-        if usuario.role == ROL_PROVEEDOR and getattr(endpoint, "__name__", None) in permitidos:
-            return usuario
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Esta sección no está disponible para tu rol",
-        )
 
-    return dependencia
+def permitir_a_roles_acotados(*endpoints: str):
+    """
+    Igual que `permitir_a_proveedor`, pero deja entrar también al vendedor:
+    es para `conversaciones`, donde ambos ven solo lo asignado a ellos (más lo
+    que su ficha les hace propio). Mismo contrato: cada endpoint de la lista
+    acota él mismo los datos (`conversacion_visible`).
+    """
+    return _permitir_a_roles(ROLES_ACOTADOS_CONVERSACIONES, endpoints)
 
 
 async def llamada_interna(

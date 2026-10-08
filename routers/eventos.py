@@ -25,7 +25,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from services.acceso_pagos import acceso_pagos
 from services.asignacion import asignar_vendedor_automatico
 from deps import llamada_interna
-from realtime import avisar_a_proveedor, broadcast_alerta
+from realtime import (
+    avisar_a_proveedor,
+    avisar_a_usuario,
+    broadcast_alerta,
+    emit_conversacion_estado,
+    emitir_datos,
+)
+from services import asignacion_conversaciones as asignacion_conv
 from services import calendario, creditos
 from services.calendario import actor_desde_chat, verificar_calendario_activo
 from services.gerencia import registrar_uso_tokens
@@ -43,6 +50,8 @@ from schemas import (
     ConversacionTransferidaOut,
     CrearReservaEventoIn,
     CrearReservaEventoOut,
+    MensajeConversacionAsignadaIn,
+    MensajeConversacionAsignadaOut,
     MensajeEntranteIn,
     MensajeEntranteOut,
     ProveedorOut,
@@ -240,6 +249,13 @@ async def conversacion_transferida(datos: ConversacionTransferidaIn):
     solo lo dispara este proceso corriendo (ver realtime.broadcast_alerta),
     así que sin esta llamada nadie se entera hasta que alguien entra al
     portal a filtrar conversaciones por estado a mano.
+
+    Además decide a quién le toca (services/asignacion_conversaciones.py): el
+    agente solo sugiere un `area`; el backend elige y valida a la persona. Si
+    no hay un responsable concreto, la conversación cae en el dueño con una
+    nota y una alerta para que la reasigne. Que la asignación falle por lo
+    que sea no puede tumbar este aviso: n8n lo reintenta y el negocio ya fue
+    alertado arriba.
     """
     detalle = [f"{datos.cliente_nombre or datos.cliente_telefono or 'Un cliente'} pidió hablar con alguien del equipo por {datos.canal}"]
     if datos.motivo:
@@ -252,14 +268,76 @@ async def conversacion_transferida(datos: ConversacionTransferidaIn):
         {"conversation_id": str(datos.conversation_id), "canal": datos.canal},
     )
     await broadcast_alerta(datos.tenant_id, *alerta)
-    # Y al proveedor dueño del chat (su cliente), que no está en la room
-    # del negocio.
-    await avisar_a_proveedor(
-        datos.tenant_id,
-        await conversaciones_svc.cuenta_del_proveedor(datos.conversation_id),
-        *alerta,
+
+    resultado = None
+    try:
+        resultado = await asignacion_conv.autoasignar(
+            datos.tenant_id, datos.conversation_id, datos.area or "otro"
+        )
+    except Exception:
+        log.exception("Falló la asignación automática de la conversación %s", datos.conversation_id)
+
+    if resultado is None:
+        # Sin asignar (ya tenía dueño, o falló): el aviso de siempre al
+        # proveedor dueño del chat (su cliente), que no está en la room del
+        # negocio.
+        await avisar_a_proveedor(
+            datos.tenant_id,
+            await conversaciones_svc.cuenta_del_proveedor(datos.conversation_id),
+            *alerta,
+        )
+        return ConversacionTransferidaOut(registrado=True)
+
+    datos_alerta = {**alerta[3], "motivo_asignacion": resultado.motivo}
+    if resultado.cayo_en_owner and resultado.fallo:
+        personal = (
+            "asignacion_fallida",
+            "No se pudo asignar una conversación",
+            f"{detalle[0]}. No se asignó automáticamente: {resultado.motivo}. "
+            "Quedó a tu nombre; reasígnala a quien corresponda.",
+            datos_alerta,
+        )
+    else:
+        personal = (
+            "conversacion_asignada",
+            "Te asignaron una conversación",
+            f"{' '.join(detalle)}. {resultado.motivo}.",
+            datos_alerta,
+        )
+    await avisar_a_usuario(datos.tenant_id, resultado.portal_user_id, *personal)
+    await emit_conversacion_estado(
+        datos.tenant_id, datos.conversation_id, "transferred", resultado.portal_user_id
     )
-    return ConversacionTransferidaOut(registrado=True)
+    return ConversacionTransferidaOut(
+        registrado=True,
+        asignado_a=resultado.portal_user_id,
+        cayo_en_owner=resultado.cayo_en_owner,
+    )
+
+
+@router.post("/mensaje-conversacion-asignada", response_model=MensajeConversacionAsignadaOut)
+async def mensaje_conversacion_asignada(datos: MensajeConversacionAsignadaIn):
+    """
+    n8n avisa que el cliente escribió en una conversación transferida. El
+    mensaje ya se guardó (en silencio, la IA no contesta); esto solo le avisa
+    a quien la tiene asignada. Un aviso por conversación hasta que lo lea.
+    Sin asignado, o asignado en otro negocio, no hace nada: no es un error.
+    """
+    fila = await asignacion_conv.asignado_de(datos.conversation_id)
+    if fila is None or fila["tenant_id"] != datos.tenant_id:
+        return MensajeConversacionAsignadaOut(avisado=False)
+    if await asignacion_conv.hay_aviso_sin_leer(fila["asignado_a"], datos.conversation_id):
+        return MensajeConversacionAsignadaOut(avisado=False)
+
+    await avisar_a_usuario(
+        datos.tenant_id,
+        fila["asignado_a"],
+        "mensaje_conversacion_asignada",
+        f"Mensaje nuevo de {datos.cliente_nombre or 'un cliente'}",
+        (datos.texto or "El cliente te escribió en una conversación asignada")[:200],
+        {"conversation_id": str(datos.conversation_id)},
+    )
+    return MensajeConversacionAsignadaOut(avisado=True)
 
 
 # ============================================================
@@ -386,9 +464,9 @@ async def calendario_crear_reserva(datos: CrearReservaEventoIn):
         },
     )
     await broadcast_alerta(datos.tenant_id, *alerta)
-    await avisar_a_proveedor(
-        datos.tenant_id, await calendario.cuenta_del_proveedor(reserva.proveedor_id), *alerta
-    )
+    cuenta = await calendario.cuenta_del_proveedor(reserva.proveedor_id)
+    await avisar_a_proveedor(datos.tenant_id, cuenta, *alerta)
+    await emitir_datos(datos.tenant_id, "reservas", [cuenta])
     return CrearReservaEventoOut(creado=True, reserva=ReservaOut(**vars(reserva)))
 
 
@@ -409,9 +487,9 @@ async def calendario_cancelar_reserva(datos: CancelarReservaEventoIn):
         {"reserva_id": str(reserva.id)},
     )
     await broadcast_alerta(datos.tenant_id, *alerta)
-    await avisar_a_proveedor(
-        datos.tenant_id, await calendario.cuenta_del_proveedor(reserva.proveedor_id), *alerta
-    )
+    cuenta = await calendario.cuenta_del_proveedor(reserva.proveedor_id)
+    await avisar_a_proveedor(datos.tenant_id, cuenta, *alerta)
+    await emitir_datos(datos.tenant_id, "reservas", [cuenta])
     return ReservaOut(**vars(reserva))
 
 

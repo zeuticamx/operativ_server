@@ -33,7 +33,7 @@ los clientes conectados a otro proceso y hace falta un
 """
 
 import logging
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 from uuid import UUID
 
 import jwt
@@ -308,19 +308,22 @@ async def broadcast_alerta(
     )
 
 
-async def _salas_de_conversacion(tenant_id: UUID, conversation_id: UUID) -> list[str]:
+async def _salas_de_conversacion(
+    tenant_id: UUID,
+    conversation_id: UUID,
+    extra_usuarios: Iterable[Optional[UUID]] = (),
+) -> list[str]:
     """
-    La room del negocio y, si la conversación es de un cliente de un
-    proveedor con cuenta, la room personal de ese proveedor (que no está en
-    la del negocio: ver `connect`).
+    La room del negocio y la room personal de quien ve la conversación sin
+    estar en la del negocio (`connect`): el asignado o, si nadie la tiene, el
+    proveedor / vendedor dueño por su ficha. `extra_usuarios` suma a quien la
+    acaba de perder (el asignado anterior), para que se le quite de la lista.
     """
-    from services.conversaciones import cuenta_del_proveedor
+    from services.conversaciones import usuarios_con_acceso
 
-    salas = [_sala(tenant_id)]
-    proveedor = await cuenta_del_proveedor(conversation_id)
-    if proveedor is not None:
-        salas.append(_sala_usuario(proveedor))
-    return salas
+    usuarios = await usuarios_con_acceso(conversation_id)
+    usuarios.update(u for u in extra_usuarios if u is not None)
+    return [_sala(tenant_id), *(_sala_usuario(u) for u in usuarios)]
 
 
 async def emit_mensaje(tenant_id: UUID, conversation_id: UUID, mensaje: dict[str, Any]) -> None:
@@ -337,12 +340,26 @@ async def emit_mensaje(tenant_id: UUID, conversation_id: UUID, mensaje: dict[str
     )
 
 
-async def emit_conversacion_estado(tenant_id: UUID, conversation_id: UUID, status: str) -> None:
-    """Avisa que una conversación pasó de/a 'transferred' (handoff)."""
+async def emit_conversacion_estado(
+    tenant_id: UUID,
+    conversation_id: UUID,
+    status: str,
+    asignado_a: Optional[UUID] = None,
+    extra_usuarios: Iterable[Optional[UUID]] = (),
+) -> None:
+    """
+    Avisa que una conversación cambió de estado (handoff) o de responsable.
+    `asignado_a` viaja para que la UI actualice el "quién la tiene" sin pedir
+    otra vez el listado; None = sin asignar.
+    """
     await sio.emit(
         "conversacion_actualizada",
-        {"conversation_id": str(conversation_id), "status": status},
-        room=await _salas_de_conversacion(tenant_id, conversation_id),
+        {
+            "conversation_id": str(conversation_id),
+            "status": status,
+            "asignado_a": str(asignado_a) if asignado_a else None,
+        },
+        room=await _salas_de_conversacion(tenant_id, conversation_id, extra_usuarios),
     )
 
 
@@ -363,3 +380,30 @@ async def avisar_a_proveedor(
     if portal_user_id is None:
         return
     await broadcast_alerta(tenant_id, tipo, titulo, mensaje, datos, portal_user_id=portal_user_id)
+
+
+# Mismo mecanismo, pero ya no es solo para proveedores: también lo recibe el
+# asignado de una conversación (vendedor, member, owner...). El nombre
+# original se conserva porque calendario y eventos lo importan.
+avisar_a_usuario = avisar_a_proveedor
+
+
+async def emitir_datos(
+    tenant_id: UUID,
+    recurso: str,
+    portal_user_ids: Iterable[Optional[UUID]] = (),
+) -> None:
+    """
+    Aviso de UI en vivo: "los datos de `recurso` cambiaron, vuelve a pedirlos".
+    Va a la room del negocio y a la room personal de cada usuario indicado
+    (proveedor/vendedor afectados, que no están en la del negocio: ver
+    `connect`). No toca la tabla `alertas` ni lleva datos: el cliente decide
+    qué recargar y el HTTP aplica los permisos de cada rol, así que esto no
+    filtra información. Nunca debe romper la operación que lo dispara.
+    """
+    salas = [_sala(tenant_id)]
+    salas += [_sala_usuario(u) for u in set(portal_user_ids) if u is not None]
+    try:
+        await sio.emit("datos_actualizados", {"recurso": recurso}, room=salas)
+    except Exception:  # pragma: no cover - el aviso es best-effort
+        logger.exception("No se pudo emitir datos_actualizados (%s)", recurso)

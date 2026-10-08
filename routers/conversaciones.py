@@ -6,17 +6,23 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Respon
 
 from deps import (
     ROL_PROVEEDOR,
+    ROL_VENDEDOR,
+    ROLES_GERENCIA,
     UsuarioActual,
-    permitir_a_proveedor,
+    gerencia_actual,
+    permitir_a_roles_acotados,
     proveedor_actual,
     requiere_herramienta,
     tenant_actual,
     usuario_actual,
+    vendedor_actual,
 )
-from realtime import emit_conversacion_estado, emit_mensaje
+from realtime import avisar_a_usuario, emit_conversacion_estado, emit_mensaje
 from session import execute, fetch_one
 from schemas import (
     AdjuntoOut,
+    AsignableOut,
+    AsignarConversacionIn,
     ContactoOut,
     ConversacionDetalleOut,
     ConversacionEstadoOut,
@@ -26,6 +32,7 @@ from schemas import (
     MetricasOut,
 )
 from services import adjuntos
+from services import asignacion_conversaciones as asig
 from services import conversaciones as svc
 from services import meta
 
@@ -34,13 +41,14 @@ from services import meta
 router = APIRouter(
     prefix="/conversaciones",
     tags=["conversaciones"],
-    # Las conversaciones son del negocio entero: el vendedor no las ve. El
-    # proveedor del calendario entra solo a estos endpoints, y cada uno lo
-    # acota a las conversaciones de sus clientes (conversacion_visible).
-    # Ni métricas del negocio ni editar el contacto.
+    # Las conversaciones son del negocio entero: el owner, el superadmin y el
+    # member las ven todas, con quién las tiene. El vendedor y el proveedor
+    # entran solo a estos endpoints, y cada uno los acota a lo suyo: lo que
+    # les asignaron, más lo que su ficha les hace propio mientras nadie lo
+    # tenga (conversacion_visible). Ni métricas ni editar el contacto.
     dependencies=[
         Depends(
-            permitir_a_proveedor(
+            permitir_a_roles_acotados(
                 "listar",
                 "detalle",
                 "enviar_mensaje",
@@ -48,6 +56,7 @@ router = APIRouter(
                 "descargar_adjunto",
                 "tomar",
                 "volver_a_ia",
+                "soltar",
             )
         ),
         Depends(requiere_herramienta("agente", lectura_sin_plan=True)),
@@ -55,11 +64,16 @@ router = APIRouter(
 )
 
 
-async def _proveedor_propio(usuario: UsuarioActual) -> UUID | None:
-    """El id de proveedor de quien llama, o None si es del equipo del negocio (ve todo)."""
-    if usuario.role != ROL_PROVEEDOR:
-        return None
-    return (await proveedor_actual(usuario)).id
+async def _alcance(usuario: UsuarioActual) -> svc.Alcance | None:
+    """
+    Qué ve quien llama: None si es del equipo del negocio (ve todo), o el
+    alcance de su ficha si es vendedor / proveedor (ficha activa, o 403).
+    """
+    if usuario.role == ROL_PROVEEDOR:
+        return svc.Alcance(usuario.id, proveedor_id=(await proveedor_actual(usuario)).id)
+    if usuario.role == ROL_VENDEDOR:
+        return svc.Alcance(usuario.id, vendedor_id=(await vendedor_actual(usuario)).id)
+    return None
 
 
 async def conversacion_visible(
@@ -68,20 +82,67 @@ async def conversacion_visible(
     tenant_id: UUID = Depends(tenant_actual),
 ) -> None:
     """
-    Para un proveedor: 404 si la conversación no existe en el negocio, 403 si
-    es de un cliente de otro proveedor (es del mismo negocio, no se esconde
-    que existe — mismo criterio que con el vendedor y sus leads).
+    Para vendedor / proveedor: 404 si la conversación no existe en el negocio,
+    403 si es de otro (es del mismo negocio, no se esconde que existe — mismo
+    criterio que con el vendedor y sus leads).
     """
-    propio = await _proveedor_propio(usuario)
-    if propio is None:
+    alcance = await _alcance(usuario)
+    if alcance is None:
         return
-    suya = await svc.es_de_proveedor(tenant_id, conversacion_id, propio)
+    suya = await svc.es_visible(tenant_id, conversacion_id, alcance)
     if suya is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversación no encontrada")
     if not suya:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Esta conversación es de un cliente de otro proveedor",
+            detail="Esta conversación es de otra persona del equipo",
+        )
+
+
+async def puede_operar(
+    conversacion_id: UUID,
+    usuario: UsuarioActual = Depends(usuario_actual),
+    tenant_id: UUID = Depends(tenant_actual),
+) -> None:
+    """
+    Para contestar o devolverla a la IA: si alguien la tiene asignada, solo él
+    o la gerencia (owner/superadmin). Sin asignar, cualquiera que la vea (como
+    hasta ahora). 403 con el nombre de quien la tiene: es del mismo negocio.
+    Además de `conversacion_visible`, no en vez de: este solo mira al asignado.
+    """
+    fila = await fetch_one(
+        f"""
+        SELECT c.asignado_a, {svc._ASIGNADO_NOMBRE} AS nombre
+        FROM conversations c
+        LEFT JOIN portal_users pa ON pa.id = c.asignado_a
+        WHERE c.id = $1 AND c.tenant_id = $2
+        """,
+        conversacion_id,
+        tenant_id,
+    )
+    if fila is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversación no encontrada")
+    if (
+        fila["asignado_a"] is not None
+        and fila["asignado_a"] != usuario.id
+        and usuario.role not in ROLES_GERENCIA
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"La conversación la tiene {fila['nombre']}",
+        )
+
+
+def _filtro_asignada(asignada: str | None) -> str | None:
+    """'mias' | 'sin_asignar' | uuid de una persona. Otra cosa: 422."""
+    if asignada is None or asignada in ("mias", "sin_asignar"):
+        return asignada
+    try:
+        return str(UUID(asignada))
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="'asignada' debe ser 'mias', 'sin_asignar' o el id de una persona",
         )
 
 
@@ -91,13 +152,32 @@ async def listar(
     canal: str | None = Query(None),
     estado: str | None = Query(None),
     buscar: str | None = Query(None, max_length=100),
+    asignada: str | None = Query(None, max_length=36),
     limite: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     usuario: UsuarioActual = Depends(usuario_actual),
 ):
-    propio = await _proveedor_propio(usuario)
-    filas = await svc.listar(tenant_id, canal, estado, buscar, limite, offset, proveedor_id=propio)
+    filas = await svc.listar(
+        tenant_id,
+        canal,
+        estado,
+        buscar,
+        limite,
+        offset,
+        alcance=await _alcance(usuario),
+        asignada=_filtro_asignada(asignada),
+        yo=usuario.id,
+    )
     return [ConversacionOut(**dict(f)) for f in filas]
+
+
+@router.get("/asignables", response_model=list[AsignableOut])
+async def listar_asignables(
+    tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(gerencia_actual),
+):
+    """Cuentas del negocio a las que se les puede asignar una conversación (solo gerencia)."""
+    return [AsignableOut(**dict(f)) for f in await asig.asignables(tenant_id)]
 
 
 @router.get("/metricas", response_model=MetricasOut)
@@ -142,6 +222,7 @@ async def enviar_mensaje(
     usuario: UsuarioActual = Depends(usuario_actual),
     tenant_id: UUID = Depends(tenant_actual),
     _: None = Depends(conversacion_visible),
+    __: None = Depends(puede_operar),
 ):
     """
     Respuesta manual mientras la conversación está transferida a un humano
@@ -169,6 +250,7 @@ async def enviar_adjunto(
     usuario: UsuarioActual = Depends(usuario_actual),
     tenant_id: UUID = Depends(tenant_actual),
     _: None = Depends(conversacion_visible),
+    __: None = Depends(puede_operar),
 ):
     """
     Imagen (JPG/PNG) o documento (PDF/DOCX) como respuesta manual por
@@ -212,24 +294,89 @@ async def descargar_adjunto(
 @router.post("/{conversacion_id}/tomar", response_model=ConversacionEstadoOut)
 async def tomar(
     conversacion_id: UUID,
+    usuario: UsuarioActual = Depends(usuario_actual),
     tenant_id: UUID = Depends(tenant_actual),
     _: None = Depends(conversacion_visible),
 ):
-    """Un humano toma el control: la IA deja de contestar (inversa de volver-a-ia)."""
-    fila = await svc.tomar_conversacion(tenant_id, conversacion_id)
-    await emit_conversacion_estado(tenant_id, conversacion_id, fila["status"])
+    """
+    Un humano toma el control y la conversación pasa a ser suya: la IA deja de
+    contestar (inversa de volver-a-ia). Vale si está sin asignar; si ya la
+    tiene otro, 409 — solo el owner se la quita (PUT/DELETE .../asignacion).
+    """
+    fila = await asig.tomar(tenant_id, conversacion_id, usuario.id)
+    await emit_conversacion_estado(tenant_id, conversacion_id, fila["status"], fila["asignado_a"])
     return ConversacionEstadoOut(**dict(fila))
 
 
 @router.post("/{conversacion_id}/volver-a-ia", response_model=ConversacionEstadoOut)
 async def volver_a_ia(
     conversacion_id: UUID,
+    usuario: UsuarioActual = Depends(usuario_actual),
+    tenant_id: UUID = Depends(tenant_actual),
+    _: None = Depends(conversacion_visible),
+    __: None = Depends(puede_operar),
+):
+    """Le devuelve el control a la IA (Escenario 4) y termina la asignación."""
+    previo = (await fetch_one(
+        "SELECT asignado_a FROM conversations WHERE id = $1 AND tenant_id = $2",
+        conversacion_id,
+        tenant_id,
+    ))
+    fila = await svc.volver_a_ia(tenant_id, conversacion_id, usuario.id)
+    await emit_conversacion_estado(
+        tenant_id, conversacion_id, fila["status"], None,
+        extra_usuarios=[previo["asignado_a"]] if previo else (),
+    )
+    return ConversacionEstadoOut(**dict(fila))
+
+
+@router.put("/{conversacion_id}/asignacion", response_model=ConversacionEstadoOut)
+async def asignar(
+    conversacion_id: UUID,
+    datos: AsignarConversacionIn,
+    usuario: UsuarioActual = Depends(gerencia_actual),
+    tenant_id: UUID = Depends(tenant_actual),
+):
+    """
+    El owner (o superadmin) asigna o reasigna la conversación a una cuenta de
+    `ROLES_ASIGNABLES`. Apaga la IA. Al asignado le llega una alerta personal;
+    al anterior, el aviso de que ya no es suya.
+    """
+    fila, anterior = await asig.asignar(
+        tenant_id, conversacion_id, datos.asignado_a, usuario.id, datos.nota
+    )
+    await emit_conversacion_estado(
+        tenant_id, conversacion_id, fila["status"], fila["asignado_a"], extra_usuarios=[anterior]
+    )
+    if datos.asignado_a != usuario.id:
+        await avisar_a_usuario(
+            tenant_id,
+            datos.asignado_a,
+            "conversacion_asignada",
+            "Te asignaron una conversación",
+            "Tienes un cliente esperando atención" + (f" — {datos.nota}" if datos.nota else ""),
+            {"conversation_id": str(conversacion_id)},
+        )
+    return ConversacionEstadoOut(**dict(fila))
+
+
+@router.delete("/{conversacion_id}/asignacion", response_model=ConversacionEstadoOut)
+async def soltar(
+    conversacion_id: UUID,
+    usuario: UsuarioActual = Depends(usuario_actual),
     tenant_id: UUID = Depends(tenant_actual),
     _: None = Depends(conversacion_visible),
 ):
-    """Le devuelve el control a la IA (Escenario 4)."""
-    fila = await svc.volver_a_ia(tenant_id, conversacion_id)
-    await emit_conversacion_estado(tenant_id, conversacion_id, fila["status"])
+    """
+    Deja la conversación sin asignar (sigue en modo humano). El owner se la
+    quita a quien sea; el asignado puede soltar la suya.
+    """
+    fila, anterior = await asig.liberar(
+        tenant_id, conversacion_id, usuario.id, es_gerencia=usuario.role in ROLES_GERENCIA
+    )
+    await emit_conversacion_estado(
+        tenant_id, conversacion_id, fila["status"], None, extra_usuarios=[anterior]
+    )
     return ConversacionEstadoOut(**dict(fila))
 
 

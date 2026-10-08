@@ -407,7 +407,7 @@ async def test_escenario2_reserva_que_excede_el_fin_de_turno_se_rechaza(
     )
     assert manual.status_code == 422
     assert manual.json()["detail"] == (
-        "El horario seleccionado está fuera de la jornada de atención del barbero"
+        "El horario seleccionado está fuera de la jornada de atención del proveedor"
     )
 
 
@@ -525,7 +525,7 @@ async def test_reprogramar_fuera_de_jornada_tambien_se_rechaza(
     )
     assert r.status_code == 422
     assert r.json()["detail"] == (
-        "El horario seleccionado está fuera de la jornada de atención del barbero"
+        "El horario seleccionado está fuera de la jornada de atención del proveedor"
     )
 
 
@@ -1043,7 +1043,7 @@ async def test_reasignar_fuera_de_horario_del_nuevo_barbero_se_rechaza(
     )
     assert r.status_code == 422
     assert r.json()["detail"] == (
-        "El horario seleccionado está fuera de la jornada de atención del barbero"
+        "El horario seleccionado está fuera de la jornada de atención del proveedor"
     )
 
     # El rechazo no debe haber dejado un registro de 'cambio_barbero' a medias.

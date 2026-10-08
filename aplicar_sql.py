@@ -37,6 +37,7 @@ TABLAS = [
     ("meta_connections", "portal"),
     ("email_verifications", "portal"),
     ("tenant_servicios", "portal"),
+    ("tenant_onboarding", "portal"),
     ("vendedores", "portal"),
     ("tenant_vendedor_config", "portal"),
     ("client_pipeline", "portal"),

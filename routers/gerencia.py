@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from config import settings
 from deps import UsuarioActual, gerencia_plataforma_actual
-from services import eliminacion_tenant, herramientas_calendario, pruebas
+from services import eliminacion_tenant, herramientas_calendario, onboarding, pruebas
 from services.banxico import obtener_tipo_cambio
 from schemas import (
     AjusteCreditosIn,
@@ -34,6 +34,7 @@ from schemas import (
     EliminarTenantIn,
     EntradaAuditoriaOut,
     EstadoTenantPlataforma,
+    OnboardingGerenciaOut,
     OtorgarPruebaIn,
     PuntoConsumoOut,
     ResumenGerenciaOut,
@@ -457,6 +458,16 @@ async def detalle_tenant(
     dias: int = Query(DIAS_POR_DEFECTO, ge=1, le=DIAS_MAXIMO),
 ):
     return await _traer_tenant(tenant_id, dias)
+
+
+@router.get("/tenants/{tenant_id}/onboarding", response_model=OnboardingGerenciaOut)
+async def onboarding_tenant(tenant_id: UUID):
+    """
+    Qué contestó el dueño en el cuestionario de bienvenida. Solo lectura:
+    para entender el negocio y ofrecerle el plan correcto (declarado en el
+    aviso de privacidad). `sin_iniciar` = negocio anterior al cuestionario.
+    """
+    return await onboarding.para_gerencia(tenant_id)
 
 
 @router.get("/tenants/{tenant_id}/transacciones", response_model=list[TransaccionOut])

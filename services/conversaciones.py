@@ -20,6 +20,7 @@ workflow ya sabe leer.
 """
 
 import secrets
+from dataclasses import dataclass
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -68,21 +69,70 @@ _PROVEEDOR_DEL_CLIENTE = (
 )
 
 
-async def es_de_proveedor(tenant_id: UUID, conversacion_id: UUID, proveedor_id: UUID) -> bool | None:
-    """None si la conversación no existe en este tenant; si existe, si le toca a ese proveedor."""
+@dataclass(frozen=True)
+class Alcance:
+    """
+    Qué conversaciones ve un rol acotado (vendedor / proveedor). El equipo del
+    negocio (ROLES_NEGOCIO) no tiene alcance: se pasa None y ve todo.
+
+    `proveedor_id` / `vendedor_id` son la ficha de quien llama, o None si no
+    es de ese rol.
+    """
+
+    portal_user_id: UUID
+    proveedor_id: UUID | None = None
+    vendedor_id: UUID | None = None
+
+
+# Un cliente es "del vendedor" si su lead está en la cartera de ese vendedor.
+_LEAD_DEL_VENDEDOR = (
+    "EXISTS (SELECT 1 FROM client_pipeline p "
+    "WHERE p.tenant_id = c.tenant_id AND p.user_id = c.user_id AND p.vendedor_id = {v})"
+)
+
+
+def _visible_acotado(u: str, p: str, v: str) -> str:
+    """
+    Fragmento SQL: lo que ve un rol acotado. `u`, `p`, `v` son los
+    placeholders ($n) de su portal_user_id, su proveedor_id y su vendedor_id.
+
+    Lo que le asignaron a él, MÁS lo que su ficha le hace propio mientras
+    nadie lo tenga (cita más reciente con ese proveedor / lead de ese
+    vendedor). Si la conversación ya está asignada a otra persona deja de ser
+    suya por la ficha: la asignación explícita manda.
+    """
+    return (
+        f"(c.asignado_a = {u}::uuid OR (c.asignado_a IS NULL AND ("
+        f"({p}::uuid IS NOT NULL AND {_PROVEEDOR_DEL_CLIENTE} = {p}::uuid) OR "
+        f"({v}::uuid IS NOT NULL AND {_LEAD_DEL_VENDEDOR.format(v=f'{v}::uuid')})"
+        f")))"
+    )
+
+
+# Nombre a mostrar de quien tiene la conversación.
+_ASIGNADO_NOMBRE = (
+    "COALESCE(NULLIF(TRIM(CONCAT_WS(' ', pa.nombres, pa.apellido_paterno)), ''), "
+    "pa.full_name, pa.email)"
+)
+
+
+async def es_visible(tenant_id: UUID, conversacion_id: UUID, alcance: Alcance) -> bool | None:
+    """None si la conversación no existe en este tenant; si existe, si entra en el alcance."""
     fila = await fetch_one(
         f"""
-        SELECT {_PROVEEDOR_DEL_CLIENTE} = $3 AS suya
+        SELECT {_visible_acotado('$3', '$4', '$5')} AS visible
         FROM conversations c
         WHERE c.id = $2 AND c.tenant_id = $1
         """,
         tenant_id,
         conversacion_id,
-        proveedor_id,
+        alcance.portal_user_id,
+        alcance.proveedor_id,
+        alcance.vendedor_id,
     )
     if fila is None:
         return None
-    return bool(fila["suya"])
+    return bool(fila["visible"])
 
 
 async def cuenta_del_proveedor(conversacion_id: UUID) -> UUID | None:
@@ -104,6 +154,38 @@ async def cuenta_del_proveedor(conversacion_id: UUID) -> UUID | None:
     return fila["portal_user_id"] if fila else None
 
 
+async def usuarios_con_acceso(conversacion_id: UUID) -> set[UUID]:
+    """
+    Cuentas de rol acotado que ven la conversación AHORA, para avisarles en
+    vivo (no están en la room del negocio: realtime.py). Con asignado, solo
+    él; sin asignado, el proveedor / vendedor dueño por su ficha.
+    """
+    fila = await fetch_one("SELECT asignado_a FROM conversations WHERE id = $1", conversacion_id)
+    if fila is None:
+        return set()
+    if fila["asignado_a"] is not None:
+        return {fila["asignado_a"]}
+
+    cuentas: set[UUID] = set()
+    proveedor = await cuenta_del_proveedor(conversacion_id)
+    if proveedor is not None:
+        cuentas.add(proveedor)
+    vendedor = await fetch_one(
+        """
+        SELECT v.portal_user_id
+        FROM conversations c
+        JOIN client_pipeline p ON p.tenant_id = c.tenant_id AND p.user_id = c.user_id
+        JOIN vendedores v ON v.id = p.vendedor_id
+        JOIN portal_users pu ON pu.id = v.portal_user_id
+        WHERE c.id = $1 AND v.activo AND pu.is_active
+        """,
+        conversacion_id,
+    )
+    if vendedor is not None:
+        cuentas.add(vendedor["portal_user_id"])
+    return cuentas
+
+
 # ============================================================
 # Lectura
 # ============================================================
@@ -114,9 +196,15 @@ async def listar(
     buscar: str | None,
     limite: int,
     offset: int,
-    proveedor_id: UUID | None = None,
+    alcance: Alcance | None = None,
+    asignada: str | None = None,
+    yo: UUID | None = None,
 ):
-    """Con `proveedor_id`, solo las conversaciones de sus clientes (_PROVEEDOR_DEL_CLIENTE)."""
+    """
+    Con `alcance` (rol acotado), solo lo suyo (_visible_acotado).
+    `asignada`: 'mias' (requiere `yo`), 'sin_asignar' o el uuid (texto) de
+    una persona; None = sin filtro.
+    """
     return await fetch_all(
         f"""
         SELECT
@@ -125,6 +213,12 @@ async def listar(
             c.status,
             c.started_at,
             c.last_message_at,
+            c.asignado_a,
+            {_ASIGNADO_NOMBRE} AS asignado_nombre,
+            pa.role AS asignado_rol,
+            c.asignado_en,
+            c.asignado_origen,
+            c.asignacion_nota,
             {_NOMBRE} AS usuario_nombre,
             {_HANDLE} AS usuario_handle,
             {_USERNAME} AS usuario_username,
@@ -137,6 +231,7 @@ async def listar(
             {_MINUTOS_VENTANA} AS minutos_restantes_ventana
         FROM conversations c
         JOIN users u ON u.id = c.user_id
+        LEFT JOIN portal_users pa ON pa.id = c.asignado_a
         WHERE c.tenant_id = $1
           AND ($2::varchar IS NULL OR c.channel_type = $2)
           AND ($3::varchar IS NULL OR c.status = $3)
@@ -145,7 +240,13 @@ async def listar(
             OR u.display_name ILIKE '%' || $4 || '%'
             OR {_HANDLE} ILIKE '%' || $4 || '%'
           )
-          AND ($7::uuid IS NULL OR {_PROVEEDOR_DEL_CLIENTE} = $7)
+          AND ($7::uuid IS NULL OR {_visible_acotado('$7', '$8', '$9')})
+          AND (
+            $10::varchar IS NULL
+            OR ($10 = 'sin_asignar' AND c.asignado_a IS NULL)
+            OR ($10 = 'mias' AND c.asignado_a = $11::uuid)
+            OR ($10 NOT IN ('sin_asignar', 'mias') AND c.asignado_a::text = $10)
+          )
         ORDER BY c.last_message_at DESC
         LIMIT $5 OFFSET $6
         """,
@@ -155,7 +256,11 @@ async def listar(
         buscar,
         limite,
         offset,
-        proveedor_id,
+        alcance.portal_user_id if alcance else None,
+        alcance.proveedor_id if alcance else None,
+        alcance.vendedor_id if alcance else None,
+        asignada,
+        yo,
     )
 
 
@@ -196,6 +301,12 @@ async def detalle(tenant_id: UUID, conversacion_id: UUID):
         f"""
         SELECT
             c.id, c.channel_type, c.status, c.started_at,
+            c.asignado_a,
+            {_ASIGNADO_NOMBRE} AS asignado_nombre,
+            pa.role AS asignado_rol,
+            c.asignado_en,
+            c.asignado_origen,
+            c.asignacion_nota,
             {_NOMBRE} AS usuario_nombre,
             {_HANDLE} AS usuario_handle,
             {_USERNAME} AS usuario_username,
@@ -203,6 +314,7 @@ async def detalle(tenant_id: UUID, conversacion_id: UUID):
             {_MINUTOS_VENTANA} AS minutos_restantes_ventana
         FROM conversations c
         JOIN users u ON u.id = c.user_id
+        LEFT JOIN portal_users pa ON pa.id = c.asignado_a
         WHERE c.id = $1 AND c.tenant_id = $2
         """,
         conversacion_id,
@@ -239,7 +351,7 @@ async def _conversacion_para_escritura(tenant_id: UUID, conversacion_id: UUID):
     """
     fila = await fetch_one(
         """
-        SELECT c.id, c.status, c.channel_type,
+        SELECT c.id, c.status, c.channel_type, c.asignado_a,
                u.whatsapp_id, u.instagram_id, u.facebook_id
         FROM conversations c
         JOIN users u ON u.id = c.user_id
@@ -632,12 +744,17 @@ async def tomar_conversacion(tenant_id: UUID, conversacion_id: UUID):
     return fila
 
 
-async def volver_a_ia(tenant_id: UUID, conversacion_id: UUID):
+async def volver_a_ia(
+    tenant_id: UUID, conversacion_id: UUID, actor_portal_user_id: UUID | None = None
+):
     """
     Le devuelve el control a la IA: solo hace falta poner status='active'
     otra vez. entrada-canal-universal ya relee este campo en cada mensaje
     entrante (nodo "¿Conversación transferida?"), así que no hace falta
     avisarle a n8n por ningún otro lado.
+
+    La asignación termina con la transferencia: sin humano al frente no hay
+    nadie a quien asignarle la conversación. Queda en el historial.
     """
     conv = await _conversacion_para_escritura(tenant_id, conversacion_id)
 
@@ -647,14 +764,30 @@ async def volver_a_ia(tenant_id: UUID, conversacion_id: UUID):
             detail="La conversación no está en modo humano",
         )
 
-    fila = await fetch_one(
-        """
-        UPDATE conversations
-        SET status = 'active',
-            metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{ack_pendiente}', 'false')
-        WHERE id = $1
-        RETURNING id, status
-        """,
-        conversacion_id,
-    )
+    async with transaccion() as conn:
+        fila = await conn.fetchrow(
+            """
+            UPDATE conversations
+            SET status = 'active',
+                metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{ack_pendiente}', 'false'),
+                asignado_a = NULL, asignado_en = NULL,
+                asignado_origen = NULL, asignacion_nota = NULL
+            WHERE id = $1
+            RETURNING id, status
+            """,
+            conversacion_id,
+        )
+        if conv["asignado_a"] is not None:
+            await conn.execute(
+                """
+                INSERT INTO conversacion_asignaciones
+                    (tenant_id, conversation_id, de_portal_user_id, a_portal_user_id,
+                     origen, actor_portal_user_id, nota)
+                VALUES ($1, $2, $3, NULL, 'sistema', $4, 'Devuelta a la IA')
+                """,
+                tenant_id,
+                conversacion_id,
+                conv["asignado_a"],
+                actor_portal_user_id,
+            )
     return fila

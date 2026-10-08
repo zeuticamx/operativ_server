@@ -13,7 +13,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from realtime import avisar_a_proveedor, broadcast_alerta
+from realtime import avisar_a_proveedor, broadcast_alerta, emitir_datos
 from deps import (
     ROL_PROVEEDOR,
     ROLES_GERENCIA,
@@ -26,6 +26,7 @@ from deps import (
     verificar_acceso_tenant,
 )
 from services import calendario
+from services.asignacion_conversaciones import reasignar_de_cuenta
 from services.calendario import actor_desde_portal, verificar_calendario_activo
 from schemas import (
     CambiarEstadoReservaIn,
@@ -240,6 +241,9 @@ async def actualizar_proveedor(
             datos.activo,
             datos.orden,
         )
+    if datos.activo is False and actual.activo and actual.portal_user_id is not None:
+        # Sus conversaciones asignadas vuelven al dueño.
+        await reasignar_de_cuenta(tenant_id, actual.portal_user_id, f"El proveedor {actual.nombre}")
     return _a_proveedor_out(calendario.Proveedor.desde_fila(fila))
 
 
@@ -272,7 +276,7 @@ _MOTIVOS_RECHAZO: dict[str, tuple[int, str]] = {
     ),
     "fuera_de_horario": (
         status.HTTP_422_UNPROCESSABLE_ENTITY,
-        "El horario seleccionado está fuera de la jornada de atención del barbero",
+        "El horario seleccionado está fuera de la jornada de atención del proveedor",
     ),
     "horario_ocupado": (
         status.HTTP_409_CONFLICT,
@@ -281,7 +285,7 @@ _MOTIVOS_RECHAZO: dict[str, tuple[int, str]] = {
 }
 
 
-# Mensajes exactos pedidos por la historia de usuario del barbero
+# Mensajes exactos pedidos por la historia de usuario del proveedor
 # (Escenarios 2 y 5): 422 para "el descanso en sí es inválido" (no cabe en
 # la jornada), 409 para "choca con algo que ya existe" (una cita
 # confirmada) — misma separación de categorías que _MOTIVOS_RECHAZO.
@@ -615,6 +619,12 @@ async def listar_reservas(
     return [_a_reserva_out(r) for r in reservas]
 
 
+async def _avisar_cambio_reservas(tenant_id: UUID, *proveedor_ids: UUID | None) -> None:
+    """Pide recargar el calendario al negocio y a los proveedores afectados."""
+    cuentas = [await calendario.cuenta_del_proveedor(p) for p in proveedor_ids if p is not None]
+    await emitir_datos(tenant_id, "reservas", cuentas)
+
+
 @router_calendario.post("/{tenant_id}/calendario/reservas", response_model=ReservaOut)
 async def crear_reserva_manual(
     datos: ReservaCrearIn,
@@ -644,7 +654,9 @@ async def crear_reserva_manual(
     # gerencia (walk-in/teléfono). Notificarle a gerencia de una reserva que
     # gerencia misma acaba de crear no informa nada -- la alerta
     # "reserva_creada" es solo para las que llegan solas por el chat (ver
-    # routers/eventos.py::calendario_crear_reserva).
+    # routers/eventos.py::calendario_crear_reserva). Sí se refresca el
+    # calendario del proveedor al que le tocó (evento de UI, sin alerta).
+    await _avisar_cambio_reservas(tenant_id, reserva.proveedor_id)
     return _a_reserva_out(reserva)
 
 
@@ -669,6 +681,7 @@ async def reprogramar_reserva(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reserva no encontrada")
         codigo, detalle = _MOTIVOS_RECHAZO[motivo]
         raise HTTPException(status_code=codigo, detail=detalle)
+    await _avisar_cambio_reservas(tenant_id, reserva.proveedor_id)
     return _a_reserva_out(reserva)
 
 
@@ -681,10 +694,10 @@ async def reasignar_reserva(
     tenant_id: UUID,
     usuario: UsuarioActual = Depends(gerencia_actual),
 ):
-    """Cambia el barbero de una cita ya agendada, conservando su horario."""
+    """Cambia el proveedor de una cita ya agendada, conservando su horario."""
     verificar_acceso_tenant(usuario, tenant_id)
     await verificar_calendario_activo(tenant_id)
-    await _exigir_reserva(reserva_id, tenant_id)
+    actual = await _exigir_reserva(reserva_id, tenant_id)
 
     reserva, motivo = await calendario.reasignar_reserva(
         reserva_id, tenant_id, datos.proveedor_id, actor_desde_portal(usuario.id, usuario.email)
@@ -694,6 +707,8 @@ async def reasignar_reserva(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reserva no encontrada")
         codigo, detalle = _MOTIVOS_RECHAZO[motivo]
         raise HTTPException(status_code=codigo, detail=detalle)
+    # Al proveedor anterior y al nuevo.
+    await _avisar_cambio_reservas(tenant_id, actual.proveedor_id, reserva.proveedor_id)
     return _a_reserva_out(reserva)
 
 
@@ -729,6 +744,7 @@ async def cancelar_reserva(
     cuenta = await calendario.cuenta_del_proveedor(reserva.proveedor_id)
     if cuenta != usuario.id:
         await avisar_a_proveedor(tenant_id, cuenta, *alerta)
+    await emitir_datos(tenant_id, "reservas", [cuenta])
     return _a_reserva_out(reserva)
 
 
@@ -756,6 +772,7 @@ async def cambiar_estado_reserva(
     )
     if reserva is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reserva no encontrada")
+    await _avisar_cambio_reservas(tenant_id, reserva.proveedor_id)
     return _a_reserva_out(reserva)
 
 
@@ -803,7 +820,7 @@ async def leer_auditoria(
 ):
     """
     Escenarios 2 y 3: tabla cronológica (más reciente primero) con filtros
-    por rango de fechas, barbero, cliente, cita puntual y estatus resultante.
+    por rango de fechas, proveedor, cliente, cita puntual y estatus resultante.
     Solo lectura — no hay POST/PATCH/DELETE en esta sección (Escenario 5):
     cada fila la escribe el propio backend al procesar el evento, nunca a
     mano.

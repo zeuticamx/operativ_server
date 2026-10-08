@@ -340,13 +340,13 @@ async def test_ve_las_conversaciones_de_sus_clientes(http_client, agenda, monkey
     # que la base local de pruebas no tiene; lo que se prueba acá es la guarda.
     from routers import conversaciones as router_conv
 
-    async def tomar_falso(tenant_id, conversacion_id):
-        return {"id": conversacion_id, "status": "transferred"}
+    async def tomar_falso(tenant_id, conversacion_id, usuario_id):
+        return {"id": conversacion_id, "status": "transferred", "asignado_a": usuario_id}
 
     async def emit_falso(*_a, **_k):
         return None
 
-    monkeypatch.setattr(router_conv.svc, "tomar_conversacion", tomar_falso)
+    monkeypatch.setattr(router_conv.asig, "tomar", tomar_falso)
     monkeypatch.setattr(router_conv, "emit_conversacion_estado", emit_falso)
     r = await http_client.post(f"/api/conversaciones/{conv_ana}/tomar", headers=h)
     assert r.status_code == 200, r.text

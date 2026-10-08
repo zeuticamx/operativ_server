@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
-from realtime import broadcast_alerta
+from realtime import broadcast_alerta, emitir_datos
 from schemas import AgendaItemOut
 from session import fetch_all, fetch_one
 
@@ -266,6 +266,35 @@ async def reprogramaciones_de_seguimiento(
 # ============================================================
 # Aviso al vendedor
 # ============================================================
+async def avisar_cambio_vendedores(
+    tenant_id: UUID,
+    vendedor_ids: list[Optional[UUID]],
+    recurso: str = "cartera",
+) -> None:
+    """
+    Evento de UI en vivo (sin alerta) para que el portal de cada vendedor
+    afectado vuelva a pedir su cartera/agenda. Vendedores sin cuenta del
+    portal se ignoran. Best-effort: se llama después del commit.
+    """
+    try:
+        ids = [v for v in vendedor_ids if v is not None]
+        filas = (
+            await fetch_all(
+                """
+                SELECT portal_user_id FROM vendedores
+                WHERE tenant_id = $1 AND id = ANY($2::uuid[]) AND portal_user_id IS NOT NULL
+                """,
+                tenant_id,
+                ids,
+            )
+            if ids
+            else []
+        )
+        await emitir_datos(tenant_id, recurso, [f["portal_user_id"] for f in filas])
+    except Exception:
+        log.exception("No se pudo avisar el cambio a los vendedores (tenant=%s)", tenant_id)
+
+
 async def avisar_reprogramacion(
     tenant_id: UUID,
     *,
@@ -305,6 +334,7 @@ async def avisar_reprogramacion(
         )
         if fila is None or fila["portal_user_id"] == actor_portal_user_id:
             return
+        await emitir_datos(tenant_id, "agenda", [fila["portal_user_id"]])
 
         cuando = fecha_legible(fecha_nueva, fila["zona_horaria"]) if fecha_nueva else None
         if asignada:

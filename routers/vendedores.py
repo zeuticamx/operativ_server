@@ -25,7 +25,9 @@ from services.acceso_plan import (
     exigir_cupo_vendedor,
     exigir_herramienta,
 )
+from services.agenda import avisar_cambio_vendedores
 from services.asignacion import asignar_vendedor_automatico, leer_config
+from services.asignacion_conversaciones import reasignar_de_cuenta
 from deps import (
     ROL_VENDEDOR,
     UsuarioActual,
@@ -456,6 +458,9 @@ async def actualizar_vendedor(
             datos.activo,
             list(ESTADOS_CERRADOS),
         )
+    if datos.activo is False and actual["activo"] and actual["portal_user_id"] is not None:
+        # Sus conversaciones asignadas vuelven al dueño (sus leads, no: ver arriba).
+        await reasignar_de_cuenta(tenant_id, actual["portal_user_id"], f"El vendedor {actual['nombre']}")
     return VendedorOut(**dict(fila))
 
 
@@ -634,6 +639,11 @@ async def reasignar_pendientes(
                 },
             )
 
+    if movimientos:
+        await avisar_cambio_vendedores(
+            tenant_id, [vendedor_id, *{m["vendedor_nuevo_id"] for m in movimientos}]
+        )
+
     return ReasignacionOut(
         vendedor_id=vendedor_id,
         estrategia=config.estrategia,
@@ -689,6 +699,7 @@ async def asignar_cliente(
 
     async with transaccion() as conn:
         embudo = await get_or_create_pipeline(tenant_id, user_id, conn)
+        anterior = embudo.vendedor_id
 
         destino = datos.vendedor_id
         if destino is None:
@@ -702,6 +713,7 @@ async def asignar_cliente(
             embudo.id,
         )
 
+    await avisar_cambio_vendedores(tenant_id, [anterior, destino])
     return _a_pipeline_out(fila)
 
 
@@ -835,6 +847,7 @@ async def cambiar_estado(
         },
     )
 
+    await avisar_cambio_vendedores(tenant_id, [resultado.vendedor_id])
     return resultado
 
 

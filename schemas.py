@@ -208,6 +208,8 @@ class UsuarioOut(BaseModel):
     # aviso permanente de modo solo lectura.
     impersonado_por: str | None = None
     impersonacion_expira: datetime | None = None
+    # En "ver como": hasta cuándo el dueño autorizó editar; None = solo lectura.
+    impersonacion_escritura_hasta: datetime | None = None
     # Perfil personal (routers/perfil.py). Van acá para que el sidebar pinte
     # nombre, foto e indicador de "faltan datos" sin otra petición.
     nombres: str | None = None
@@ -216,6 +218,10 @@ class UsuarioOut(BaseModel):
     # Cambia cada vez que se sube o borra la foto: el portal la usa para no
     # mostrar una foto vieja cacheada. None = sin foto.
     foto_version: str | None = None
+    # Cuenta nueva que todavía no contestó ni omitió el cuestionario de
+    # bienvenida (services/onboarding.py). Solo para owner/superadmin, y
+    # nunca en "ver como". El portal lo manda a /bienvenida al entrar.
+    onboarding_pendiente: bool = False
 
 
 # ============================================================
@@ -372,7 +378,22 @@ class ActualizarHerramientaIn(BaseModel):
 # ============================================================
 # CONVERSACIONES
 # ============================================================
-class ConversacionOut(BaseModel):
+class AsignacionConversacionOut(BaseModel):
+    """
+    Quién tiene la conversación (services/asignacion_conversaciones.py).
+    Todo None = sin asignar. `asignado_origen`: 'owner' | 'usuario' | 'agente'.
+    `asignacion_nota`: por qué cayó donde cayó (p. ej. "No se pudo asignar
+    automáticamente: …"), para que el dueño la reasigne.
+    """
+    asignado_a: UUID | None = None
+    asignado_nombre: str | None = None
+    asignado_rol: str | None = None
+    asignado_en: datetime | None = None
+    asignado_origen: str | None = None
+    asignacion_nota: str | None = None
+
+
+class ConversacionOut(AsignacionConversacionOut):
     id: UUID
     channel_type: str
     status: str
@@ -418,12 +439,27 @@ class EnviarMensajeIn(BaseModel):
 
 
 class ConversacionEstadoOut(BaseModel):
-    """Respuesta de POST .../conversaciones/{id}/volver-a-ia."""
+    """Respuesta de POST .../conversaciones/{id}/tomar y .../volver-a-ia."""
     id: UUID
     status: str
+    asignado_a: UUID | None = None
 
 
-class ConversacionDetalleOut(BaseModel):
+class AsignarConversacionIn(BaseModel):
+    """Body de PUT .../conversaciones/{id}/asignacion."""
+    asignado_a: UUID
+    nota: str | None = Field(default=None, max_length=500)
+
+
+class AsignableOut(BaseModel):
+    """Una cuenta a la que se le puede asignar una conversación."""
+    id: UUID
+    nombre: str
+    email: str
+    role: str
+
+
+class ConversacionDetalleOut(AsignacionConversacionOut):
     id: UUID
     channel_type: str
     status: str
@@ -1111,6 +1147,10 @@ class TipoAlerta(str, Enum):
     conversacion_transferida = "conversacion_transferida"
     perfil_incompleto = "perfil_incompleto"
     agenda_reprogramada = "agenda_reprogramada"
+    solicitud_escritura = "solicitud_escritura"
+    conversacion_asignada = "conversacion_asignada"
+    asignacion_fallida = "asignacion_fallida"
+    mensaje_conversacion_asignada = "mensaje_conversacion_asignada"
 
 class AlertaOut(BaseModel):
     id: UUID
@@ -1776,6 +1816,45 @@ class ImpersonarOut(BaseModel):
 
 
 # ------------------------------------------------------------
+# Acceso de soporte con escritura, autorizado por el dueño
+# (services/acceso_soporte.py, routers/acceso_soporte.py)
+# ------------------------------------------------------------
+EstadoAccesoSoporte = Literal[
+    "pendiente", "aprobada", "rechazada", "revocada", "cancelada", "vencida", "terminada"
+]
+
+
+class SolicitarEscrituraIn(BaseModel):
+    # Obligatorio y visible para el dueño: es lo que decide si autoriza.
+    motivo: str = Field(min_length=5, max_length=500)
+
+
+class AprobarEscrituraIn(BaseModel):
+    duracion_min: Literal[15, 30, 60]
+
+
+class SolicitudEscrituraOut(BaseModel):
+    id: UUID
+    gerente_email: str
+    motivo: str
+    estado: EstadoAccesoSoporte
+    creada_en: datetime
+    expira_en: datetime
+    resuelta_en: datetime | None = None
+    canal: Literal["portal", "correo"] | None = None
+    duracion_min: int | None = None
+    concede_hasta: datetime | None = None
+
+
+class InfoEnlaceEscrituraOut(BaseModel):
+    tenant_nombre: str
+    gerente_email: str
+    motivo: str
+    estado: EstadoAccesoSoporte
+    expira_en: datetime
+
+
+# ------------------------------------------------------------
 # Catálogo de planes (tabla `planes`), administrado desde plataforma
 # ------------------------------------------------------------
 # `PlanOut` (arriba) es lo que ve un tenant contratando — sin `activo` ni
@@ -2239,10 +2318,32 @@ class ConversacionTransferidaIn(BaseModel):
     motivo: str | None = Field(default=None, max_length=500)
     cliente_nombre: str | None = Field(default=None, max_length=200)
     cliente_telefono: str | None = Field(default=None, max_length=50)
+    # A quién ligar la conversación: lo que el agente SUGIERE ('ventas',
+    # 'agenda' u 'otro'). El backend decide quién la recibe; cualquier otro
+    # valor (o ninguno) se trata como 'otro' y va al dueño.
+    area: str | None = Field(default=None, max_length=20)
 
 
 class ConversacionTransferidaOut(BaseModel):
     registrado: bool
+    # Quién quedó con la conversación (None = no se asignó: ya tenía dueño).
+    asignado_a: UUID | None = None
+    cayo_en_owner: bool = False
+
+
+class MensajeConversacionAsignadaIn(BaseModel):
+    """
+    n8n avisa que el cliente escribió en una conversación transferida, para
+    que quien la tiene asignada se entere (el mensaje se guarda en silencio).
+    """
+    tenant_id: UUID
+    conversation_id: UUID
+    cliente_nombre: str | None = Field(default=None, max_length=200)
+    texto: str | None = Field(default=None, max_length=500)
+
+
+class MensajeConversacionAsignadaOut(BaseModel):
+    avisado: bool
 
 
 # ============================================================
@@ -2368,3 +2469,119 @@ class AceptarInvitacionIn(InvitacionTokenIn):
         if v is not True:
             raise ValueError("Debes aceptar los Términos y Condiciones para crear tu cuenta")
         return v
+
+
+# ============================================================
+# ONBOARDING: cuestionario de bienvenida (services/onboarding.py)
+# ============================================================
+# Las claves de GiroNegocio son también las de PLANTILLAS_GIRO en el
+# servicio: sumar un giro es agregarlo en los dos lados.
+GiroNegocio = Literal[
+    "salon_belleza",
+    "salud",
+    "restaurante",
+    "tienda",
+    "inmobiliaria",
+    "servicios_profesionales",
+    "educacion",
+    "otro",
+]
+TonoAgente = Literal["cercano", "formal", "juvenil"]
+CanalOnboarding = Literal["whatsapp", "instagram", "facebook"]
+EstadoOnboarding = Literal["sin_iniciar", "pendiente", "omitido", "completado"]
+
+
+class OnboardingRespuestasIn(BaseModel):
+    """
+    Lo que contesta el dueño. Todo menos el giro tiene default para poder
+    guardar a medias y retomar después.
+
+    `descripcion` y `horario` terminan dentro del system prompt: se dejan en
+    una sola línea (sin saltos que imiten una sección `# REGLAS` nueva) y con
+    tope de largo. El dueño igual puede editar el prompt entero en /agente;
+    esto es para que el texto generado quede limpio, no un control de
+    seguridad.
+    """
+    giro: GiroNegocio
+    descripcion: str = Field(default="", max_length=300)
+    agenda_citas: bool = False
+    vende_por_chat: bool = False
+    visitas_campo: bool = False
+    consulta_sistemas: bool = False
+    num_vendedores: int = Field(default=0, ge=0, le=1000)
+    num_proveedores: int = Field(default=0, ge=0, le=1000)
+    canales: list[CanalOnboarding] = Field(default_factory=list, max_length=3)
+    tono: TonoAgente = "cercano"
+    horario: str = Field(default="", max_length=200)
+
+    @field_validator("descripcion", "horario")
+    @classmethod
+    def _una_linea(cls, v: str) -> str:
+        return " ".join(v.split())
+
+    @field_validator("canales")
+    @classmethod
+    def _sin_repetidos(cls, v: list[str]) -> list[str]:
+        return list(dict.fromkeys(v))
+
+
+class PlanRecomendadoOut(BaseModel):
+    nombre: str
+    precio_monthly: Decimal
+    herramientas: list[Herramienta]
+    # None = sin tope.
+    max_vendedores: int | None
+    max_proveedores: int | None
+    # False cuando ningún plan activo cubre todo: se recomienda el más
+    # completo y `faltantes` dice qué queda afuera (para hablar con ventas).
+    cubre_todo: bool
+    faltantes: list[str]
+
+
+class OnboardingRecomendacionOut(BaseModel):
+    system_prompt: str
+    modulos: list[Herramienta]
+    # None solo si no hay ningún plan activo en el catálogo.
+    plan: PlanRecomendadoOut | None
+
+
+class OnboardingOut(BaseModel):
+    estado: EstadoOnboarding
+    respuestas: OnboardingRespuestasIn | None
+    recomendacion: OnboardingRecomendacionOut | None
+    # Si al aplicar se le daría el plan recomendado de prueba: solo a quien
+    # nunca tuvo suscripción ni prueba del onboarding.
+    prueba_disponible: bool
+    dias_prueba: int
+    # El prompt actual del agente lo escribió el dueño (no es el inicial ni
+    # el último del onboarding): aplicar no lo pisa sin `sobrescribir_prompt`.
+    prompt_editado: bool
+
+
+class OnboardingAplicarIn(BaseModel):
+    sobrescribir_prompt: bool = False
+
+
+class PruebaOnboardingOut(BaseModel):
+    plan: str
+    vence: datetime
+
+
+class OnboardingAplicadoOut(BaseModel):
+    prompt_actualizado: bool
+    modulos_encendidos: list[Herramienta]
+    # Sugeridos que el plan vigente no incluye: se encienden al contratarlo.
+    modulos_pendientes: list[Herramienta]
+    prueba: PruebaOnboardingOut | None
+    plan_recomendado: str | None
+
+
+class OnboardingGerenciaOut(BaseModel):
+    """Lo que ve gerencia de plataforma en la ficha del negocio."""
+    estado: EstadoOnboarding
+    respuestas: OnboardingRespuestasIn | None
+    plan_recomendado: str | None
+    completado_en: datetime | None
+    omitido_en: datetime | None
+    prueba_otorgada_en: datetime | None
+    actualizado_en: datetime | None

@@ -123,8 +123,8 @@ surte efecto en su siguiente llamada.
 | `owner` | `/auth/registro` (o Google) | Todo el negocio | Todo |
 | `superadmin` | a mano | Todo el negocio | Todo |
 | `member` ("colaborador") | invitación | Conversaciones, embudo, agenda, métricas | Nada (agente, canales, herramientas, equipo, pagos) |
-| `vendedor` | invitación ligada a su ficha | **Solo lo suyo**: su ficha, sus leads, su cartera de campo | Nada |
-| `proveedor` | invitación ligada a su ficha del calendario | **Solo lo suyo**: su agenda y las conversaciones de sus clientes | Sus descansos y días libres |
+| `vendedor` | invitación ligada a su ficha | **Solo lo suyo**: su ficha, sus leads, su cartera de campo y las conversaciones que le asignaron (o de sus leads sin dueño) | Nada |
+| `proveedor` | invitación ligada a su ficha del calendario | **Solo lo suyo**: su agenda y las conversaciones que le asignaron (o de sus clientes sin dueño) | Sus descansos y días libres |
 
 Las guardas, de la más amplia a la más estrecha:
 
@@ -384,6 +384,53 @@ la extensión tiene que coincidir; las dimensiones se leen del encabezado
 antes de subir. Se guarda en `portal_user_fotos` (BYTEA): el contenedor no
 tiene volumen persistente.
 
+### Cuestionario de bienvenida (`sql/42_onboarding.sql`)
+
+Al crear una cuenta, el dueño contesta un cuestionario sobre su negocio y
+el sistema le arma una configuración de arranque. `services/onboarding.py`,
+`routers/onboarding.py`; en el portal, `/bienvenida`.
+
+```
+GET  /api/onboarding           estado + respuestas + recomendación (si hay respuestas)
+PUT  /api/onboarding           guarda respuestas, devuelve la vista previa; no aplica nada
+POST /api/onboarding/aplicar   {sobrescribir_prompt}: prompt + prueba + módulos
+POST /api/onboarding/omitir    204
+GET  /api/gerencia/tenants/{id}/onboarding   lo que contestó (solo lectura, gerencia de plataforma)
+```
+
+- **Quién:** solo owner/superadmin (`gerencia_actual`). Sin `requiere_herramienta`
+  a propósito: la cuenta nueva no tiene plan y esto es lo que se lo recomienda.
+  `/api/onboarding` está en `RUTAS_SENSIBLES`: "ver como" puede mirar, nunca
+  escribir (aplicar otorga una prueba).
+- **Pendiente:** `_crear_cuenta` (alta por correo y por Google) inserta la fila
+  de `tenant_onboarding`; `GET /auth/yo` devuelve `onboarding_pendiente` (sin
+  completar ni omitir, rol de gerencia, no en "ver como") y el portal manda a
+  `/bienvenida` al aterrizar en `/dashboard`, una vez por pestaña. Los negocios
+  anteriores no tienen fila: no se les impone, lo abren desde `/agente`
+  ("Configuración guiada").
+- **Prompt:** plantillas fijas por giro (`PLANTILLAS_GIRO`, mismas claves que
+  `schemas.GiroNegocio`) + tono + tareas por módulo; sin LLM. El texto libre
+  (`descripcion`, `horario`) se deja en una línea y con tope de largo.
+  `PROMPT_INICIAL` vive en este servicio. **No pisa un prompt editado a mano**
+  (distinto del inicial y del último que escribió el onboarding,
+  `prompt_generado`) sin `sobrescribir_prompt`.
+- **Plan recomendado:** el más barato de `planes WHERE activo` (orden de la
+  grilla) que incluye los módulos sugeridos y cuyo `max_vendedores` /
+  `max_proveedores` alcanza para el equipo declarado (un cupo solo cuenta si se
+  usa ese módulo). Si ninguno cubre todo, el que deja menos afuera, con
+  `cubre_todo=false` y `faltantes`. Lee la matriz de la tabla, no una copia.
+- **Prueba:** al aplicar, el plan recomendado por `DIAS_PRUEBA` (14) días: fila
+  de `tenant_subscriptions` con `origen='prueba'`, `otorgada_por='onboarding'`,
+  créditos del plan y asiento `prueba_onboarding` en `gerencia_auditoria`. Una
+  sola vez (`prueba_otorgada_en`) y **solo a quien nunca tuvo fila en
+  `tenant_subscriptions`** (ni suspendido/baja): pagar, cancelar y volver a
+  contestar no da otra. Nunca cobra: el resto se contrata en `/suscripcion`.
+- **Módulos:** después del commit, enciende (nunca apaga) los sugeridos que el
+  plan vigente permite — `gestion_vendedores_activo`, `calendario_activo` (con
+  sus `tenant_tools`); los que no, vuelven en `modulos_pendientes`.
+- Las respuestas las ve gerencia de plataforma; está declarado en el aviso de
+  privacidad del portal (`frontend/app/privacidad`).
+
 ### Gestionar suscripción y borrar cuenta (solo el dueño)
 
 ```
@@ -447,17 +494,70 @@ GET    /api/agente/modelos   Lista blanca de modelos
 
 ### Conversaciones
 ```
-GET    /api/conversaciones                Listado con filtros
+GET    /api/conversaciones                Listado con filtros (?asignada=mias|sin_asignar|<uuid>)
 GET    /api/conversaciones/metricas
 GET    /api/conversaciones/{id}           Detalle con mensajes
 POST   /api/conversaciones/{id}/mensajes       Respuesta manual (handoff humano)
-POST   /api/conversaciones/{id}/tomar          Un humano toma el control (status='transferred', sin acuse)
-POST   /api/conversaciones/{id}/volver-a-ia    Le devuelve el control a la IA
+POST   /api/conversaciones/{id}/tomar          Un humano toma el control y se la queda (status='transferred', sin acuse)
+POST   /api/conversaciones/{id}/volver-a-ia    Le devuelve el control a la IA (y termina la asignación)
+PUT    /api/conversaciones/{id}/asignacion     Owner/superadmin asigna o reasigna {asignado_a, nota?}
+DELETE /api/conversaciones/{id}/asignacion     Deja la conversación sin asignar (owner, o el asignado la suya)
+GET    /api/conversaciones/asignables          Cuentas a las que se les puede asignar (solo gerencia)
 POST   /api/conversaciones/{id}/adjuntos       Imagen/documento por WhatsApp (multipart: archivo, leyenda?)
 GET    /api/conversaciones/{id}/adjuntos/{aid} Contenido de un adjunto (JWT, filtrado por tenant)
 GET    /api/media/{token}                      Público: lo descargan NeuroAPI/Meta (token aleatorio)
 POST   /api/eventos/adjunto-entrante           n8n asocia a un mensaje el archivo que mandó el cliente
+POST   /api/eventos/conversacion-transferida   n8n avisa que escaló; el backend asigna según `area`
+POST   /api/eventos/mensaje-conversacion-asignada  n8n avisa al asignado que el cliente escribió
 ```
+
+### Asignación de conversaciones (`sql/41_conversaciones_asignacion.sql`)
+
+Una conversación transferida a un humano tiene como máximo **un responsable**:
+`conversations.asignado_a` → `portal_users.id` (la cuenta, no la ficha de
+vendedor / proveedor: un rol nuevo no necesita migración, solo sumarse a
+`deps.ROLES_ASIGNABLES`). Cada cambio queda en `conversacion_asignaciones`.
+Asignar apaga la IA (`status='transferred'`).
+
+| Acción | Quién |
+|---|---|
+| Ver todas, con quién la tiene | owner, superadmin, member |
+| Asignar / reasignar / quitar | owner, superadmin (`gerencia_actual`) |
+| Tomar | quien la vea, **si está sin asignar**; si ya es de otro, 409. Solo el owner se la quita |
+| Soltar la propia | el asignado (`DELETE .../asignacion`) |
+| Contestar y `volver-a-ia` | el asignado o la gerencia (`puede_operar`); sin asignar, quien la vea |
+
+- **Alcance de vendedor y proveedor** (`conversaciones._visible_acotado`): lo
+  que les asignaron, más lo que su ficha les hace propio **mientras nadie lo
+  tenga** (proveedor: cita más reciente con él; vendedor: lead de su cartera).
+  Asignada a otro, deja de ser suya. Ajena del mismo negocio: 403; de otro
+  negocio o inexistente: 404. `permitir_a_roles_acotados(...)` es lista blanca
+  por nombre de endpoint, como `permitir_a_proveedor`.
+- **Exclusión mutua**: `tomar` / `asignar` / `soltar` bloquean la fila
+  (`SELECT … FOR UPDATE`), así que dos personas que la toman a la vez no se
+  pisan: gana una y la otra recibe 409 con el nombre de quien la tiene.
+- **Agente de n8n** (`services/asignacion_conversaciones.py`): `escalar_humano`
+  manda `area` (`ventas` | `agenda` | `otro`) a `/eventos/conversacion-transferida`.
+  El LLM solo **sugiere**; `elegir_destino` (pura, con tests) decide: `agenda`
+  → proveedor de la cita más reciente; `ventas` → vendedor del lead, o el que
+  toque por `tenant_vendedor_config`; `otro` o un valor inventado → owner. Todo
+  se valida (ficha y cuenta activas, módulo encendido). **Si no hay a quién,
+  cae en el owner** con `asignacion_nota` y una alerta `asignacion_fallida`
+  para que reasigne. Es idempotente: si ya tenía dueño (reintento de n8n, o un
+  humano se adelantó) no pisa nada, y una falla de asignación nunca tumba el
+  aviso.
+- **Mensajes del cliente**: n8n llama `/eventos/mensaje-conversacion-asignada`
+  cuando el cliente escribe en una transferida; el asignado recibe una alerta
+  personal (una sin leer por conversación, para no llenarlo).
+- **Quien se queda sin acceso** (desactivar la cuenta en `/equipo`, o la ficha
+  de vendedor / proveedor): sus conversaciones pasan al owner con una nota
+  (`reasignar_de_cuenta`); si no, nadie más podría tomarlas.
+- Una conversación cerrada que el cliente reabre es una conversación nueva en
+  n8n: **no hereda** el asignado.
+- `alertas.tipo` es `VARCHAR(30)`: los tipos nuevos (`conversacion_asignada`,
+  `asignacion_fallida`, `mensaje_conversacion_asignada`) caben justo.
+- Escribe en `conversations` (tabla de n8n) con la misma excepción deliberada
+  del handoff; las columnas son nullables, así que los INSERT de n8n no cambian.
 
 **Adjuntos de WhatsApp.** Solo JPG/PNG (tope `WA_IMAGEN_MAX_BYTES`, 5 MB) y
 PDF/DOCX (`WA_DOCUMENTO_MAX_BYTES`, 16 MB). El tipo se decide por la firma de
@@ -1010,12 +1110,37 @@ que cada garantía vive en un lugar concreto:
 
 | Garantía | Dónde |
 |---|---|
-| Solo lectura: todo lo que no sea GET/HEAD/OPTIONS → 403 | `deps._validar_impersonacion`, dentro de `usuario_actual` (lo usan todos los endpoints; no hay lista de permitidos que olvidar) |
+| Solo lectura por defecto: todo lo que no sea GET/HEAD/OPTIONS → 403, salvo que el dueño haya autorizado escribir (abajo) | `deps._validar_impersonacion`, dentro de `usuario_actual` (lo usan todos los endpoints; no hay lista de permitidos que olvidar) |
 | Si sacan al gerente de `gerencia_users`, muere en la siguiente petición | la misma función relee la tabla |
 | Desde el "ver como" no se entra a `/gerencia` | `es_gerencia_plataforma` forzado a `False` |
 | Dura `IMPERSONACION_MINUTOS` (30) y no se estira | sin refresh token; `/auth/refresh` solo acepta `type: refresh` |
 | No marca alertas leídas por el socket | `realtime.marcar_leida` ignora sids de solo lectura |
 | Queda registrado con motivo | `gerencia_auditoria`, acción `impersonacion` |
+
+#### Escritura autorizada por el dueño
+
+Para corregir algo por el cliente, soporte pide permiso de edición (botón del
+banner de "ver como"; solo cargos de `ACCESO_SOPORTE_CARGOS`, por defecto
+`gerencia,developer,ti`, con motivo obligatorio). El dueño (owner/superadmin)
+recibe una alerta personal `solicitud_escritura` y un correo, y responde desde
+el portal o desde el enlace del correo (`/acceso-soporte#t=...`, token de un
+solo uso; en BD solo el SHA-256):
+
+| Endpoint | Quién |
+|---|---|
+| `GET /acceso-soporte/estado`, `POST /acceso-soporte/solicitar`, `POST /acceso-soporte/cancelar` | sesión de "ver como" (las dos escrituras son las únicas que `deps` deja pasar en solo lectura) |
+| `GET /acceso-soporte/solicitudes`, `POST /acceso-soporte/{id}/aprobar` (15/30/60 min), `/rechazar`, `/revocar` | owner/superadmin, nunca una sesión de "ver como" |
+| `POST /acceso-soporte/enlace/leer`, `/enlace/aprobar`, `/enlace/rechazar` | públicos; token en el body |
+
+Reglas: una solicitud viva (pendiente o aprobada) por gerente y negocio;
+pendiente vive `ACCESO_SOPORTE_VIGENCIA_MINUTOS` (30); aprobar/rechazar es
+idempotente (una ya resuelta o vencida devuelve su estado, sin efecto); un id
+de otro negocio es 404. La concesión se relee de BD en cada petición, no viaja
+en el token: revocar o vencerse cierra la escritura en la siguiente llamada.
+Con concesión siguen cerradas las rutas de `services.acceso_soporte.RUTAS_SENSIBLES`
+(contraseña, equipo, pagos, credenciales de canales, perfil, borrar cuenta) y cada
+escritura queda en `gerencia_auditoria` (`impersonacion_escritura`, más las acciones
+`acceso_escritura_*`). Tests: `tests/test_acceso_soporte.py`.
 
 Entra como el `owner` (si no hay, `superadmin` o `member`), nunca como
 `vendedor`. En el portal el token va a `sessionStorage`: solo afecta a esa

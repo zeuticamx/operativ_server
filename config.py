@@ -294,6 +294,16 @@ class Settings:
     # tiene que pedir otro (con otro motivo, que queda en la bitácora).
     IMPERSONACION_MINUTOS: int = int(os.getenv("IMPERSONACION_MINUTOS", "30"))
 
+    # "Ver como" con escritura (sql/40_acceso_soporte_escritura.sql): cuánto
+    # tiene el dueño para responder una solicitud, y qué cargos de
+    # gerencia_users pueden pedirla (comparados sin mayúsculas, exactos).
+    ACCESO_SOPORTE_VIGENCIA_MINUTOS: int = int(os.getenv("ACCESO_SOPORTE_VIGENCIA_MINUTOS", "30"))
+    ACCESO_SOPORTE_CARGOS: frozenset[str] = frozenset(
+        c.strip().lower()
+        for c in os.getenv("ACCESO_SOPORTE_CARGOS", "gerencia,developer,ti").split(",")
+        if c.strip()
+    )
+
     # ---- CORS ----
     FRONTEND_ORIGINS: list[str] = [
         o.strip()

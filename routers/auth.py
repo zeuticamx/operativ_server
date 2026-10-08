@@ -12,9 +12,10 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from config import settings
 from services.correo import ErrorEnvioCorreo, enviar_codigo_verificacion
 from services.google_login import TokenGoogleInvalido, verificar_credential
-from services import invitaciones, recuperacion_password
+from services import invitaciones, onboarding, recuperacion_password
+from services.onboarding import PROMPT_INICIAL
 from routers.perfil import version_foto
-from deps import UsuarioActual, usuario_actual
+from deps import ROLES_GERENCIA, UsuarioActual, usuario_actual
 from security import (
     crear_access_token,
     crear_refresh_token,
@@ -44,21 +45,6 @@ from schemas import (
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
-
-
-PROMPT_INICIAL = """Eres el asistente virtual de {negocio}.
-
-# TONO
-Cercano, profesional y resolutivo. Español neutro.
-
-# FORMATO
-- Máximo 2 o 3 líneas por respuesta. Es un chat, no un correo.
-- Ve directo a resolver, sin fórmulas de cortesía largas.
-
-# REGLAS
-- Si no sabes algo, dilo. No inventes datos ni precios.
-- Usa el historial: no vuelvas a preguntar lo que el cliente ya te dijo.
-- Si preguntan si eres una IA, confírmalo con naturalidad."""
 
 
 # ============================================================
@@ -177,6 +163,11 @@ async def _crear_cuenta(
         "Asistente",
         PROMPT_INICIAL.format(negocio=nombre_negocio),
     )
+
+    # El cuestionario de bienvenida queda pendiente: el portal lo abre en la
+    # primera entrada (services/onboarding.py). Los negocios anteriores a
+    # esto no tienen fila y por eso no se les impone.
+    await conn.execute("INSERT INTO tenant_onboarding (tenant_id) VALUES ($1)", tenant_id)
 
     user_id = await conn.fetchval(
         """
@@ -788,6 +779,15 @@ async def yo(usuario: UsuarioActual = Depends(usuario_actual)):
         usuario.id,
     )
 
+    # Solo a quien puede contestarlo, y nunca en "ver como": soporte no
+    # tiene que caer en el cuestionario del negocio que está mirando.
+    onboarding_pendiente = bool(
+        usuario.tenant_id
+        and usuario.role in ROLES_GERENCIA
+        and usuario.impersonado_por is None
+        and await onboarding.pendiente(usuario.tenant_id)
+    )
+
     return UsuarioOut(
         id=usuario.id,
         email=usuario.email,
@@ -798,8 +798,10 @@ async def yo(usuario: UsuarioActual = Depends(usuario_actual)):
         es_gerencia_plataforma=usuario.es_gerencia_plataforma,
         impersonado_por=usuario.impersonado_por,
         impersonacion_expira=usuario.impersonacion_expira,
+        impersonacion_escritura_hasta=usuario.impersonacion_escritura_hasta,
         nombres=perfil["nombres"] if perfil else None,
         apellido_paterno=perfil["apellido_paterno"] if perfil else None,
         perfil_completo=bool(perfil and perfil["perfil_completado_en"]),
         foto_version=version_foto(perfil["foto_actualizada_en"]) if perfil else None,
+        onboarding_pendiente=onboarding_pendiente,
     )

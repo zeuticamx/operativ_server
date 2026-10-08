@@ -29,6 +29,7 @@ from schemas import (
     UsuarioEquipoOut,
 )
 from services import invitaciones as svc
+from services.asignacion_conversaciones import reasignar_de_cuenta
 from session import execute, fetch_all, fetch_one, transaccion
 
 router = APIRouter(prefix="/equipo", tags=["equipo"])
@@ -114,6 +115,13 @@ async def actualizar_usuario(
         tenant_id,
         datos.activo,
     )
+    if not datos.activo:
+        # Lo que tenía asignado vuelve al dueño: a nombre de alguien sin
+        # acceso nadie más podría tomarlo (solo el owner se lo quita).
+        actualizado = await fetch_one(f"{_SELECT_USUARIOS} WHERE pu.id = $1", usuario_id)
+        await reasignar_de_cuenta(
+            tenant_id, usuario_id, actualizado["nombre"] or actualizado["email"]
+        )
     actualizado = await fetch_one(f"{_SELECT_USUARIOS} WHERE pu.id = $1", usuario_id)
     return _usuario_out(actualizado, usuario)
 

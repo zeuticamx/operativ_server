@@ -347,6 +347,68 @@ async def enviar_recordatorio_perfil(
 
 
 # ============================================================
+# Solicitud de acceso de soporte con escritura (services/acceso_soporte.py)
+# ============================================================
+_TEXTO_ACCESO_SOPORTE = """Hola.
+
+{gerente} (soporte de OperativAI) pidió permiso para EDITAR la cuenta de
+{negocio}, no solo verla.
+
+Motivo que dejó: {motivo}
+
+Tú decides: puedes aprobarlo (eligiendo cuánto tiempo), rechazarlo o
+ignorarlo. Abre este enlace para responder:
+
+    {enlace}
+
+La solicitud vence en {minutos} minutos y el enlace solo sirve una vez.
+También la puedes responder desde tu portal, en la notificación. Mientras
+no la apruebes, soporte solo puede ver tu cuenta.
+
+Si no esperabas esto, recházalo.
+"""
+
+_HTML_ACCESO_SOPORTE = """<div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:460px;margin:0 auto;padding:24px;color:#1c1c1c">
+  <p style="margin:0 0 16px;font-size:14px">
+    <strong>{gerente}</strong> (soporte de OperativAI) pidió permiso para
+    <strong>editar</strong> la cuenta de <strong>{negocio}</strong>, no solo verla.
+  </p>
+  <p style="margin:0 0 20px;font-size:13px;color:#444">Motivo: {motivo}</p>
+  <p style="margin:0 0 20px">
+    <a href="{enlace}" style="display:inline-block;padding:10px 18px;background:#1c1c1c;color:#fff;border-radius:6px;font-size:14px;text-decoration:none">
+      Revisar solicitud
+    </a>
+  </p>
+  <p style="margin:0 0 12px;font-size:12px;color:#888">
+    Vence en {minutos} minutos y el enlace solo sirve una vez. También puedes
+    responder desde la notificación de tu portal. Si no esperabas esto, recházalo.
+  </p>
+</div>"""
+
+
+async def enviar_solicitud_acceso_soporte(
+    destino: str, gerente: str, negocio: str, motivo: str, enlace: str, minutos: int
+) -> None:
+    """Lanza ErrorEnvioCorreo si el SMTP falla."""
+    datos = {
+        "gerente": gerente,
+        "negocio": negocio,
+        "motivo": motivo,
+        "enlace": enlace,
+        "minutos": minutos,
+    }
+    await enviar_correo(
+        destino,
+        asunto=f"Soporte pide permiso para editar la cuenta de {negocio}",
+        texto=_TEXTO_ACCESO_SOPORTE.format(**datos),
+        # El motivo lo escribe una persona.
+        html=_HTML_ACCESO_SOPORTE.format(
+            **{k: html_mod.escape(str(v)) for k, v in datos.items()}
+        ),
+    )
+
+
+# ============================================================
 # Invitación al equipo de un negocio (services/invitaciones.py)
 # ============================================================
 _TEXTO_INVITACION = """Hola.
