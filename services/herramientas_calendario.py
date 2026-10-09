@@ -113,8 +113,9 @@ def definiciones() -> list[dict[str, Any]]:
             "display_name": "Consultar horarios disponibles",
             "description": (
                 "Usa esta herramienta cuando el cliente quiera saber qué horarios hay libres "
-                "para agendar. Necesitas el servicio_id antes de llamarla — si no lo tienes, "
-                "pregunta primero o llama a consultar_servicios."
+                "para agendar. SIEMPRE llama primero a consultar_servicios si no tienes ya el "
+                "UUID exacto del servicio en el historial de esta conversación — nunca lo "
+                "inventes ni lo deduzcas del nombre."
             ),
             "parametros_schema": {
                 "fecha_desde": {"type": "string", "format": "YYYY-MM-DD", "required": True},
@@ -127,13 +128,23 @@ def definiciones() -> list[dict[str, Any]]:
                         "fecha_desde y fecha_hasta"
                     ),
                 },
-                "servicio_id": {"type": "string", "required": True},
+                "servicio_id": {
+                    "type": "string",
+                    "required": True,
+                    "description": (
+                        "Debe ser el UUID exacto del campo `id` que devolvió "
+                        "consultar_servicios — nunca el nombre del servicio ni un slug "
+                        "inventado a partir de él."
+                    ),
+                },
                 "proveedor_id": {
                     "type": "string",
                     "required": False,
                     "description": (
                         "Si el cliente no pidió un proveedor específico, omite este campo — "
-                        "el sistema mostrará disponibilidad de todos"
+                        "el sistema mostrará disponibilidad de todos. Si lo incluyes, debe "
+                        "ser el UUID exacto del campo `id` que devolvió consultar_proveedores, "
+                        "nunca el nombre."
                     ),
                 },
             },
@@ -161,8 +172,23 @@ def definiciones() -> list[dict[str, Any]]:
                         '(ej. "corte con máquina 2", "primera vez")'
                     ),
                 },
-                "servicio_id": {"type": "string", "required": True},
-                "proveedor_id": {"type": "string", "required": True},
+                "servicio_id": {
+                    "type": "string",
+                    "required": True,
+                    "description": (
+                        "Debe ser el UUID exacto del campo `id` que devolvió "
+                        "consultar_servicios — nunca el nombre del servicio ni un slug "
+                        "inventado a partir de él."
+                    ),
+                },
+                "proveedor_id": {
+                    "type": "string",
+                    "required": True,
+                    "description": (
+                        "Debe ser el UUID exacto del campo `id` que devolvió "
+                        "consultar_proveedores — nunca el nombre del proveedor."
+                    ),
+                },
             },
             "config": _post("reservas", idempotent=True, incluir_contacto=True),
         },
