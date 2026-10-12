@@ -27,7 +27,12 @@ from deps import (
 )
 from services import calendario
 from services.asignacion_conversaciones import reasignar_de_cuenta
-from services.calendario import actor_desde_portal, verificar_calendario_activo
+from services.calendario import (
+    CancelacionRechazada,
+    actor_desde_portal,
+    detalle_cancelacion_rechazada,
+    verificar_calendario_activo,
+)
 from schemas import (
     CambiarEstadoReservaIn,
     CancelarReservaIn,
@@ -320,7 +325,8 @@ async def listar_servicios(
 
     filas = await fetch_all(
         """
-        SELECT id, tenant_id, nombre, duracion_minutos, precio, activo, creado_en
+        SELECT id, tenant_id, nombre, duracion_minutos, precio, activo, creado_en,
+               antelacion_cancelacion_horas
         FROM servicios
         WHERE tenant_id = $1 AND ($2::boolean IS NULL OR activo = $2)
         ORDER BY activo DESC, nombre
@@ -344,14 +350,18 @@ async def crear_servicio(
 
     fila = await fetch_one(
         """
-        INSERT INTO servicios (tenant_id, nombre, duracion_minutos, precio)
-        VALUES ($1, $2, $3, $4)
-        RETURNING id, tenant_id, nombre, duracion_minutos, precio, activo, creado_en
+        INSERT INTO servicios (
+            tenant_id, nombre, duracion_minutos, precio, antelacion_cancelacion_horas
+        )
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, tenant_id, nombre, duracion_minutos, precio, activo, creado_en,
+                  antelacion_cancelacion_horas
         """,
         tenant_id,
         datos.nombre,
         datos.duracion_minutos,
         datos.precio,
+        datos.antelacion_cancelacion_horas,
     )
     return _a_servicio_out(calendario.Servicio.desde_fila(fila))
 
@@ -369,22 +379,35 @@ async def actualizar_servicio(
     await verificar_calendario_activo(tenant_id)
     anterior = await _exigir_servicio(servicio_id, tenant_id)
 
-    fila = await fetch_one(
-        """
-        UPDATE servicios SET
-            nombre           = COALESCE($3, nombre),
-            duracion_minutos = COALESCE($4, duracion_minutos),
-            precio           = COALESCE($5, precio),
-            activo           = COALESCE($6, activo)
-        WHERE id = $1 AND tenant_id = $2
-        RETURNING id, tenant_id, nombre, duracion_minutos, precio, activo, creado_en
-        """,
+    # La antelación es la única columna que admite NULL como valor nuevo: se
+    # toca solo si el campo vino en el cuerpo (`null` explícito la borra, omitirlo
+    # no la cambia), así que no puede ir con COALESCE como las demás.
+    asignar_antelacion = "antelacion_cancelacion_horas" in datos.model_fields_set
+    parametros: list = [
         servicio_id,
         tenant_id,
         datos.nombre,
         datos.duracion_minutos,
         datos.precio,
         datos.activo,
+    ]
+    set_antelacion = ""
+    if asignar_antelacion:
+        parametros.append(datos.antelacion_cancelacion_horas)
+        set_antelacion = f", antelacion_cancelacion_horas = ${len(parametros)}"
+
+    fila = await fetch_one(
+        f"""
+        UPDATE servicios SET
+            nombre           = COALESCE($3, nombre),
+            duracion_minutos = COALESCE($4, duracion_minutos),
+            precio           = COALESCE($5, precio),
+            activo           = COALESCE($6, activo){set_antelacion}
+        WHERE id = $1 AND tenant_id = $2
+        RETURNING id, tenant_id, nombre, duracion_minutos, precio, activo, creado_en,
+                  antelacion_cancelacion_horas
+        """,
+        *parametros,
     )
 
     # Las citas ya agendadas no se enteran de este cambio: hora_fin quedó
@@ -726,9 +749,19 @@ async def cancelar_reserva(
     actual = await _exigir_reserva(reserva_id, tenant_id)
     await _gestiona(usuario, actual.proveedor_id)
 
-    reserva = await calendario.cancelar_reserva(
-        reserva_id, tenant_id, datos.motivo, actor_desde_portal(usuario.id, usuario.email)
-    )
+    # Origen "equipo" lo decide este endpoint, no el cuerpo (R17/R18).
+    try:
+        reserva = await calendario.cancelar_reserva(
+            reserva_id,
+            tenant_id,
+            datos.motivo,
+            actor_desde_portal(usuario.id, usuario.email),
+            origen="equipo",
+        )
+    except CancelacionRechazada as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=detalle_cancelacion_rechazada(exc)
+        )
     if reserva is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reserva no encontrada")
 

@@ -14,14 +14,23 @@ con `get_tool_credentials(tenant, tool_key)` y llama al backend:
                     mensaje entrante, `incluir_contacto` agrega
                     cliente_nombre / cliente_telefono.
 
-Las cinco de acá apuntan a /api/eventos/calendario/* (routers/eventos.py)
+Las nueve de acá apuntan a /api/eventos/calendario/* (routers/eventos.py)
 con X-Internal-Token. Antes se daban de alta a mano por SQL en producción;
 ahora las crea este módulo cuando un negocio enciende el calendario (el
 dueño, gerencia o una prueba) y las pausa cuando lo apaga.
 
 Las definiciones son las que ya corrían en producción (copiadas de las
 ejecuciones de n8n), salvo `cancelar_reserva`, que nunca llegó a
-ejecutarse: su config sale de la ruta y de CancelarReservaEventoIn.
+ejecutarse (su config sale de la ruta y de CancelarReservaEventoIn), y
+`consultar_cancelacion_reserva` (spec 001): consulta previa de solo lectura
+para informar al cliente del límite de cancelación antes de cancelar.
+`historial_citas_cliente` (spec 002): historial del cliente de la
+conversación, sin parámetros del modelo ni contacto. Su fila se crea siempre,
+pero solo puede estar activa si HISTORIAL_CITAS_N8N_PUBLICADO es true (n8n ya
+envía el conversation_id real); ver `compuerta_abierta` y `_encender`.
+`consultar_citas_proximas` y `reagendar_reserva` (re-agendar): lista las citas
+futuras del cliente (con su reserva_id) y mueve una de ellas. Las dos deducen al
+cliente de ese mismo conversation_id, así que comparten la compuerta del historial.
 
 Qué se respeta del dueño:
   - nombre y descripción editados desde /herramientas no se pisan;
@@ -45,6 +54,12 @@ from session import fetch_all, transaccion
 log = logging.getLogger("operativai.herramientas_calendario")
 
 AUTH_HEADER = "X-Internal-Token"
+HERRAMIENTA_HISTORIAL = "historial_citas_cliente"
+HERRAMIENTA_CITAS_PROXIMAS = "consultar_citas_proximas"
+HERRAMIENTA_REAGENDAR = "reagendar_reserva"
+# Herramientas que deducen al cliente de `conversation_id` y por eso solo pueden
+# estar activas si n8n ya lo manda de verdad (HISTORIAL_CITAS_N8N_PUBLICADO).
+CON_COMPUERTA = frozenset({HERRAMIENTA_HISTORIAL, HERRAMIENTA_CITAS_PROXIMAS, HERRAMIENTA_REAGENDAR})
 
 
 def _get(ruta: str) -> dict[str, Any]:
@@ -202,7 +217,11 @@ def definiciones() -> list[dict[str, Any]]:
                 "revisa si tú mismo creaste esa reserva antes en esta misma conversación "
                 "(el resultado de crear_reserva incluye el id). Si no cuentas con el "
                 "reserva_id y el cliente tampoco lo tiene, dile que no puedes cancelarla sin "
-                "ese dato y ofrece escalar con el negocio."
+                "ese dato y ofrece escalar con el negocio. Antes de cancelar, llama a "
+                "consultar_cancelacion_reserva para saber si el servicio tiene una antelación "
+                "mínima e infórmale al cliente de ese límite con amabilidad; si cancelar ahora "
+                "fuera tardío, avísale y confirma que quiere seguir. La cancelación se permite "
+                "igualmente: solo queda marcada como tardía."
             ),
             "parametros_schema": {
                 "reserva_id": {
@@ -217,11 +236,110 @@ def definiciones() -> list[dict[str, Any]]:
             },
             "config": _post("reservas/cancelar", idempotent=False, incluir_contacto=False),
         },
+        {
+            "tool_key": "consultar_cancelacion_reserva",
+            "tool_type": "http_post_json",
+            "display_name": "Consultar cancelación de una cita",
+            "description": (
+                "Usa esta herramienta ANTES de cancelar una cita, cuando el cliente pida "
+                "cancelarla, para informarle del límite de cancelación del servicio. No cancela "
+                "nada: devuelve antelacion_minima_horas (null si el servicio no tiene regla), "
+                "segundos_restantes hasta la cita, puede_cancelar, motivo_no_cancelable y "
+                "cancelacion_seria_tardia (si cancelar en este momento quedaría marcada como "
+                "tardía). Si puede_cancelar es false, explica el motivo al cliente en lugar de "
+                "llamar a cancelar_reserva. Necesitas el reserva_id, igual que para cancelar."
+            ),
+            "parametros_schema": {
+                "reserva_id": {
+                    "type": "string",
+                    "required": True,
+                    "description": (
+                        "UUID de la reserva a consultar. Debe venir del código de "
+                        "confirmación que dio el cliente, o del resultado de una llamada "
+                        "anterior a crear_reserva en esta conversación."
+                    ),
+                },
+            },
+            "config": _post(
+                "reservas/consultar-cancelacion", idempotent=True, incluir_contacto=False
+            ),
+        },
+        {
+            "tool_key": HERRAMIENTA_HISTORIAL,
+            "tool_type": "http_post_json",
+            "display_name": "Historial de citas del cliente",
+            "description": (
+                "Usa esta herramienta cuando el cliente pregunte por su historial de citas. "
+                "No necesitas pedirle ni indicar ningún dato: el sistema ya sabe quién es. "
+                "Devuelve sus citas pasadas y canceladas, como máximo las 10 más recientes; "
+                "no incluye citas futuras confirmadas. Es solo de consulta: no sirve para "
+                "cancelar ni reprogramar una cita. Si la respuesta es que no se encontró la "
+                "conversación, dile al cliente que no se puede consultar ahora."
+            ),
+            "parametros_schema": {},
+            "config": _post("historial-cliente", idempotent=False, incluir_contacto=False),
+        },
+        {
+            "tool_key": HERRAMIENTA_CITAS_PROXIMAS,
+            "tool_type": "http_post_json",
+            "display_name": "Citas próximas del cliente",
+            "description": (
+                "Usa esta herramienta ANTES de re-agendar (cuando el cliente quiera cambiar, "
+                "mover o re-agendar una cita) y cuando pregunte por sus próximas citas. No "
+                "necesitas pedirle ningún dato: el sistema ya sabe quién es. Devuelve sus citas "
+                "futuras confirmadas, cada una con reserva_id, servicio_id, proveedor_id, "
+                "fecha_hora_inicio y cancelacion_seria_tardia. Es solo de consulta."
+            ),
+            "parametros_schema": {},
+            "config": _post("citas-proximas", idempotent=False, incluir_contacto=False),
+        },
+        {
+            "tool_key": HERRAMIENTA_REAGENDAR,
+            "tool_type": "http_post_json",
+            "display_name": "Re-agendar una cita",
+            "description": (
+                "Usa esta herramienta para cambiar la hora de una cita existente del cliente. "
+                "Flujo obligatorio: 1) llama a consultar_citas_proximas; si hay varias, "
+                "pregunta cuál quiere mover; 2) averigua la nueva fecha y hora con "
+                "consultar_disponibilidad usando el servicio_id y el proveedor_id de ESA cita "
+                "(se mantienen); 3) ANTES de llamar a esta herramienta explícale al cliente que "
+                "para re-agendar se cancelará su cita actual y se agendará la nueva, y que si "
+                "cancelacion_seria_tardia es true el cambio quedará registrado como cancelación "
+                "tardía; 4) llámala SOLO cuando el cliente haya confirmado explícitamente. "
+                "Hace todo en un paso: si el horario nuevo ya no está libre, la cita actual "
+                "NO se cancela. NUNCA uses crear_reserva para re-agendar: dejaría la cita "
+                "anterior sin cancelar."
+            ),
+            "parametros_schema": {
+                "reserva_id": {
+                    "type": "string",
+                    "required": True,
+                    "description": (
+                        "UUID exacto del campo `reserva_id` de la cita que devolvió "
+                        "consultar_citas_proximas — nunca inventado."
+                    ),
+                },
+                "fecha": {"type": "string", "format": "YYYY-MM-DD", "required": True},
+                "hora": {"type": "string", "format": "HH:MM", "required": True},
+            },
+            "config": _post("reservas/reagendar", idempotent=True, incluir_contacto=False),
+        },
     ]
 
 
 def claves() -> frozenset[str]:
     return frozenset(d["tool_key"] for d in definiciones())
+
+
+def compuerta_abierta(tool_key: str, publicado: bool) -> bool:
+    """
+    Si la herramienta puede estar activa. Solo las de CON_COMPUERTA (historial
+    y re-agendar) dependen de que n8n haya publicado el cambio (`publicado`);
+    el resto siempre está abierta.
+    """
+    if tool_key in CON_COMPUERTA:
+        return publicado
+    return True
 
 
 def es_gestionada(tool_key: str) -> bool:
@@ -231,19 +349,35 @@ def es_gestionada(tool_key: str) -> bool:
 
 async def _encender(conn: asyncpg.Connection, tenant_id: UUID) -> None:
     for d in definiciones():
+        abierta = compuerta_abierta(d["tool_key"], settings.HISTORIAL_CITAS_N8N_PUBLICADO)
+        # $8 = compuerta abierta. Abierta: reglas de siempre (una pausa del
+        # dueño se respeta, una del sistema se reactiva). Cerrada: queda
+        # desactivada, y la marca de "pausada por el sistema" solo se escribe
+        # si estaba activa o ya la tenía; una pausa del dueño (desactivada y
+        # sin marca) no se marca, para que sobreviva a abrir la compuerta.
         await conn.execute(
             """
             INSERT INTO tenant_tools
                 (tenant_id, tool_key, tool_type, display_name, description,
                  parametros_schema, config, is_enabled)
-            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, true)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb,
+                    CASE WHEN $8::boolean THEN $7::jsonb
+                         ELSE $7::jsonb || '{"pausada_por_sistema": true}'::jsonb END,
+                    $8::boolean)
             ON CONFLICT (tenant_id, tool_key) DO UPDATE SET
                 tool_type         = EXCLUDED.tool_type,
                 parametros_schema = EXCLUDED.parametros_schema,
-                config            = EXCLUDED.config,
-                is_enabled        = tenant_tools.is_enabled
-                                    OR COALESCE((tenant_tools.config->>'pausada_por_sistema')::boolean,
-                                                false),
+                config            = CASE
+                    WHEN $8::boolean THEN $7::jsonb
+                    WHEN tenant_tools.is_enabled
+                         OR COALESCE((tenant_tools.config->>'pausada_por_sistema')::boolean, false)
+                        THEN $7::jsonb || '{"pausada_por_sistema": true}'::jsonb
+                    ELSE $7::jsonb
+                END,
+                is_enabled        = $8::boolean
+                                    AND (tenant_tools.is_enabled
+                                         OR COALESCE((tenant_tools.config->>'pausada_por_sistema')::boolean,
+                                                     false)),
                 updated_at        = NOW()
             """,
             tenant_id,
@@ -253,6 +387,7 @@ async def _encender(conn: asyncpg.Connection, tenant_id: UUID) -> None:
             d["description"],
             d["parametros_schema"],
             d["config"],
+            abierta,
         )
 
         # Sin token n8n recibiría 503 del backend en cada llamada: mejor que
@@ -324,3 +459,10 @@ async def sincronizar_todos() -> None:
         await sincronizar(f["tenant_id"], True)
     if filas:
         log.info("Herramientas de calendario sincronizadas para %s negocios", len(filas))
+        if not settings.HISTORIAL_CITAS_N8N_PUBLICADO:
+            log.warning(
+                "HISTORIAL_CITAS_N8N_PUBLICADO=false: las herramientas %s quedan desactivadas en "
+                "%s negocio(s) con calendario encendido",
+                sorted(CON_COMPUERTA),
+                len(filas),
+            )

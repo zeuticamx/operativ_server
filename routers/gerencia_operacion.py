@@ -12,7 +12,7 @@ cambia algo deja asiento en gerencia_auditoria dentro de su transacción.
   /gerencia/tenants/{id}/impersonar       ver el portal como el negocio
 """
 
-from datetime import date
+from datetime import date, datetime, timezone
 from uuid import UUID
 
 import asyncpg
@@ -24,6 +24,7 @@ from realtime import emit_conversacion_estado, emit_mensaje
 from schemas import (
     AdjuntoOut,
     AlertaGerenciaOut,
+    CancelacionTardiaFilaOut,
     CohorteOut,
     CohortesOut,
     ConversacionDetalleOut,
@@ -40,7 +41,10 @@ from schemas import (
 )
 from security import crear_token_impersonacion
 from services import adjuntos
+from services import avisos_conversacion as avisos
+from services import calendario as calendario_svc
 from services import conversaciones as conversaciones_svc
+from services.cancelacion_citas import Granularidad, validar_rango_reporte
 from services.gerencia import registrar_auditoria
 from services.gerencia_salud import problemas_de_salud
 from session import fetch_all, fetch_value, transaccion
@@ -360,6 +364,37 @@ async def cohortes(
 
 
 # ============================================================
+# Cancelaciones tardias (spec 001)
+# ============================================================
+@router.get("/cancelaciones-tardias", response_model=list[CancelacionTardiaFilaOut])
+async def cancelaciones_tardias(
+    desde: date | None = Query(None),
+    hasta: date | None = Query(None),
+    granularidad: Granularidad = Query("dia"),
+    tenant_id: UUID | None = Query(None),
+    servicio_id: UUID | None = Query(None),
+):
+    """
+    Cancelaciones que hicieron los CLIENTES (no el equipo), por tenant,
+    servicio y periodo, con cuantas fueron tardias. Solo lectura y sin datos
+    del cliente final. Sin rango: ultimos 30 dias. Rango maximo 366 dias.
+    El acceso lo cierra el router (gerencia_plataforma_actual).
+    """
+    try:
+        desde_r, hasta_r = validar_rango_reporte(desde, hasta, datetime.now(timezone.utc).date())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    filas = await calendario_svc.reporte_cancelaciones_tardias(
+        desde=desde_r,
+        hasta=hasta_r,
+        granularidad=granularidad,
+        tenant_id=tenant_id,
+        servicio_id=servicio_id,
+    )
+    return [CancelacionTardiaFilaOut(**f) for f in filas]
+
+
+# ============================================================
 # Ver como el negocio
 # ============================================================
 @router.post("/tenants/{tenant_id}/impersonar", response_model=ImpersonarOut)
@@ -581,6 +616,7 @@ async def tomar_conversacion_tenant(
     )
 
     await emit_conversacion_estado(tenant_id, conversacion_id, fila["status"])
+    await avisos.tomada(tenant_id, conversacion_id, gerente.email, desde_soporte=True)
     return ConversacionEstadoOut(**dict(fila))
 
 
@@ -593,6 +629,11 @@ async def volver_a_ia_conversacion_tenant(
     conversacion_id: UUID,
     gerente: UsuarioActual = Depends(gerencia_plataforma_actual),
 ):
+    previo = await fetch_value(
+        "SELECT asignado_a FROM conversations WHERE id = $1 AND tenant_id = $2",
+        conversacion_id,
+        tenant_id,
+    )
     fila = await conversaciones_svc.volver_a_ia(tenant_id, conversacion_id)
     await registrar_auditoria(
         actor_email=gerente.email,
@@ -603,4 +644,7 @@ async def volver_a_ia_conversacion_tenant(
     )
 
     await emit_conversacion_estado(tenant_id, conversacion_id, fila["status"])
+    await avisos.devuelta_a_ia(
+        tenant_id, conversacion_id, previo, None, gerente.email, desde_soporte=True
+    )
     return ConversacionEstadoOut(**dict(fila))

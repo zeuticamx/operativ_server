@@ -32,6 +32,17 @@ class Settings:
     # fallar cerrado: un endpoint que crea leads y confirma qué tenant_id
     # existe no puede quedar abierto por olvidar una variable.
     N8N_INTERNAL_TOKEN: str = os.getenv("N8N_INTERNAL_TOKEN", "")
+    # Compuerta de la herramienta `historial_citas_cliente` (spec 002): el
+    # operador la enciende cuando n8n ya publicó el cambio que envía el
+    # conversation_id real a la herramienta. Mientras sea false la herramienta
+    # existe pero desactivada y el dueño no puede activarla.
+    HISTORIAL_CITAS_N8N_PUBLICADO: bool = os.getenv("HISTORIAL_CITAS_N8N_PUBLICADO", "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "si",
+        "sí",
+    )
 
     # URL de producción del webhook `entrada-canal-universal` de n8n. El
     # backend le reenvía los mensajes entrantes de WhatsApp que NeuroAPI

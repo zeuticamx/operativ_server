@@ -23,14 +23,17 @@ import asyncpg
 from fastapi import HTTPException, status
 
 from schemas import ServicioActualizarIn
-from services import calendario_slots
+from services import calendario_slots, historial_citas
+from services.cancelacion_citas import Origen, evaluar_cancelacion, segundos_hasta
 from services.acceso_pagos import acceso_pagos
 from services.acceso_plan import exigir_herramienta
 from services.pipeline import get_tenant_servicios
 from session import conexion, execute, fetch_all, fetch_one, transaccion
 
 
-async def verificar_calendario_activo(tenant_id: UUID, *, desde_chat: bool = False) -> None:
+async def verificar_calendario_activo(
+    tenant_id: UUID, *, desde_chat: bool = False, con_codigo: bool = False
+) -> None:
     """
     409 si el negocio no tiene el módulo de calendarios encendido; 402 si lo
     tiene encendido pero no puede usarlo. Mismo criterio y mismo orden que
@@ -44,15 +47,20 @@ async def verificar_calendario_activo(tenant_id: UUID, *, desde_chat: bool = Fal
         el gate de pagos de siempre (services/acceso_pagos.py). Es lo que
         ve el cliente final, y ese lado sigue el modelo híbrido — con
         créditos el agente sigue agendando aunque la suscripción venciera.
+
+    `con_codigo=True` (solo los endpoints de cancelar/consultar del agente,
+    spec 001 R24/R33): el 409 lleva `detail={"codigo": "calendario_inactivo",
+    "mensaje": ...}` en vez de texto. El resto conserva el detail de texto.
     """
     servicios = await get_tenant_servicios(tenant_id)
     if not servicios.calendario_activo:
+        mensaje = (
+            "El módulo de calendarios no está activo para este negocio. "
+            "Actívalo en /tenants/{tenant_id}/servicios."
+        )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                "El módulo de calendarios no está activo para este negocio. "
-                "Actívalo en /tenants/{tenant_id}/servicios."
-            ),
+            detail={"codigo": "calendario_inactivo", "mensaje": mensaje} if con_codigo else mensaje,
         )
 
     if not desde_chat:
@@ -101,6 +109,9 @@ class Servicio:
     precio: Optional[Decimal]
     activo: bool
     creado_en: datetime
+    # Horas mínimas de antelación para que el CLIENTE cancele (43_...sql).
+    # None = sin regla.
+    antelacion_cancelacion_horas: Optional[int] = None
 
     @classmethod
     def desde_fila(cls, fila) -> "Servicio":
@@ -126,6 +137,11 @@ class Reserva:
     precio_cobrado: Optional[Decimal]
     metodo_pago: Optional[str]
     creado_en: datetime
+    # Regla de cancelación (43_...sql). NULL/false en reservas no canceladas y
+    # en las canceladas antes del despliegue.
+    cancelada_por: Optional[str] = None
+    cancelacion_tardia: bool = False
+    antelacion_aplicada_horas: Optional[int] = None
 
     @classmethod
     def desde_fila(cls, fila) -> "Reserva":
@@ -154,6 +170,9 @@ class Reserva:
             precio_cobrado=fila["precio_cobrado"],
             metodo_pago=fila["metodo_pago"],
             creado_en=fila["creado_en"],
+            cancelada_por=fila["cancelada_por"],
+            cancelacion_tardia=fila["cancelacion_tardia"],
+            antelacion_aplicada_horas=fila["antelacion_aplicada_horas"],
         )
 
 
@@ -322,7 +341,8 @@ async def servicio_del_tenant(
     servicio_id: UUID, tenant_id: UUID, conn: Optional[asyncpg.Connection] = None
 ) -> Optional[Servicio]:
     sql = """
-        SELECT id, tenant_id, nombre, duracion_minutos, precio, activo, creado_en
+        SELECT id, tenant_id, nombre, duracion_minutos, precio, activo, creado_en,
+               antelacion_cancelacion_horas
         FROM servicios
         WHERE id = $1 AND tenant_id = $2
     """
@@ -356,7 +376,8 @@ async def servicios_activos(
     desactivado (gerencia lo apagó a propósito, ver ServicioActualizarIn).
     """
     sql = """
-        SELECT id, tenant_id, nombre, duracion_minutos, precio, activo, creado_en
+        SELECT id, tenant_id, nombre, duracion_minutos, precio, activo, creado_en,
+               antelacion_cancelacion_horas
         FROM servicios
         WHERE tenant_id = $1 AND activo = true
         ORDER BY nombre
@@ -551,7 +572,8 @@ async def consultar_disponibilidad(
 _COLUMNAS_RESERVA = """
     r.id, r.tenant_id, r.proveedor_id, p.nombre AS proveedor_nombre, p.color AS proveedor_color,
     r.servicio_id, s.nombre AS servicio_nombre, r.hora_inicio, r.hora_fin, r.estado,
-    r.user_id, r.cliente_nombre, r.cliente_telefono, r.notas, r.precio_cobrado, r.metodo_pago, r.creado_en
+    r.user_id, r.cliente_nombre, r.cliente_telefono, r.notas, r.precio_cobrado, r.metodo_pago, r.creado_en,
+    r.cancelada_por, r.cancelacion_tardia, r.antelacion_aplicada_horas, r.cancelada_en
 """
 
 
@@ -676,7 +698,8 @@ async def crear_reserva(
                 ON CONFLICT ON CONSTRAINT reservas_sin_traslape DO NOTHING
                 RETURNING id, tenant_id, proveedor_id, servicio_id, user_id,
                           cliente_nombre, cliente_telefono, hora_inicio, hora_fin,
-                          estado, notas, precio_cobrado, metodo_pago, creado_en
+                          estado, notas, precio_cobrado, metodo_pago, creado_en,
+                          cancelada_por, cancelacion_tardia, antelacion_aplicada_horas, cancelada_en
                 """,
                 tenant_id,
                 proveedor_id,
@@ -716,7 +739,8 @@ async def crear_reserva(
             """
             SELECT id, tenant_id, proveedor_id, servicio_id, user_id,
                    cliente_nombre, cliente_telefono, hora_inicio, hora_fin,
-                   estado, notas, precio_cobrado, metodo_pago, creado_en
+                   estado, notas, precio_cobrado, metodo_pago, creado_en,
+                   cancelada_por, cancelacion_tardia, antelacion_aplicada_horas, cancelada_en
             FROM reservas
             WHERE tenant_id = $1 AND idempotency_key = $2
             """,
@@ -742,7 +766,8 @@ async def crear_reserva(
                 """
                 SELECT id, tenant_id, proveedor_id, servicio_id, user_id,
                        cliente_nombre, cliente_telefono, hora_inicio, hora_fin,
-                       estado, notas, precio_cobrado, metodo_pago, creado_en
+                       estado, notas, precio_cobrado, metodo_pago, creado_en,
+                       cancelada_por, cancelacion_tardia, antelacion_aplicada_horas, cancelada_en
                 FROM reservas
                 WHERE tenant_id = $1 AND idempotency_key = $2
                 """,
@@ -759,30 +784,105 @@ async def crear_reserva(
     return Reserva.desde_fila(_con_proveedor_y_servicio(fila, proveedor, servicio)), "creada"
 
 
+class CancelacionRechazada(Exception):
+    """
+    La reserva existe pero no se puede cancelar (spec 001 R12/R13). `codigo`
+    es `reserva_no_confirmada` o `cita_ya_iniciada`; `estado` es el estado
+    actual de la reserva. Los routers la vuelven 409 con `detail` objeto.
+    """
+
+    def __init__(self, codigo: str, estado: str) -> None:
+        super().__init__(codigo)
+        self.codigo = codigo
+        self.estado = estado
+
+
+MOTIVO_REAGENDADA = "Reagendada por el cliente"
+
+MENSAJES_CANCELACION_RECHAZADA = {
+    "reserva_no_confirmada": "La reserva no está confirmada, así que no se puede cancelar.",
+    "cita_ya_iniciada": "La cita ya empezó, así que no se puede cancelar.",
+}
+
+
+def detalle_cancelacion_rechazada(exc: CancelacionRechazada) -> dict:
+    """`detail` objeto {codigo, mensaje, estado} de los 409 de cancelar."""
+    return {
+        "codigo": exc.codigo,
+        "mensaje": MENSAJES_CANCELACION_RECHAZADA[exc.codigo],
+        "estado": exc.estado,
+    }
+
+
 async def cancelar_reserva(
-    reserva_id: UUID, tenant_id: UUID, motivo: Optional[str], actor: ActorAuditoria
+    reserva_id: UUID,
+    tenant_id: UUID,
+    motivo: Optional[str],
+    actor: ActorAuditoria,
+    *,
+    origen: Origen,
+    ahora: Optional[datetime] = None,
 ) -> Optional[Reserva]:
-    """None si la reserva no existe o no es de este tenant (404 lo decide el caller)."""
+    """
+    None si la reserva no existe o no es de este tenant (404 lo decide el
+    caller). Lanza CancelacionRechazada si no está confirmada o (solo origen
+    "cliente") ya empezó. El origen lo decide el endpoint, nunca el cuerpo.
+
+    La fila se bloquea (FOR UPDATE) antes de evaluar: dos cancelaciones
+    simultáneas se serializan y la segunda ve 'cancelada' (R19). `ahora` es
+    inyectable para los tests; en producción es el reloj del servidor.
+    """
+    ahora = ahora or datetime.now(timezone.utc)
     async with transaccion() as conn:
         anterior = await conn.fetchrow(
-            "SELECT estado FROM reservas WHERE id = $1 AND tenant_id = $2", reserva_id, tenant_id
+            "SELECT estado, hora_inicio, servicio_id FROM reservas "
+            "WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+            reserva_id,
+            tenant_id,
         )
         if anterior is None:
             return None
 
+        servicio = await servicio_del_tenant(anterior["servicio_id"], tenant_id, conn)
+        antelacion = servicio.antelacion_cancelacion_horas if servicio else None
+        evaluacion = evaluar_cancelacion(
+            estado=anterior["estado"],
+            hora_inicio=anterior["hora_inicio"],
+            antelacion_horas=antelacion,
+            origen=origen,
+            ahora=ahora,
+        )
+        if not evaluacion.puede_cancelar:
+            raise CancelacionRechazada(
+                evaluacion.motivo_no_cancelable or "reserva_no_confirmada", anterior["estado"]
+            )
+
+        # El equipo nunca queda sujeto a la regla: no se guarda antelación (R17).
+        antelacion_aplicada = antelacion if origen == "cliente" else None
         fila = await conn.fetchrow(
             """
             UPDATE reservas
-            SET estado = 'cancelada', motivo_cancelacion = $3, actualizado_en = NOW()
+            SET estado = 'cancelada', motivo_cancelacion = $3, actualizado_en = NOW(),
+                cancelada_por = $4, cancelacion_tardia = $5,
+                antelacion_aplicada_horas = $6, cancelada_en = $7
             WHERE id = $1 AND tenant_id = $2
             RETURNING id, tenant_id, proveedor_id, servicio_id, user_id,
                       cliente_nombre, cliente_telefono, hora_inicio, hora_fin,
-                      estado, notas, precio_cobrado, metodo_pago, creado_en
+                      estado, notas, precio_cobrado, metodo_pago, creado_en,
+                      cancelada_por, cancelacion_tardia, antelacion_aplicada_horas, cancelada_en
             """,
             reserva_id,
             tenant_id,
             motivo,
+            origen,
+            evaluacion.tardia,
+            antelacion_aplicada,
+            ahora,
         )
+        datos_nuevos: dict = {"cancelada_por": origen, "cancelacion_tardia": evaluacion.tardia}
+        if evaluacion.tardia:
+            datos_nuevos["antelacion_aplicada_horas"] = antelacion
+            datos_nuevos["segundos_restantes"] = segundos_hasta(anterior["hora_inicio"], ahora)
         await _registrar_auditoria(
             conn,
             tenant_id=tenant_id,
@@ -792,13 +892,512 @@ async def cancelar_reserva(
             estado_nuevo="cancelada",
             motivo=motivo,
             datos_anteriores=None,
-            datos_nuevos=None,
+            datos_nuevos=datos_nuevos,
             actor=actor,
         )
 
     proveedor = await proveedor_del_tenant(fila["proveedor_id"], tenant_id)
     servicio = await servicio_del_tenant(fila["servicio_id"], tenant_id)
     return Reserva.desde_fila(_con_proveedor_y_servicio(fila, proveedor, servicio))
+
+
+async def consultar_cancelacion(
+    reserva_id: UUID, tenant_id: UUID, *, ahora: Optional[datetime] = None
+) -> Optional[dict]:
+    """
+    Consulta previa del agente (spec 001 R27-R30): qué pasaría si el cliente
+    cancelara ahora. Solo lectura: no toca la reserva ni escribe auditoría, y
+    usa la MISMA `evaluar_cancelacion` que la cancelación real (R28), siempre
+    con origen "cliente". None si la reserva no existe o es de otro tenant.
+    """
+    ahora = ahora or datetime.now(timezone.utc)
+    fila = await fetch_one(
+        """
+        SELECT r.id, r.estado, r.hora_inicio, r.servicio_id,
+               s.nombre AS servicio_nombre, s.antelacion_cancelacion_horas
+        FROM reservas r
+        LEFT JOIN servicios s ON s.id = r.servicio_id AND s.tenant_id = r.tenant_id
+        WHERE r.id = $1 AND r.tenant_id = $2
+        """,
+        reserva_id,
+        tenant_id,
+    )
+    if fila is None:
+        return None
+    antelacion = fila["antelacion_cancelacion_horas"]
+    evaluacion = evaluar_cancelacion(
+        estado=fila["estado"],
+        hora_inicio=fila["hora_inicio"],
+        antelacion_horas=antelacion,
+        origen="cliente",
+        ahora=ahora,
+    )
+    return {
+        "reserva_id": fila["id"],
+        "estado": fila["estado"],
+        "servicio_id": fila["servicio_id"],
+        "servicio_nombre": fila["servicio_nombre"],
+        "hora_inicio": fila["hora_inicio"],
+        "antelacion_minima_horas": antelacion,
+        "segundos_restantes": evaluacion.segundos_restantes,
+        "puede_cancelar": evaluacion.puede_cancelar,
+        "motivo_no_cancelable": evaluacion.motivo_no_cancelable,
+        "cancelacion_seria_tardia": evaluacion.puede_cancelar and evaluacion.tardia,
+    }
+
+
+@dataclass(frozen=True)
+class _CitaDeHistorial:
+    """Fila mínima de una reserva del cliente; cumple `historial_citas.CitaFila`."""
+
+    estado: str
+    hora_inicio: datetime
+    hora_fin: datetime
+    creado_en: datetime
+    servicio_nombre: str
+    proveedor_nombre: str
+    notas: Optional[str]
+    cancelada_por: Optional[str]
+    cancelacion_tardia: bool
+
+
+async def historial_citas_de_conversacion(
+    tenant_id: UUID,
+    conversacion_id: UUID,
+    *,
+    ahora: datetime,
+    proveedor_id: Optional[UUID] = None,
+) -> Optional[dict]:
+    """
+    Historial de citas (spec 002) del cliente de una conversación. Solo lectura.
+
+    El cliente sale de la conversación (`conversations.user_id`), nunca de un
+    dato del llamante, y solo cuenta lo vinculado por `reservas.user_id`: ni el
+    teléfono ni el nombre (un walk-in con el mismo teléfono queda fuera, R5).
+    Devuelve None si la conversación no existe, es de otro negocio o no es de
+    un canal admitido (WhatsApp/Instagram/Facebook): el llamante lo traduce a
+    404 sin distinguir el motivo (R6).
+
+    Con `proveedor_id` solo se consideran las citas de ese proveedor, de modo
+    que el tope y `hay_mas` se calculan sobre ese subconjunto (R10).
+    La regla (elegibilidad, orden, tope) vive en `services.historial_citas`.
+
+    Devuelve `{"citas": [...], "hay_mas": bool}`; cada cita trae solo
+    fecha_hora_inicio y hora_fin (ISO 8601 en la zona vigente del negocio, R12),
+    servicio_nombre, proveedor_nombre, estado, notas, cancelada_por y
+    cancelacion_tardia. Nunca identificador de cita, precio, pago, motivo ni
+    contacto. El esquema de cada superficie recorta lo que no le toca.
+    """
+    conversacion = await fetch_one(
+        "SELECT user_id, channel_type FROM conversations WHERE id = $1 AND tenant_id = $2",
+        conversacion_id,
+        tenant_id,
+    )
+    if conversacion is None or not historial_citas.es_canal_de_cliente(conversacion["channel_type"]):
+        return None
+
+    filas = await fetch_all(
+        """
+        SELECT r.estado, r.hora_inicio, r.hora_fin, r.creado_en, r.notas,
+               r.cancelada_por, r.cancelacion_tardia,
+               s.nombre AS servicio_nombre, p.nombre AS proveedor_nombre
+        FROM reservas r
+        JOIN servicios s ON s.id = r.servicio_id AND s.tenant_id = r.tenant_id
+        JOIN proveedores p ON p.id = r.proveedor_id AND p.tenant_id = r.tenant_id
+        WHERE r.tenant_id = $1
+          AND r.user_id = $2
+          AND ($3::uuid IS NULL OR r.proveedor_id = $3)
+        """,
+        tenant_id,
+        conversacion["user_id"],
+        proveedor_id,
+    )
+    citas = [
+        _CitaDeHistorial(
+            estado=f["estado"],
+            hora_inicio=f["hora_inicio"],
+            hora_fin=f["hora_fin"],
+            creado_en=f["creado_en"],
+            servicio_nombre=f["servicio_nombre"],
+            proveedor_nombre=f["proveedor_nombre"],
+            notas=f["notas"],
+            cancelada_por=f["cancelada_por"],
+            cancelacion_tardia=bool(f["cancelacion_tardia"]),
+        )
+        for f in filas
+    ]
+    elegidas, hay_mas = historial_citas.seleccionar_historial(citas, ahora=ahora)
+
+    zona = (await get_tenant_servicios(tenant_id)).zona_horaria
+    return {
+        "citas": [
+            {
+                "fecha_hora_inicio": historial_citas.fecha_hora_local(c.hora_inicio, zona),
+                "hora_fin": historial_citas.fecha_hora_local(c.hora_fin, zona),
+                "servicio_nombre": c.servicio_nombre,
+                "proveedor_nombre": c.proveedor_nombre,
+                "estado": c.estado,
+                "notas": c.notas,
+                "cancelada_por": c.cancelada_por,
+                "cancelacion_tardia": c.cancelacion_tardia,
+            }
+            for c in elegidas
+        ],
+        "hay_mas": hay_mas,
+    }
+
+
+async def _cliente_de_conversacion(tenant_id: UUID, conversacion_id: UUID) -> Optional[UUID]:
+    """
+    El cliente de una conversación del agente (`conversations.user_id`), o None
+    si no existe, es de otro negocio o no es WhatsApp/Instagram/Facebook. Mismo
+    criterio que el historial (spec 002): el cliente sale de la conversación,
+    nunca de un dato que mande el llamante.
+    """
+    conversacion = await fetch_one(
+        "SELECT user_id, channel_type FROM conversations WHERE id = $1 AND tenant_id = $2",
+        conversacion_id,
+        tenant_id,
+    )
+    if conversacion is None or not historial_citas.es_canal_de_cliente(conversacion["channel_type"]):
+        return None
+    return conversacion["user_id"]
+
+
+MAX_CITAS_PROXIMAS = 10
+
+
+async def citas_proximas_de_conversacion(
+    tenant_id: UUID, conversacion_id: UUID, *, ahora: datetime
+) -> Optional[dict]:
+    """
+    Citas FUTURAS y confirmadas del cliente de la conversación, de la más
+    cercana a la más lejana (tope MAX_CITAS_PROXIMAS, con `hay_mas`). Solo
+    lectura. Es lo que el agente necesita antes de re-agendar: qué citas tiene
+    el cliente y cuál es su `reserva_id`. Solo cuenta lo vinculado por
+    `reservas.user_id` (ni teléfono ni nombre). None si la conversación no
+    existe, es ajena o de un canal no admitido (el router lo vuelve 404).
+    """
+    user_id = await _cliente_de_conversacion(tenant_id, conversacion_id)
+    if user_id is None:
+        return None
+
+    filas = await fetch_all(
+        """
+        SELECT r.id, r.servicio_id, r.proveedor_id, r.estado, r.hora_inicio,
+               s.nombre AS servicio_nombre, s.antelacion_cancelacion_horas,
+               p.nombre AS proveedor_nombre
+        FROM reservas r
+        JOIN servicios s ON s.id = r.servicio_id AND s.tenant_id = r.tenant_id
+        JOIN proveedores p ON p.id = r.proveedor_id AND p.tenant_id = r.tenant_id
+        WHERE r.tenant_id = $1 AND r.user_id = $2
+          AND r.estado = 'confirmada' AND r.hora_inicio > $3
+        ORDER BY r.hora_inicio
+        LIMIT $4
+        """,
+        tenant_id,
+        user_id,
+        ahora,
+        MAX_CITAS_PROXIMAS + 1,
+    )
+    zona = (await get_tenant_servicios(tenant_id)).zona_horaria
+    citas = []
+    for f in filas[:MAX_CITAS_PROXIMAS]:
+        evaluacion = evaluar_cancelacion(
+            estado=f["estado"],
+            hora_inicio=f["hora_inicio"],
+            antelacion_horas=f["antelacion_cancelacion_horas"],
+            origen="cliente",
+            ahora=ahora,
+        )
+        citas.append(
+            {
+                "reserva_id": f["id"],
+                "servicio_id": f["servicio_id"],
+                "proveedor_id": f["proveedor_id"],
+                "fecha_hora_inicio": historial_citas.fecha_hora_local(f["hora_inicio"], zona),
+                "servicio_nombre": f["servicio_nombre"],
+                "proveedor_nombre": f["proveedor_nombre"],
+                "antelacion_minima_horas": f["antelacion_cancelacion_horas"],
+                "cancelacion_seria_tardia": evaluacion.puede_cancelar and evaluacion.tardia,
+            }
+        )
+    return {"citas": citas, "hay_mas": len(filas) > MAX_CITAS_PROXIMAS}
+
+
+class _HorarioOcupado(Exception):
+    """Deshace la transacción de reagendar: el horario nuevo ya no está libre."""
+
+
+_COLUMNAS_RESERVA_RETORNO = """
+    id, tenant_id, proveedor_id, servicio_id, user_id,
+    cliente_nombre, cliente_telefono, hora_inicio, hora_fin,
+    estado, notas, precio_cobrado, metodo_pago, creado_en,
+    cancelada_por, cancelacion_tardia, antelacion_aplicada_horas, cancelada_en
+"""
+
+
+async def reagendar_reserva(
+    tenant_id: UUID,
+    conversacion_id: UUID,
+    reserva_id: UUID,
+    nueva_hora_inicio: datetime,
+    *,
+    actor: ActorAuditoria,
+    idempotency_key: Optional[str] = None,
+    ahora: Optional[datetime] = None,
+) -> tuple[Optional[Reserva], Optional[Reserva], str]:
+    """
+    Re-agenda una cita del cliente de la conversación: cancela la actual (como
+    cancelación del CLIENTE, así que cuenta como tardía si no respeta la
+    antelación del servicio) y crea otra con el mismo servicio, proveedor y
+    datos del cliente, TODO EN UNA TRANSACCIÓN. Si el horario nuevo no está
+    libre, nada cambia y el cliente conserva su cita.
+
+    Devuelve (nueva, anterior_cancelada, motivo), con motivo 'reagendada',
+    'duplicado' (reintento con el mismo idempotency_key: no cancela de nuevo),
+    'no_encontrada' (no existe, es de otro negocio o NO es del cliente de la
+    conversación), 'horario_ocupado', 'fuera_de_horario', 'proveedor_invalido'
+    o 'servicio_invalido'. Lanza CancelacionRechazada si la cita no está
+    confirmada o ya empezó.
+    """
+    ahora = ahora or datetime.now(timezone.utc)
+
+    async def _por_clave() -> Optional[Reserva]:
+        if idempotency_key is None:
+            return None
+        existente = await fetch_one(
+            f"SELECT {_COLUMNAS_RESERVA_RETORNO} FROM reservas WHERE tenant_id = $1 AND idempotency_key = $2",
+            tenant_id,
+            idempotency_key,
+        )
+        if existente is None:
+            return None
+        proveedor = await proveedor_del_tenant(existente["proveedor_id"], tenant_id)
+        servicio = await servicio_del_tenant(existente["servicio_id"], tenant_id)
+        return Reserva.desde_fila(_con_proveedor_y_servicio(existente, proveedor, servicio))
+
+    user_id = await _cliente_de_conversacion(tenant_id, conversacion_id)
+    if user_id is None:
+        return None, None, "no_encontrada"
+
+    duplicada = await _por_clave()
+    if duplicada is not None:
+        return duplicada, None, "duplicado"
+
+    actual = await fetch_one(
+        """
+        SELECT proveedor_id, servicio_id, user_id, cliente_nombre, cliente_telefono, notas
+        FROM reservas WHERE id = $1 AND tenant_id = $2
+        """,
+        reserva_id,
+        tenant_id,
+    )
+    # Ajena y no existente dan lo mismo: no se confirma que la cita exista.
+    if actual is None or actual["user_id"] != user_id:
+        return None, None, "no_encontrada"
+
+    proveedor = await proveedor_del_tenant(actual["proveedor_id"], tenant_id)
+    if proveedor is None or not proveedor.activo:
+        return None, None, "proveedor_invalido"
+    servicio = await servicio_del_tenant(actual["servicio_id"], tenant_id)
+    if servicio is None or not servicio.activo:
+        return None, None, "servicio_invalido"
+
+    nueva_hora_fin = nueva_hora_inicio + timedelta(minutes=servicio.duracion_minutos)
+    if not await _dentro_de_horario_del_proveedor(
+        actual["proveedor_id"], tenant_id, nueva_hora_inicio, nueva_hora_fin
+    ):
+        return None, None, "fuera_de_horario"
+
+    try:
+        async with transaccion() as conn:
+            # Misma guarda que cancelar_reserva: bloquea la fila y evalúa
+            # estado y antelación con el reloj inyectado.
+            anterior = await conn.fetchrow(
+                "SELECT estado, hora_inicio FROM reservas WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+                reserva_id,
+                tenant_id,
+            )
+            if anterior is None:
+                return None, None, "no_encontrada"
+            antelacion = servicio.antelacion_cancelacion_horas
+            evaluacion = evaluar_cancelacion(
+                estado=anterior["estado"],
+                hora_inicio=anterior["hora_inicio"],
+                antelacion_horas=antelacion,
+                origen="cliente",
+                ahora=ahora,
+            )
+            if not evaluacion.puede_cancelar:
+                raise CancelacionRechazada(
+                    evaluacion.motivo_no_cancelable or "reserva_no_confirmada", anterior["estado"]
+                )
+
+            # Se cancela primero: la anterior deja de bloquear el traslape, así
+            # que mover la cita a una hora contigua o solapada del mismo
+            # proveedor funciona. Si la nueva no cabe se hace rollback de todo.
+            cancelada = await conn.fetchrow(
+                f"""
+                UPDATE reservas
+                SET estado = 'cancelada', motivo_cancelacion = $3, actualizado_en = NOW(),
+                    cancelada_por = 'cliente', cancelacion_tardia = $4,
+                    antelacion_aplicada_horas = $5, cancelada_en = $6
+                WHERE id = $1 AND tenant_id = $2
+                RETURNING {_COLUMNAS_RESERVA_RETORNO}
+                """,
+                reserva_id,
+                tenant_id,
+                MOTIVO_REAGENDADA,
+                evaluacion.tardia,
+                antelacion,
+                ahora,
+            )
+            nueva = await conn.fetchrow(
+                f"""
+                INSERT INTO reservas (
+                    tenant_id, proveedor_id, servicio_id, user_id,
+                    cliente_nombre, cliente_telefono, hora_inicio, hora_fin,
+                    notas, idempotency_key
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT ON CONSTRAINT reservas_sin_traslape DO NOTHING
+                RETURNING {_COLUMNAS_RESERVA_RETORNO}
+                """,
+                tenant_id,
+                actual["proveedor_id"],
+                actual["servicio_id"],
+                user_id,
+                actual["cliente_nombre"],
+                actual["cliente_telefono"],
+                nueva_hora_inicio,
+                nueva_hora_fin,
+                actual["notas"],
+                idempotency_key,
+            )
+            if nueva is None:
+                raise _HorarioOcupado()
+
+            datos_cancelada: dict = {
+                "cancelada_por": "cliente",
+                "cancelacion_tardia": evaluacion.tardia,
+                "reagendada_a": str(nueva["id"]),
+            }
+            if evaluacion.tardia:
+                datos_cancelada["antelacion_aplicada_horas"] = antelacion
+                datos_cancelada["segundos_restantes"] = segundos_hasta(anterior["hora_inicio"], ahora)
+            await _registrar_auditoria(
+                conn,
+                tenant_id=tenant_id,
+                reserva_id=reserva_id,
+                evento="cancelada",
+                estado_anterior=anterior["estado"],
+                estado_nuevo="cancelada",
+                motivo=MOTIVO_REAGENDADA,
+                datos_anteriores=None,
+                datos_nuevos=datos_cancelada,
+                actor=actor,
+            )
+            await _registrar_auditoria(
+                conn,
+                tenant_id=tenant_id,
+                reserva_id=nueva["id"],
+                evento="creada",
+                estado_anterior=None,
+                estado_nuevo="confirmada",
+                motivo=None,
+                datos_anteriores=None,
+                datos_nuevos={
+                    "proveedor_id": str(actual["proveedor_id"]),
+                    "proveedor_nombre": proveedor.nombre,
+                    "servicio_id": str(actual["servicio_id"]),
+                    "servicio_nombre": servicio.nombre,
+                    "hora_inicio": nueva_hora_inicio.isoformat(),
+                    "hora_fin": nueva_hora_fin.isoformat(),
+                    "reagendada_de": str(reserva_id),
+                },
+                actor=actor,
+            )
+    except _HorarioOcupado:
+        # Puede ser un reintento concurrente que ya hizo el cambio.
+        duplicada = await _por_clave()
+        if duplicada is not None:
+            return duplicada, None, "duplicado"
+        return None, None, "horario_ocupado"
+    except asyncpg.exceptions.UniqueViolationError:
+        duplicada = await _por_clave()
+        if duplicada is None:
+            raise
+        return duplicada, None, "duplicado"
+
+    return (
+        Reserva.desde_fila(_con_proveedor_y_servicio(nueva, proveedor, servicio)),
+        Reserva.desde_fila(_con_proveedor_y_servicio(cancelada, proveedor, servicio)),
+        "reagendada",
+    )
+
+
+ZONA_POR_DEFECTO = "America/Mexico_City"  # mismo valor que get_tenant_servicios
+SIN_SERVICIO = "Sin servicio"
+
+
+async def reporte_cancelaciones_tardias(
+    *,
+    desde: date,
+    hasta: date,
+    granularidad: str,
+    tenant_id: Optional[UUID] = None,
+    servicio_id: Optional[UUID] = None,
+) -> list[dict]:
+    """
+    Reporte de plataforma (spec 001 R34-R43, R46). Solo lectura.
+
+    Cuenta SOLO cancelaciones con cancelada_por = 'cliente', agrupadas por
+    tenant, servicio y periodo. El periodo y el rango [desde, hasta]
+    (inclusivo) se miden en la zona horaria de CADA tenant
+    (tenant_servicios.zona_horaria; sin fila, el valor por defecto). No
+    devuelve ningun dato del cliente final. LEFT JOIN a servicios: una cita
+    sin servicio cae en servicio_id = NULL / "Sin servicio", una sola fila por
+    tenant y periodo. Incluye tenants y servicios inactivos.
+    """
+    if granularidad not in ("dia", "mes"):
+        raise ValueError("granularidad debe ser 'dia' o 'mes'")
+    formato = "YYYY-MM-DD" if granularidad == "dia" else "YYYY-MM"
+    filas = await fetch_all(
+        f"""
+        WITH base AS (
+            SELECT r.tenant_id, t.name AS tenant_nombre,
+                   s.id AS servicio_id, s.nombre AS servicio_nombre,
+                   r.cancelacion_tardia,
+                   COALESCE(ts.zona_horaria, $5) AS zona,
+                   r.cancelada_en
+            FROM reservas r
+            JOIN tenants t ON t.id = r.tenant_id
+            LEFT JOIN tenant_servicios ts ON ts.tenant_id = r.tenant_id
+            LEFT JOIN servicios s ON s.id = r.servicio_id AND s.tenant_id = r.tenant_id
+            WHERE r.cancelada_por = 'cliente'
+              AND r.cancelada_en IS NOT NULL
+              AND ($3::uuid IS NULL OR r.tenant_id = $3)
+              AND ($4::uuid IS NULL OR s.id = $4)
+        )
+        SELECT tenant_id, tenant_nombre, servicio_id,
+               COALESCE(servicio_nombre, '{SIN_SERVICIO}') AS servicio_nombre,
+               to_char(cancelada_en AT TIME ZONE zona, '{formato}') AS periodo,
+               COUNT(*) FILTER (WHERE cancelacion_tardia) AS tardias,
+               COUNT(*) AS total_cliente
+        FROM base
+        WHERE (cancelada_en AT TIME ZONE zona) >= $1::date
+          AND (cancelada_en AT TIME ZONE zona) < ($2::date + 1)
+        GROUP BY tenant_id, tenant_nombre, servicio_id, servicio_nombre, periodo
+        ORDER BY periodo, tenant_nombre, tenant_id, servicio_nombre
+        """,
+        desde,
+        hasta,
+        tenant_id,
+        servicio_id,
+        ZONA_POR_DEFECTO,
+    )
+    return [dict(f) for f in filas]
 
 
 async def reprogramar_reserva(
@@ -835,7 +1434,8 @@ async def reprogramar_reserva(
                 WHERE id = $1 AND tenant_id = $2
                 RETURNING id, tenant_id, proveedor_id, servicio_id, user_id,
                           cliente_nombre, cliente_telefono, hora_inicio, hora_fin,
-                          estado, notas, precio_cobrado, metodo_pago, creado_en
+                          estado, notas, precio_cobrado, metodo_pago, creado_en,
+                          cancelada_por, cancelacion_tardia, antelacion_aplicada_horas, cancelada_en
                 """,
                 reserva_id,
                 tenant_id,
@@ -913,7 +1513,8 @@ async def reasignar_reserva(
                 WHERE id = $1 AND tenant_id = $2
                 RETURNING id, tenant_id, proveedor_id, servicio_id, user_id,
                           cliente_nombre, cliente_telefono, hora_inicio, hora_fin,
-                          estado, notas, precio_cobrado, metodo_pago, creado_en
+                          estado, notas, precio_cobrado, metodo_pago, creado_en,
+                          cancelada_por, cancelacion_tardia, antelacion_aplicada_horas, cancelada_en
                 """,
                 reserva_id,
                 tenant_id,
@@ -977,7 +1578,8 @@ async def cambiar_estado_reserva(
             WHERE id = $1 AND tenant_id = $2
             RETURNING id, tenant_id, proveedor_id, servicio_id, user_id,
                       cliente_nombre, cliente_telefono, hora_inicio, hora_fin,
-                      estado, notas, precio_cobrado, metodo_pago, creado_en
+                      estado, notas, precio_cobrado, metodo_pago, creado_en,
+                      cancelada_por, cancelacion_tardia, antelacion_aplicada_horas, cancelada_en
             """,
             reserva_id,
             tenant_id,

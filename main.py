@@ -25,6 +25,7 @@ from routers import (
     canales_neuroapi_webhook,
     clientes,
     conversaciones,
+    conversaciones_historial,
     cuenta,
     equipo,
     acceso_soporte,
@@ -97,6 +98,7 @@ app.include_router(canales.router, prefix="/api")
 app.include_router(canales_neuroapi_webhook.router, prefix="/api")
 app.include_router(agente.router, prefix="/api")
 app.include_router(conversaciones.router, prefix="/api")
+app.include_router(conversaciones_historial.router, prefix="/api")
 # Sin JWT: lo descargan NeuroAPI/Meta con un token aleatorio (routers/media.py).
 app.include_router(media.router, prefix="/api")
 app.include_router(herramientas.router, prefix="/api")

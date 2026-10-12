@@ -316,7 +316,7 @@ async def test_aplicar_cuenta_nueva(http_client, cuenta_nueva):
 
     # El calendario quedó encendido y con las herramientas del agente.
     assert await fetch_value("SELECT calendario_activo FROM tenant_servicios WHERE tenant_id = $1", tid)
-    assert await fetch_value("SELECT COUNT(*) FROM tenant_tools WHERE tenant_id = $1", tid) == 5
+    assert await fetch_value("SELECT COUNT(*) FROM tenant_tools WHERE tenant_id = $1", tid) == 7
 
     assert await fetch_value(
         "SELECT COUNT(*) FROM gerencia_auditoria WHERE tenant_id = $1 AND accion = 'prueba_onboarding'", tid

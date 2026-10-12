@@ -15,7 +15,7 @@ import base64
 import binascii
 import logging
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -33,8 +33,14 @@ from realtime import (
     emitir_datos,
 )
 from services import asignacion_conversaciones as asignacion_conv
-from services import calendario, creditos
-from services.calendario import actor_desde_chat, verificar_calendario_activo
+from services import calendario, creditos, historial_citas
+from services.calendario import (
+    CancelacionRechazada,
+    actor_desde_chat,
+    detalle_cancelacion_rechazada,
+    verificar_calendario_activo,
+)
+from services.cancelacion_citas import segundos_hasta, texto_alerta_tardia
 from services.gerencia import registrar_uso_tokens
 from services.notificaciones import notificar_vendedor_nuevo_lead
 from services.pipeline import asignar_vendedor, get_or_create_pipeline, get_tenant_servicios
@@ -42,6 +48,9 @@ from schemas import (
     AdjuntoEntranteIn,
     AdjuntoOut,
     CancelarReservaEventoIn,
+    CitasProximasAgenteOut,
+    ConsultaCancelacionOut,
+    ConsultarCancelacionEventoIn,
     ConsultarDisponibilidadIn,
     ConsultarDisponibilidadOut,
     ConsumirCreditoIn,
@@ -50,11 +59,15 @@ from schemas import (
     ConversacionTransferidaOut,
     CrearReservaEventoIn,
     CrearReservaEventoOut,
+    HistorialCitasAgenteOut,
+    HistorialClienteEventoIn,
     MensajeConversacionAsignadaIn,
     MensajeConversacionAsignadaOut,
     MensajeEntranteIn,
     MensajeEntranteOut,
     ProveedorOut,
+    ReagendarReservaEventoIn,
+    ReagendarReservaEventoOut,
     ReservaOut,
     ServicioOut,
     SlotDisponibleOut,
@@ -405,6 +418,66 @@ async def calendario_disponibilidad(datos: ConsultarDisponibilidadIn):
     )
 
 
+async def _avisar_reserva_creada(tenant_id: UUID, reserva) -> None:
+    """
+    Alerta "reserva_creada" al negocio y copia al proveedor. Solo para
+    reservas realmente nuevas que llegaron por el chat (crear o reagendar):
+    un reintento duplicado no debe generar una segunda alerta.
+
+    Este es el único punto que dispara "reserva_creada": una reserva creada
+    por el propio negocio desde el portal (walk-in/teléfono,
+    routers/calendario.py::crear_reserva_manual) no notifica a gerencia de
+    sí misma -- la alerta es para avisar de reservas que llegaron solas por
+    el chat, no para confirmar lo que gerencia ya sabe que hizo.
+    """
+    servicio = await calendario.servicio_del_tenant(reserva.servicio_id, tenant_id)
+    tenant_servicios = await get_tenant_servicios(tenant_id)
+    hora_local = reserva.hora_inicio.astimezone(ZoneInfo(tenant_servicios.zona_horaria))
+
+    detalle = [f"{reserva.cliente_nombre or 'Cliente'} reservó {reserva.servicio_nombre} con {reserva.proveedor_nombre}"]
+    detalle.append(f"el {hora_local.strftime('%d/%m')} a las {hora_local.strftime('%H:%M')}")
+    if reserva.cliente_telefono:
+        detalle.append(f"({reserva.cliente_telefono})")
+    if servicio and servicio.precio is not None:
+        detalle.append(f"— ${servicio.precio:.2f}")
+
+    alerta = (
+        "reserva_creada",
+        "Nueva reserva",
+        " ".join(detalle),
+        {
+            "reserva_id": str(reserva.id),
+            "proveedor_id": str(reserva.proveedor_id),
+            "hora_inicio": reserva.hora_inicio.isoformat(),
+        },
+    )
+    await broadcast_alerta(tenant_id, *alerta)
+    cuenta = await calendario.cuenta_del_proveedor(reserva.proveedor_id)
+    await avisar_a_proveedor(tenant_id, cuenta, *alerta)
+    await emitir_datos(tenant_id, "reservas", [cuenta])
+
+
+async def _avisar_reserva_cancelada(tenant_id: UUID, reserva, ahora: datetime, *, reagendada: bool = False) -> None:
+    """Alerta "reserva_cancelada" al negocio y copia al proveedor (cancelar o reagendar)."""
+    mensaje = f"Se canceló la cita de {reserva.cliente_nombre or 'un cliente'} con {reserva.proveedor_nombre}"
+    if reagendada:
+        mensaje += " porque el cliente la reagendó"
+    if reserva.cancelacion_tardia and reserva.antelacion_aplicada_horas is not None:
+        mensaje += " " + texto_alerta_tardia(
+            segundos_hasta(reserva.hora_inicio, ahora), reserva.antelacion_aplicada_horas
+        )
+    alerta = (
+        "reserva_cancelada",
+        "Reserva cancelada",
+        mensaje,
+        {"reserva_id": str(reserva.id)},
+    )
+    await broadcast_alerta(tenant_id, *alerta)
+    cuenta = await calendario.cuenta_del_proveedor(reserva.proveedor_id)
+    await avisar_a_proveedor(tenant_id, cuenta, *alerta)
+    await emitir_datos(tenant_id, "reservas", [cuenta])
+
+
 @router.post("/calendario/reservas", response_model=CrearReservaEventoOut)
 async def calendario_crear_reserva(datos: CrearReservaEventoIn):
     """
@@ -442,55 +515,144 @@ async def calendario_crear_reserva(datos: CrearReservaEventoIn):
     # routers/calendario.py::crear_reserva_manual) no notifica a gerencia
     # de sí misma -- la alerta es para avisar de reservas que llegaron
     # solas por el chat, no para confirmar lo que gerencia ya sabe que hizo.
-    servicio = await calendario.servicio_del_tenant(datos.servicio_id, datos.tenant_id)
-    tenant_servicios = await get_tenant_servicios(datos.tenant_id)
-    hora_local = reserva.hora_inicio.astimezone(ZoneInfo(tenant_servicios.zona_horaria))
-
-    detalle = [f"{reserva.cliente_nombre or 'Cliente'} reservó {reserva.servicio_nombre} con {reserva.proveedor_nombre}"]
-    detalle.append(f"el {hora_local.strftime('%d/%m')} a las {hora_local.strftime('%H:%M')}")
-    if reserva.cliente_telefono:
-        detalle.append(f"({reserva.cliente_telefono})")
-    if servicio and servicio.precio is not None:
-        detalle.append(f"— ${servicio.precio:.2f}")
-
-    alerta = (
-        "reserva_creada",
-        "Nueva reserva",
-        " ".join(detalle),
-        {
-            "reserva_id": str(reserva.id),
-            "proveedor_id": str(reserva.proveedor_id),
-            "hora_inicio": reserva.hora_inicio.isoformat(),
-        },
-    )
-    await broadcast_alerta(datos.tenant_id, *alerta)
-    cuenta = await calendario.cuenta_del_proveedor(reserva.proveedor_id)
-    await avisar_a_proveedor(datos.tenant_id, cuenta, *alerta)
-    await emitir_datos(datos.tenant_id, "reservas", [cuenta])
+    await _avisar_reserva_creada(datos.tenant_id, reserva)
     return CrearReservaEventoOut(creado=True, reserva=ReservaOut(**vars(reserva)))
 
 
 @router.post("/calendario/reservas/cancelar", response_model=ReservaOut)
 async def calendario_cancelar_reserva(datos: CancelarReservaEventoIn):
-    await verificar_calendario_activo(datos.tenant_id, desde_chat=True)
+    await verificar_calendario_activo(datos.tenant_id, desde_chat=True, con_codigo=True)
 
-    reserva = await calendario.cancelar_reserva(
-        datos.reserva_id, datos.tenant_id, datos.motivo, actor_desde_chat(None, None)
-    )
+    # Origen "cliente" por la vía del agente: lo decide este endpoint, nunca
+    # el cuerpo (R18). Un campo extra de origen/marca en el cuerpo se ignora.
+    ahora = datetime.now(timezone.utc)
+    try:
+        reserva = await calendario.cancelar_reserva(
+            datos.reserva_id,
+            datos.tenant_id,
+            datos.motivo,
+            actor_desde_chat(None, None),
+            origen="cliente",
+            ahora=ahora,
+        )
+    except CancelacionRechazada as exc:
+        raise HTTPException(status_code=409, detail=detalle_cancelacion_rechazada(exc))
     if reserva is None:
         raise HTTPException(status_code=404, detail="Reserva no encontrada")
 
-    alerta = (
-        "reserva_cancelada",
-        "Reserva cancelada",
-        f"Se canceló la cita de {reserva.cliente_nombre or 'un cliente'} con {reserva.proveedor_nombre}",
-        {"reserva_id": str(reserva.id)},
-    )
-    await broadcast_alerta(datos.tenant_id, *alerta)
-    cuenta = await calendario.cuenta_del_proveedor(reserva.proveedor_id)
-    await avisar_a_proveedor(datos.tenant_id, cuenta, *alerta)
-    await emitir_datos(datos.tenant_id, "reservas", [cuenta])
+    await _avisar_reserva_cancelada(datos.tenant_id, reserva, ahora)
     return ReservaOut(**vars(reserva))
+
+
+@router.post("/calendario/reservas/consultar-cancelacion", response_model=ConsultaCancelacionOut)
+async def calendario_consultar_cancelacion(datos: ConsultarCancelacionEventoIn):
+    """
+    Qué pasaría si el cliente cancelara ahora (spec 001 R27-R33). Solo
+    lectura: no cambia la reserva ni escribe auditoría. Informativa: la marca
+    la decide siempre la cancelación real.
+    """
+    await verificar_calendario_activo(datos.tenant_id, desde_chat=True, con_codigo=True)
+    consulta = await calendario.consultar_cancelacion(
+        datos.reserva_id, datos.tenant_id, ahora=datetime.now(timezone.utc)
+    )
+    if consulta is None:
+        raise HTTPException(status_code=404, detail="Reserva no encontrada")
+    return ConsultaCancelacionOut(**consulta)
+
+
+@router.post("/calendario/historial-cliente", response_model=HistorialCitasAgenteOut)
+async def calendario_historial_cliente(datos: HistorialClienteEventoIn):
+    """
+    Historial de citas del cliente de la conversación (spec 002 R22-R24). Solo
+    lectura y repetible. El cliente sale únicamente de `conversation_id` y
+    `tenant_id`; el resto del cuerpo se ignora. Orden: 401 (router), 422
+    (campo ausente), módulo de calendarios (409 con código / 402 de texto) y
+    por último la conversación: ajena, inexistente, de widget o con un
+    identificador inválido dan el mismo 404 (R6).
+    """
+    await verificar_calendario_activo(datos.tenant_id, desde_chat=True, con_codigo=True)
+
+    conversacion_id = historial_citas.interpretar_conversation_id(datos.conversation_id)
+    historial = None
+    if conversacion_id is not None:
+        historial = await calendario.historial_citas_de_conversacion(
+            datos.tenant_id, conversacion_id, ahora=datetime.now(timezone.utc)
+        )
+    if historial is None:
+        raise HTTPException(status_code=404, detail="Conversación no encontrada")
+    return historial
+
+
+@router.post("/calendario/citas-proximas", response_model=CitasProximasAgenteOut)
+async def calendario_citas_proximas(datos: HistorialClienteEventoIn):
+    """
+    Citas futuras y confirmadas del cliente de la conversación, con su
+    `reserva_id` (herramienta `consultar_citas_proximas`): lo que el agente
+    necesita ANTES de re-agendar. Solo lectura. Mismas reglas que el historial:
+    el cliente sale únicamente de `conversation_id` + `tenant_id`, y una
+    conversación ajena, inexistente, de widget o con id inválido da el mismo 404.
+    """
+    await verificar_calendario_activo(datos.tenant_id, desde_chat=True, con_codigo=True)
+
+    conversacion_id = historial_citas.interpretar_conversation_id(datos.conversation_id)
+    resultado = None
+    if conversacion_id is not None:
+        resultado = await calendario.citas_proximas_de_conversacion(
+            datos.tenant_id, conversacion_id, ahora=datetime.now(timezone.utc)
+        )
+    if resultado is None:
+        raise HTTPException(status_code=404, detail="Conversación no encontrada")
+    return resultado
+
+
+@router.post("/calendario/reservas/reagendar", response_model=ReagendarReservaEventoOut)
+async def calendario_reagendar_reserva(datos: ReagendarReservaEventoIn):
+    """
+    Re-agenda una cita del cliente: cancela la actual (como cancelación del
+    cliente, tardía si no respeta la antelación del servicio) y crea la nueva
+    con el mismo servicio y proveedor, en UNA transacción -- si el horario
+    nuevo no está libre el cliente conserva su cita. La cita debe ser del
+    cliente de `conversation_id`: la ajena o inexistente da 404. 409 con
+    `detail` objeto si no está confirmada o ya empezó (mismos códigos que
+    cancelar). Idempotente por `idempotency_key`.
+    """
+    await verificar_calendario_activo(datos.tenant_id, desde_chat=True, con_codigo=True)
+
+    conversacion_id = historial_citas.interpretar_conversation_id(datos.conversation_id)
+    if conversacion_id is None:
+        raise HTTPException(status_code=404, detail="Reserva no encontrada")
+
+    ahora = datetime.now(timezone.utc)
+    try:
+        nueva, anterior, motivo = await calendario.reagendar_reserva(
+            datos.tenant_id,
+            conversacion_id,
+            datos.reserva_id,
+            datos.hora_inicio,
+            actor=actor_desde_chat(None, None),
+            idempotency_key=datos.idempotency_key,
+            ahora=ahora,
+        )
+    except CancelacionRechazada as exc:
+        raise HTTPException(status_code=409, detail=detalle_cancelacion_rechazada(exc))
+
+    if motivo == "no_encontrada":
+        raise HTTPException(status_code=404, detail="Reserva no encontrada")
+    if nueva is None:
+        return ReagendarReservaEventoOut(reagendada=False, motivo_rechazo=motivo)
+    if motivo == "duplicado":
+        return ReagendarReservaEventoOut(
+            reagendada=True, duplicado=True, reserva=ReservaOut(**vars(nueva))
+        )
+
+    await _avisar_reserva_cancelada(datos.tenant_id, anterior, ahora, reagendada=True)
+    await _avisar_reserva_creada(datos.tenant_id, nueva)
+    return ReagendarReservaEventoOut(
+        reagendada=True,
+        reserva=ReservaOut(**vars(nueva)),
+        reserva_anterior_id=anterior.id,
+        cancelacion_tardia=anterior.cancelacion_tardia,
+    )
 
 
 @router.post("/adjunto-entrante", response_model=AdjuntoOut, status_code=201)

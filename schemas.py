@@ -1151,6 +1151,9 @@ class TipoAlerta(str, Enum):
     conversacion_asignada = "conversacion_asignada"
     asignacion_fallida = "asignacion_fallida"
     mensaje_conversacion_asignada = "mensaje_conversacion_asignada"
+    conversacion_tomada = "conversacion_tomada"
+    conversacion_liberada = "conversacion_liberada"
+    conversacion_devuelta_ia = "conversacion_devuelta_ia"
 
 class AlertaOut(BaseModel):
     id: UUID
@@ -2000,10 +2003,16 @@ class ProveedorOut(BaseModel):
     portal_user_id: UUID | None = None
 
 
+# Antelación mínima (horas) para que el CLIENTE cancele su cita. Entero JSON
+# estricto: rechaza 1.5, 24.0, "24" y true (R3). None = sin regla.
+AntelacionCancelacionHoras = Annotated[int, Field(strict=True, ge=0, le=720)]
+
+
 class ServicioCrearIn(BaseModel):
     nombre: str = Field(min_length=2, max_length=255)
     duracion_minutos: int = Field(ge=5, le=480)
     precio: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
+    antelacion_cancelacion_horas: AntelacionCancelacionHoras | None = None
 
 
 class ServicioActualizarIn(BaseModel):
@@ -2011,10 +2020,19 @@ class ServicioActualizarIn(BaseModel):
     duracion_minutos: int | None = Field(default=None, ge=5, le=480)
     precio: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
     activo: bool | None = None
+    # null EXPLÍCITO borra la regla; omitir el campo no la cambia (R4). Por eso
+    # quien lo usa mira `model_fields_set`, no solo el valor.
+    antelacion_cancelacion_horas: AntelacionCancelacionHoras | None = None
 
     @model_validator(mode="after")
     def al_menos_uno(self):
-        if all(v is None for v in self.model_dump().values()):
+        """Cuenta campos presentes: `antelacion_cancelacion_horas: null` es un cambio válido."""
+        if "antelacion_cancelacion_horas" in self.model_fields_set:
+            return self
+        if all(
+            getattr(self, campo) is None
+            for campo in ("nombre", "duracion_minutos", "precio", "activo")
+        ):
             raise ValueError("Hay que indicar al menos un campo para actualizar")
         return self
 
@@ -2027,6 +2045,7 @@ class ServicioOut(BaseModel):
     precio: Decimal | None
     activo: bool
     creado_en: datetime
+    antelacion_cancelacion_horas: int | None = None
 
 
 class HorarioSemanalIn(BaseModel):
@@ -2183,6 +2202,10 @@ class ReservaOut(BaseModel):
     precio_cobrado: Decimal | None
     metodo_pago: MetodoPago | None
     creado_en: datetime
+    # Regla de cancelación (spec 001). Solo se añaden; ninguno de los previos cambia.
+    cancelacion_tardia: bool = False
+    cancelada_por: Literal["cliente", "equipo"] | None = None
+    antelacion_aplicada_horas: int | None = None
 
 
 class CorteDiarioOut(BaseModel):
@@ -2301,6 +2324,143 @@ class CancelarReservaEventoIn(BaseModel):
     tenant_id: UUID
     reserva_id: UUID
     motivo: str | None = Field(default=None, max_length=500)
+
+
+class ConsultarCancelacionEventoIn(BaseModel):
+    """Consulta previa del agente (spec 001 R27): no cancela nada."""
+
+    tenant_id: UUID
+    reserva_id: UUID
+
+
+class ConsultaCancelacionOut(BaseModel):
+    reserva_id: UUID
+    estado: EstadoReserva
+    servicio_id: UUID | None
+    servicio_nombre: str | None
+    hora_inicio: datetime
+    antelacion_minima_horas: int | None
+    segundos_restantes: int  # negativo si la cita ya empezó
+    puede_cancelar: bool
+    motivo_no_cancelable: Literal["reserva_no_confirmada", "cita_ya_iniciada"] | None
+    cancelacion_seria_tardia: bool
+
+
+class HistorialClienteEventoIn(BaseModel):
+    """
+    Cuerpo de la herramienta `historial_citas_cliente` del agente (spec 002
+    R22, R23). `conversation_id` es `Any` a propósito: n8n lo manda como texto,
+    pero un nulo, un número o un objeto no deben dar 422 sino el mismo 404 que
+    una conversación inexistente (R6); lo interpreta el router. Es obligatorio
+    (sin el campo, 422). Cualquier otro campo se ignora (pydantic los descarta):
+    el cliente sale solo de la conversación.
+    """
+
+    tenant_id: UUID
+    conversation_id: Any
+
+
+class CitaHistorialAgenteOut(BaseModel):
+    """
+    Cita del historial que ve el agente (spec 002 R11, R24). A propósito NO
+    declara identificador de cita, notas, quién canceló ni si fue tardía, ni
+    precio, pago, motivo o teléfono: un campo que no existe en el modelo no
+    puede filtrarse por error. `fecha_hora_inicio` es texto ISO 8601 con el
+    desfase de la zona del negocio (pydantic normalizaría un datetime a UTC).
+    """
+
+    fecha_hora_inicio: str
+    servicio_nombre: str
+    proveedor_nombre: str
+    estado: EstadoReserva
+
+
+class HistorialCitasAgenteOut(BaseModel):
+    citas: list[CitaHistorialAgenteOut]
+    hay_mas: bool
+
+
+class CitaProximaAgenteOut(BaseModel):
+    """
+    Cita futura confirmada del cliente, para que el agente pueda re-agendarla
+    (herramienta `consultar_citas_proximas`). A diferencia del historial, SÍ
+    lleva `reserva_id`: es lo que `reagendar_reserva` necesita. El backend
+    vuelve a comprobar en cada llamada que esa cita es del cliente de la
+    conversación, así que conocer un id no basta para mover la de otro.
+    """
+
+    reserva_id: UUID
+    servicio_id: UUID
+    proveedor_id: UUID
+    fecha_hora_inicio: str
+    servicio_nombre: str
+    proveedor_nombre: str
+    antelacion_minima_horas: int | None = None
+    # Mover la cita ahora quedaría registrado como cancelación tardía.
+    cancelacion_seria_tardia: bool = False
+
+
+class CitasProximasAgenteOut(BaseModel):
+    citas: list[CitaProximaAgenteOut]
+    hay_mas: bool
+
+
+class ReagendarReservaEventoIn(BaseModel):
+    """
+    Cuerpo de la herramienta `reagendar_reserva`. `conversation_id` es `Any`
+    por la misma razón que en `HistorialClienteEventoIn`: un valor inválido
+    debe dar el 404 uniforme, no un 422. Se mantienen servicio, proveedor y
+    datos del cliente de la cita anterior: solo cambia la hora.
+    """
+
+    tenant_id: UUID
+    conversation_id: Any
+    reserva_id: UUID
+    hora_inicio: datetime
+    idempotency_key: str | None = Field(default=None, max_length=120)
+
+
+class ReagendarReservaEventoOut(BaseModel):
+    reagendada: bool
+    duplicado: bool = False
+    reserva: ReservaOut | None = None
+    # None si fue un reintento duplicado (la anterior ya se había cancelado).
+    reserva_anterior_id: UUID | None = None
+    # La cita anterior quedó cancelada como tardía (regla de antelación).
+    cancelacion_tardia: bool = False
+    # 'horario_ocupado' | 'fuera_de_horario' | 'proveedor_invalido' |
+    # 'servicio_invalido' | None
+    motivo_rechazo: str | None = None
+
+
+class CitaHistorialPortalOut(CitaHistorialAgenteOut):
+    """
+    Cita del historial que ve el equipo en el portal: lo del agente más hora de
+    fin, notas, quién canceló y si fue tardía. Sin precio, pago, motivo de
+    cancelación ni identificador de cita (R11, R13).
+    """
+
+    hora_fin: str
+    notas: str | None = None
+    cancelada_por: Literal["cliente", "equipo"] | None = None
+    cancelacion_tardia: bool = False
+
+
+class HistorialCitasPortalOut(BaseModel):
+    citas: list[CitaHistorialPortalOut]
+    hay_mas: bool
+
+
+class CancelacionTardiaFilaOut(BaseModel):
+    """Fila del reporte de plataforma (spec 001 R39, R46): sin datos del cliente final."""
+
+    tenant_id: UUID
+    tenant_nombre: str
+    servicio_id: UUID | None
+    servicio_nombre: str
+    periodo: str  # AAAA-MM-DD o AAAA-MM, en la zona horaria del tenant
+    tardias: int
+    total_cliente: int
 
 
 class ConversacionTransferidaIn(BaseModel):

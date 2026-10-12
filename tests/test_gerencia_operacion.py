@@ -501,3 +501,297 @@ async def test_ordenar_por_margen_pone_primero_al_que_pierde_plata(
     )
     assert r.json()["items"][0]["tenant_id"] == str(negocio["tenant_id"])
     assert r.json()["tipo_cambio_configurado"] is True
+
+
+# ------------------------------------------------------------
+# 6. Reporte de cancelaciones tardias (spec 001, R34-R46)
+# ------------------------------------------------------------
+import itertools
+from datetime import datetime as _datetime, timedelta as _timedelta, timezone as _timezone
+
+RUTA_CANCELACIONES = "/api/gerencia/cancelaciones-tardias"
+_HORA_CITA = itertools.count()
+
+
+async def _negocio_con_citas(zona: str | None = "America/Mexico_City", nombre: str = "Peluquería"):
+    """Tenant + proveedor + servicio (+ zona horaria opcional). Devuelve ids para insertar reservas."""
+    tid = uuid4()
+    await execute("INSERT INTO tenants (id, name) VALUES ($1, $2)", tid, f"{nombre} {tid}")
+    if zona is not None:
+        await execute(
+            "INSERT INTO tenant_servicios (tenant_id, calendario_activo, zona_horaria) "
+            "VALUES ($1, true, $2)",
+            tid,
+            zona,
+        )
+    proveedor = await fetch_value(
+        "INSERT INTO proveedores (tenant_id, nombre) VALUES ($1, 'Ana') RETURNING id", tid
+    )
+    servicio = await fetch_value(
+        "INSERT INTO servicios (tenant_id, nombre, duracion_minutos) VALUES ($1, 'Corte', 30) RETURNING id",
+        tid,
+    )
+    return {"tid": tid, "proveedor": proveedor, "servicio": servicio}
+
+
+async def _cancelada(
+    n,
+    cancelada_en,
+    por: str | None = "cliente",
+    tardia: bool = False,
+    servicio=None,
+    estado: str = "cancelada",
+):
+    # Una hora de inicio distinta por cita: el proveedor no admite citas solapadas.
+    inicio = _datetime(2040, 1, 1, tzinfo=_timezone.utc) + _timedelta(hours=next(_HORA_CITA))
+    return await fetch_value(
+        """
+        INSERT INTO reservas (tenant_id, proveedor_id, servicio_id, hora_inicio, hora_fin, estado,
+                              cliente_nombre, cliente_telefono, cancelada_por, cancelacion_tardia,
+                              cancelada_en)
+        VALUES ($1, $2, $3, $4, $5, $6, 'Cliente Secreto', '+5215500000000', $7, $8, $9)
+        RETURNING id
+        """,
+        n["tid"],
+        n["proveedor"],
+        servicio or n["servicio"],
+        inicio,
+        inicio + _timedelta(minutes=30),
+        estado,
+        por,
+        tardia,
+        cancelada_en,
+    )
+
+
+async def _borrar_negocio_citas(*negocios) -> None:
+    for n in negocios:
+        await execute("DELETE FROM reservas WHERE tenant_id = $1", n["tid"])
+        await execute("DELETE FROM tenants WHERE id = $1", n["tid"])
+
+
+def _utc(*args) -> _datetime:
+    return _datetime(*args, tzinfo=_timezone.utc)
+
+
+async def _reporte(http_client, headers, **params):
+    return await http_client.get(RUTA_CANCELACIONES, params=params, headers=headers)
+
+
+@pytest.mark.asyncio
+async def test_reporte_gerencia_200_con_filas_del_contrato_y_solo_cliente(http_client, gerente):
+    n = await _negocio_con_citas()
+    try:
+        await _cancelada(n, _utc(2031, 3, 10, 18), "cliente", tardia=True)
+        await _cancelada(n, _utc(2031, 3, 10, 19), "cliente", tardia=False)
+        await _cancelada(n, _utc(2031, 3, 10, 20), "equipo", tardia=False)  # no cuenta
+        await _cancelada(n, _utc(2031, 3, 10, 21), None, estado="confirmada")  # no cuenta
+
+        r = await _reporte(
+            http_client, gerente["headers"], desde="2031-03-01", hasta="2031-03-31",
+            tenant_id=str(n["tid"]),
+        )
+        assert r.status_code == 200, r.text
+        filas = r.json()
+        assert len(filas) == 1
+        fila = filas[0]
+        assert set(fila) == {
+            "tenant_id", "tenant_nombre", "servicio_id", "servicio_nombre",
+            "periodo", "tardias", "total_cliente",
+        }
+        assert fila["tenant_id"] == str(n["tid"])
+        assert fila["servicio_id"] == str(n["servicio"])
+        assert fila["servicio_nombre"] == "Corte"
+        assert fila["periodo"] == "2031-03-10"
+        assert (fila["tardias"], fila["total_cliente"]) == (1, 2)
+        # R39: nada del cliente final.
+        assert "Secreto" not in r.text and "5500000000" not in r.text
+    finally:
+        await _borrar_negocio_citas(n)
+
+
+@pytest.mark.asyncio
+async def test_reporte_cerrado_a_quien_no_es_gerencia(
+    http_client, gerente, negocio, headers_autenticado
+):
+    # owner comun
+    r = await _reporte(http_client, headers_autenticado)
+    assert r.status_code == 403
+    assert r.json()["detail"] == "Esta acción requiere nivel gerencia"
+
+    # member de un negocio
+    uid, _ = await _crear_portal_user(negocio["tenant_id"], "member")
+    h_member = {"Authorization": f"Bearer {crear_access_token(uid, negocio['tenant_id'], 'member')}"}
+    r = await _reporte(http_client, h_member)
+    assert r.status_code == 403
+    assert r.json()["detail"] == "Esta acción requiere nivel gerencia"
+
+    # "ver como" (R36)
+    token = (await _impersonar(http_client, gerente, negocio["tenant_id"])).json()["access_token"]
+    r = await _reporte(http_client, {"Authorization": f"Bearer {token}"})
+    assert r.status_code == 403
+    assert r.json()["detail"] == "Esta acción requiere nivel gerencia"
+
+    # sin token (R37)
+    r = await _reporte(http_client, {})
+    assert r.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_reporte_es_solo_lectura(http_client, gerente):
+    for metodo in ("post", "put", "patch", "delete"):
+        r = await getattr(http_client, metodo)(RUTA_CANCELACIONES, headers=gerente["headers"])
+        assert r.status_code == 405, metodo
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"desde": "2030-01-01", "hasta": "2031-01-02"},  # 367 dias
+        {"desde": "2031-02-02", "hasta": "2031-02-01"},  # desde > hasta
+        {"granularidad": "semana"},
+        {"desde": "no-es-fecha"},
+        {"hasta": "2031-13-45"},
+    ],
+)
+async def test_reporte_422_por_parametros_invalidos(http_client, gerente, params):
+    r = await _reporte(http_client, gerente["headers"], **params)
+    assert r.status_code == 422, r.text
+
+
+@pytest.mark.asyncio
+async def test_reporte_rango_de_366_dias_es_valido(http_client, gerente):
+    r = await _reporte(http_client, gerente["headers"], desde="2030-01-01", hasta="2031-01-01")
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_reporte_sin_rango_usa_los_ultimos_30_dias(http_client, gerente):
+    n = await _negocio_con_citas(zona="UTC")
+    try:
+        ahora = _datetime.now(_timezone.utc)
+        await _cancelada(n, ahora - _timedelta(days=2), "cliente")
+        await _cancelada(n, ahora - _timedelta(days=40), "cliente")  # fuera de los 30 dias
+        r = await _reporte(http_client, gerente["headers"], tenant_id=str(n["tid"]))
+        assert r.status_code == 200
+        assert [f["total_cliente"] for f in r.json()] == [1]
+    finally:
+        await _borrar_negocio_citas(n)
+
+
+@pytest.mark.asyncio
+async def test_reporte_vacio_es_200_con_lista_vacia(http_client, gerente):
+    n = await _negocio_con_citas()
+    try:
+        await _cancelada(n, _utc(2031, 3, 10, 18), "cliente")
+        base = {"desde": "2031-03-01", "hasta": "2031-03-31"}
+        # periodo sin cancelaciones
+        r = await _reporte(http_client, gerente["headers"], desde="2031-05-01", hasta="2031-05-31",
+                           tenant_id=str(n["tid"]))
+        assert (r.status_code, r.json()) == (200, [])
+        # tenant_id y servicio_id inexistentes
+        r = await _reporte(http_client, gerente["headers"], tenant_id=str(uuid4()), **base)
+        assert (r.status_code, r.json()) == (200, [])
+        r = await _reporte(http_client, gerente["headers"], servicio_id=str(uuid4()),
+                           tenant_id=str(n["tid"]), **base)
+        assert (r.status_code, r.json()) == (200, [])
+    finally:
+        await _borrar_negocio_citas(n)
+
+
+@pytest.mark.asyncio
+async def test_reporte_incluye_tenants_y_servicios_inactivos(http_client, gerente):
+    n = await _negocio_con_citas()
+    try:
+        await _cancelada(n, _utc(2031, 3, 10, 18), "cliente", tardia=True)
+        await execute("UPDATE tenant_servicios SET calendario_activo = false WHERE tenant_id = $1", n["tid"])
+        await execute("UPDATE servicios SET activo = false WHERE id = $1", n["servicio"])
+        await execute("UPDATE proveedores SET activo = false WHERE id = $1", n["proveedor"])
+        r = await _reporte(http_client, gerente["headers"], desde="2031-03-01", hasta="2031-03-31",
+                           tenant_id=str(n["tid"]))
+        assert r.status_code == 200
+        assert [(f["tardias"], f["total_cliente"]) for f in r.json()] == [(1, 1)]
+    finally:
+        await _borrar_negocio_citas(n)
+
+
+@pytest.mark.asyncio
+async def test_reporte_zona_por_tenant_y_borde_de_medianoche(http_client, gerente):
+    mexico = await _negocio_con_citas("America/Mexico_City", "Mexico")  # UTC-6 en enero
+    tokio = await _negocio_con_citas("Asia/Tokyo", "Tokio")  # UTC+9
+    ids = (str(mexico["tid"]), str(tokio["tid"]))
+    try:
+        # 2031-01-01 05:59 UTC = 2030-12-31 23:59 en Mexico; 06:01 UTC = 2031-01-01 00:01
+        await _cancelada(mexico, _utc(2031, 1, 1, 5, 59), "cliente")
+        await _cancelada(mexico, _utc(2031, 1, 1, 6, 1), "cliente")
+        # 14:59 UTC = 23:59 en Tokio del 1 de enero; 15:01 UTC = 2 de enero 00:01
+        await _cancelada(tokio, _utc(2031, 1, 1, 14, 59), "cliente")
+        await _cancelada(tokio, _utc(2031, 1, 1, 15, 1), "cliente")
+
+        r = await _reporte(http_client, gerente["headers"], desde="2030-12-30", hasta="2031-01-03")
+        filas = {(f["tenant_id"], f["periodo"]): f["total_cliente"] for f in r.json()
+                 if f["tenant_id"] in ids}
+        assert filas == {
+            (ids[0], "2030-12-31"): 1,
+            (ids[0], "2031-01-01"): 1,
+            (ids[1], "2031-01-01"): 1,
+            (ids[1], "2031-01-02"): 1,
+        }
+
+        # El rango tambien se interpreta en la zona de cada tenant (R40).
+        r = await _reporte(http_client, gerente["headers"], desde="2030-12-31", hasta="2030-12-31")
+        assert [(f["tenant_id"], f["total_cliente"]) for f in r.json()
+                if f["tenant_id"] in ids] == [(ids[0], 1)]
+        r = await _reporte(http_client, gerente["headers"], desde="2031-01-02", hasta="2031-01-02",
+                           tenant_id=ids[1])
+        assert [f["periodo"] for f in r.json()] == ["2031-01-02"]
+
+        # Por mes, Mexico = 2 filas (dic y ene): una cancelacion nunca cuenta en dos periodos.
+        r = await _reporte(http_client, gerente["headers"], desde="2030-12-01", hasta="2031-01-31",
+                           granularidad="mes", tenant_id=ids[0])
+        assert {f["periodo"]: f["total_cliente"] for f in r.json()} == {"2030-12": 1, "2031-01": 1}
+    finally:
+        await _borrar_negocio_citas(mexico, tokio)
+
+
+@pytest.mark.asyncio
+async def test_reporte_servicio_renombrado_una_fila_y_sin_servicio(http_client, gerente):
+    n = await _negocio_con_citas()
+    ajeno = await _negocio_con_citas(nombre="Otro")
+    try:
+        await _cancelada(n, _utc(2031, 3, 10, 18), "cliente")
+        await execute("UPDATE servicios SET nombre = 'Corte premium' WHERE id = $1", n["servicio"])
+        await _cancelada(n, _utc(2031, 3, 10, 19), "cliente")
+        # Servicio que no es del tenant de la cita (o que ya no existe): cae en "Sin servicio".
+        await _cancelada(n, _utc(2031, 3, 10, 20), "cliente", tardia=True, servicio=ajeno["servicio"])
+        await _cancelada(n, _utc(2031, 3, 10, 21), "cliente", servicio=ajeno["servicio"])
+
+        r = await _reporte(http_client, gerente["headers"], desde="2031-03-01", hasta="2031-03-31",
+                           tenant_id=str(n["tid"]))
+        filas = {(f["servicio_id"], f["servicio_nombre"]): (f["tardias"], f["total_cliente"])
+                 for f in r.json()}
+        assert filas == {
+            (str(n["servicio"]), "Corte premium"): (0, 2),
+            (None, "Sin servicio"): (1, 2),
+        }
+
+        # Filtrar por servicio_id deja solo ese servicio.
+        r = await _reporte(http_client, gerente["headers"], desde="2031-03-01", hasta="2031-03-31",
+                           tenant_id=str(n["tid"]), servicio_id=str(n["servicio"]))
+        assert [f["servicio_nombre"] for f in r.json()] == ["Corte premium"]
+    finally:
+        await _borrar_negocio_citas(n, ajeno)
+
+
+@pytest.mark.asyncio
+async def test_reporte_tenant_sin_fila_de_servicios_usa_zona_por_defecto(http_client, gerente):
+    n = await _negocio_con_citas(zona=None)
+    try:
+        # 2031-01-01 03:00 UTC = 2030-12-31 21:00 en Mexico (zona por defecto).
+        await _cancelada(n, _utc(2031, 1, 1, 3), "cliente")
+        r = await _reporte(http_client, gerente["headers"], desde="2030-12-31", hasta="2031-01-01",
+                           tenant_id=str(n["tid"]))
+        assert [f["periodo"] for f in r.json()] == ["2030-12-31"]
+    finally:
+        await _borrar_negocio_citas(n)

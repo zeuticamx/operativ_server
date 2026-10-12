@@ -1030,9 +1030,11 @@ bloquea nada.
 
 ### Herramientas del agente para el calendario
 
-El agente de n8n usa el calendario a través de cinco filas de `tenant_tools`
+El agente de n8n usa el calendario a través de nueve filas de `tenant_tools`
 (`consultar_servicios`, `consultar_proveedores`, `consultar_disponibilidad`,
-`crear_reserva`, `cancelar_reserva`) que apuntan a `/api/eventos/calendario/*`
+`crear_reserva`, `cancelar_reserva`, `consultar_cancelacion_reserva` e
+`historial_citas_cliente`, `consultar_citas_proximas` y `reagendar_reserva`)
+que apuntan a `/api/eventos/calendario/*`
 con `X-Internal-Token`. Las crea `services/herramientas_calendario.py` al
 encender el calendario (dueño, gerencia o una prueba de plan) y las pausa al
 apagarlo; al arrancar, `sincronizar_todos()` se las da a quien ya lo tenía
@@ -1041,7 +1043,204 @@ guardado con `set_tool_credentials`). No pisa textos editados por el dueño ni
 reactiva una que él pausó. No se pueden eliminar desde `/herramientas` (409).
 
 Si cambias el contrato de esos endpoints, actualiza también `definiciones()`:
-es lo que lee el workflow `ejecutar-herramienta-tenant`.
+es lo que lee el workflow `ejecutar-herramienta-tenant`. Desde la regla de
+cancelación se suma `consultar_cancelacion_reserva` (ver abajo) y, con el
+historial de citas, `historial_citas_cliente`, y con re-agendar
+`consultar_citas_proximas` y `reagendar_reserva`: hoy son **nueve**.
+
+### Regla de cancelación de citas (`sql/43_regla_cancelacion_citas.sql`)
+
+Cada servicio puede exigir una **antelación mínima para cancelar**
+(`servicios.antelacion_cancelacion_horas`, entero 0-720, `NULL` = sin regla). La
+configuran owner/superadmin (`gerencia_actual`) al crear o editar el servicio; en
+`PATCH` omitir el campo no lo toca y mandar `null` lo borra. Editarla no
+reescribe las cancelaciones pasadas: la marca se guarda en la reserva al cancelar.
+
+- **Tardía** = cancelación del **cliente** (por el agente, endpoint de
+  `/api/eventos/calendario/reservas/cancelar`) hecha con menos de N horas exactas
+  para la cita. Justo N horas no es tardía. La cancelación desde el portal es
+  `cancelada_por='equipo'` y nunca es tardía. El origen lo decide el endpoint, no
+  el cuerpo. Una tardía **no se bloquea**: se cancela, se marca
+  (`cancelacion_tardia`, `antelacion_aplicada_horas`, `cancelada_por`,
+  `cancelada_en`), se audita (evento `cancelada` con origen y segundos) y la alerta
+  al negocio dice cuánto faltaba.
+- **409 con `detail` objeto** `{codigo, mensaje, estado?}` (no texto): 
+  `reserva_no_confirmada` (solo se cancela una `confirmada`) y `cita_ya_iniciada`
+  (el cliente no puede cancelar una cita que ya empezó; el equipo sí hasta que
+  el job la pase a `no_asistio`). También `calendario_inactivo` en los dos
+  endpoints del agente. El portal muestra el mensaje fijo y recarga.
+  `evaluar_cancelacion` (`services/cancelacion_citas.py`, pura, reloj inyectable)
+  decide todo con estado primero, luego hora de inicio.
+- **Consulta previa**: `POST /api/eventos/calendario/reservas/consultar-cancelacion`
+  (solo lectura, sin auditoría, `X-Internal-Token`) devuelve `puede_cancelar`,
+  `motivo_no_cancelable`, `antelacion_minima_horas`, `segundos_restantes` y
+  `cancelacion_seria_tardia`. La expone la herramienta del agente
+  `consultar_cancelacion_reserva`, para que avise al cliente antes de cancelar.
+  Es informativa: la marca final la decide la cancelación real.
+- **Reporte de plataforma**: `GET /api/gerencia/cancelaciones-tardias` (solo
+  gerencia de plataforma; owner/member y "ver como" reciben 403) devuelve por
+  tenant, servicio y periodo `tardias` y `total_cliente` sin datos del cliente
+  final. Filtros `desde`/`hasta` (por defecto 30 días, máximo 366, si no 422),
+  `granularidad=dia|mes`, `tenant_id`, `servicio_id`; el periodo usa la zona
+  horaria de cada tenant. Pantalla: `/gerencia/cancelaciones`.
+- **Despliegue**: aplicar primero la migración 43 (aditiva). Al arrancar,
+  `sincronizar_todos()` crea `consultar_cancelacion_reserva` en los negocios con
+  calendario encendido. **Revisión manual del workflow de n8n**: los 409 de
+  cancelar ahora traen `detail` como objeto; el workflow y el prompt deben leer
+  `detail.mensaje`/`detail.codigo` (si lo tratan como texto el agente verá
+  "[object Object]") y llamar a la consulta antes de cancelar.
+- **Límite conocido (R32)**: `_encender` no pisa descripciones ya guardadas, así
+  que el texto nuevo de `cancelar_reserva` solo llega a negocios que activen el
+  calendario después; los existentes conservan la descripción vieja y dependen de
+  la de la herramienta nueva.
+
+Tests: `tests/test_cancelacion_citas.py` (puro), `test_calendario.py`,
+`test_herramientas_calendario.py` y `test_gerencia_operacion.py`.
+
+### Historial de citas del cliente (spec 002)
+
+Muestra las **10 citas pasadas o canceladas más recientes** del cliente de una
+conversación, en el portal (panel "Historial de citas" bajo la asignación) y como
+herramienta del agente. Solo lectura: no modifica citas ni escribe auditoría. La
+regla (elegibilidad, orden, tope, UUID válido, fecha local) vive en
+`services/historial_citas.py` (pura, sin I/O); la consulta, en
+`services/calendario.py::historial_citas_de_conversacion`.
+
+- **Quién es el cliente**: se deduce de la conversación (`conversations.user_id`),
+  nunca de un dato que mande el llamante, y solo cuentan las citas con
+  `reservas.user_id` igual: no se une por teléfono ni nombre. Solo conversaciones
+  de `whatsapp`, `instagram` o `facebook` (lista blanca; el widget web no cuenta).
+- **Citas elegibles**: `cancelada`, `completada` y `no_asistio` siempre; una
+  `confirmada` solo si ya empezó (`hora_inicio <= ahora`). Orden por inicio
+  descendente (empate por `creado_en`), tope 10, `hay_mas` = hay más de 10
+  elegibles. Fechas ISO 8601 con el desfase de la **zona del negocio**, no la del
+  navegador.
+- **Portal**: `GET /api/conversaciones/{id}/historial-citas`
+  (`routers/conversaciones_historial.py`). Respuesta `{citas, hay_mas}`; cada cita:
+  `fecha_hora_inicio`, `hora_fin`, `servicio_nombre`, `proveedor_nombre`, `estado`,
+  `notas`, `cancelada_por` (`cliente|equipo|null`), `cancelacion_tardia`. Nunca
+  identificador de cita, precio, pago, motivo ni contacto.
+  Orden de verificación: 401 → ruta con UUID mal formado 422 → vendedor 403 → plan
+  sin acceso a conversaciones 402 → proveedor sin ficha o desactivado 403 →
+  calendario apagado 409 `{codigo: "calendario_inactivo", mensaje}` / plan sin
+  calendario, vencido o cuenta suspendida 402 → conversación no visible para el
+  proveedor 404 → conversación inexistente, de otro negocio o de canal no admitido
+  404 (`Conversación no encontrada`, idéntico en todos los casos).
+- **Roles**: owner, superadmin y member ven todas las citas del cliente en el
+  negocio; el **proveedor** solo las suyas (tope y `hay_mas` sobre ese subconjunto)
+  y solo si la conversación le es visible (si no, 404, no 403); el vendedor, 403.
+  El endpoint se llama `historial_citas` porque `permitir_a_proveedor` filtra por
+  nombre de función.
+- **Agente**: `POST /api/eventos/calendario/historial-cliente` con
+  `X-Internal-Token` y cuerpo `{tenant_id, conversation_id}` (el resto se ignora).
+  Respuesta `{citas, hay_mas}` con solo `fecha_hora_inicio`, `servicio_nombre`,
+  `proveedor_nombre` y `estado`: **nunca** identificador de cita, notas, quién
+  canceló, tardía, precio, pago, motivo ni teléfono. Orden: 401 → `tenant_id` o
+  `conversation_id` ausente 422 → calendario apagado 409 con `codigo` / pagos del
+  chat agotados 402 → conversación inexistente, ajena, de widget o
+  `conversation_id` inválido (nulo, número, sin forma de UUID con guiones) 404
+  `Conversación no encontrada`. Ve el historial completo del cliente (sin filtro de
+  proveedor).
+- **Herramienta** `historial_citas_cliente` (`http_post_json`, sin parámetros del
+  modelo, sin contacto, no idempotente): la crea `services/herramientas_calendario.py`
+  junto con las demás al encender el calendario. El dueño puede pausarla, no
+  borrarla.
+- **Compuerta `HISTORIAL_CITAS_N8N_PUBLICADO`** (`false` por defecto; ver
+  `.env.example`). La herramienta solo puede estar activa si n8n ya envía el
+  `conversation_id` **real** de la conversación; si no, el modelo podría pasar el
+  de otra y leer el historial de otro cliente. Con `false`: la fila se crea
+  siempre pero **desactivada** (marcada `pausada_por_sistema`, salvo que el dueño
+  ya la hubiera pausado), `PATCH /api/herramientas/{tool_key}` con
+  `is_enabled=true` da 409 `Esta herramienta aún no está disponible para tu
+  negocio.` (rechaza todo el PATCH; 404 si la fila no existe) y el arranque deja un
+  aviso en el log con los negocios afectados. Con `true`: se comporta como las
+  demás (se reactiva una pausada por el sistema; una pausa del dueño se respeta).
+  Cambiar la variable exige reiniciar el backend; al arrancar `sincronizar_todos()`
+  aplica el nuevo valor.
+- **Orden de despliegue** (no alterar):
+  1. Desplegar backend y portal con la variable en `false` (no hay migración SQL).
+  2. En n8n, flujo `ejecutar-herramienta-tenant`, nodo "Prepara HTTP POST": añadir
+     `conversation_id` (el real, el que recibe el nodo de inicio) al body, **después**
+     de los parámetros del modelo para que prevalezca; no tocar la clave de
+     repetición. **Publicar** el flujo (un cambio solo en borrador no cuenta).
+     Estado: publicado el 2026-10-12 (versión `34d6da8f` -> `0cc2a050`); falta la
+     prueba manual del paso 3.
+  3. Prueba manual (criterio 30) en un negocio de pruebas: en una conversación real
+     de WhatsApp/Instagram/Facebook, con el modelo instruido para pasar otro
+     `conversation_id`, la petición que recibe el backend lleva el de la
+     conversación real y el historial es el de ese cliente. Guardar la ejecución y
+     la petición.
+  4. Solo con la prueba superada: `HISTORIAL_CITAS_N8N_PUBLICADO=true` y reiniciar.
+     Después el dueño activa la herramienta desde `/herramientas`.
+- **Reversa**: poner la variable en `false` y reiniciar; al arrancar
+  `sincronizar_todos()` desactiva la herramienta en los negocios con calendario
+  encendido y el dueño no puede reactivarla. Si basta con parar un negocio, el
+  dueño la pausa desde `/herramientas`. El panel del portal no depende de la
+  variable.
+
+Tests: `tests/test_historial_citas.py` (puro), `test_historial_citas_api.py` (portal
+y agente), `test_herramientas_calendario.py` (herramienta y compuerta) y
+`test_pruebas.py`.
+
+### Re-agendar una cita desde el agente
+
+Antes el agente "re-agendaba" creando una cita nueva con `crear_reserva` y la
+anterior quedaba confirmada, ocupando horario. Ahora hay dos herramientas más (en
+total **nueve**, `services/herramientas_calendario.py`) y una regla en el prompt de
+n8n.
+
+- **`consultar_citas_proximas`** → `POST /api/eventos/calendario/citas-proximas`,
+  cuerpo `{tenant_id, conversation_id}`. Citas **futuras y `confirmada`s** del
+  cliente de la conversación, de la más cercana a la más lejana (tope 10 +
+  `hay_mas`), cada una con `reserva_id`, `servicio_id`, `proveedor_id`,
+  `fecha_hora_inicio` (zona del negocio), nombres, `antelacion_minima_horas` y
+  `cancelacion_seria_tardia`. Es lo único que le da al agente un `reserva_id` sin que
+  el cliente lo tenga (el historial **no** lo incluye, a propósito). Mismo
+  criterio de cliente y mismo 404 uniforme que el historial (conversación ajena,
+  inexistente, de widget o con id inválido).
+- **`reagendar_reserva`** → `POST /api/eventos/calendario/reservas/reagendar`,
+  cuerpo `{tenant_id, conversation_id, reserva_id, hora_inicio, idempotency_key}`
+  (la herramienta recibe `fecha` + `hora` y "Prepara HTTP POST" los convierte).
+  `services/calendario.py::reagendar_reserva` hace **en una sola transacción**:
+  bloquea la cita (`FOR UPDATE`), la cancela como cancelación **del cliente**
+  y crea otra con el mismo servicio, proveedor, cliente y notas. Si el horario nuevo
+  no cabe (ocupado, fuera de jornada, proveedor o servicio inactivos), no cambia
+  nada y la respuesta es `200 {reagendada: false, motivo_rechazo}`.
+- **Qué se decidió**: se mantienen servicio y proveedor (solo cambia la hora);
+  fuera de la antelación del servicio **se acepta**, pero la anterior queda con
+  `cancelacion_tardia=true` (cuenta en el reporte de plataforma y avisa al negocio,
+  igual que cancelar); una cita que no está `confirmada` o ya empezó da 409
+  `{codigo: reserva_no_confirmada | cita_ya_iniciada}` (mismos códigos que
+  cancelar). Mover la cita a un horario que se solapa con la propia funciona, porque
+  la anterior se cancela primero dentro de la transacción.
+- **La cita debe ser del cliente de la conversación**: se compara
+  `reservas.user_id` con el de `conversation_id`; la ajena y la inexistente dan el
+  mismo 404 (el modelo no puede mover la cita de otro cliente aunque conozca su id).
+  Esa es la razón de que `reagendar_reserva` dependa del `conversation_id` real.
+- **Idempotencia**: `idempotency_key` se guarda en la cita **nueva**; un reintento
+  con la misma clave devuelve `duplicado=true` con esa cita y **no** cancela otra vez.
+- **Auditoría y avisos**: la anterior registra `cancelada` (datos con
+  `reagendada_a`, y `antelacion_aplicada_horas`/`segundos_restantes` si fue tardía),
+  la nueva `creada` (con `reagendada_de`); sin migración. El negocio recibe las
+  alertas ya existentes `reserva_cancelada` ("...porque el cliente la reagendó") y
+  `reserva_creada`, y la del proveedor si tiene cuenta.
+- **Compuerta**: las dos herramientas comparten `HISTORIAL_CITAS_N8N_PUBLICADO` con
+  el historial (`herramientas_calendario.CON_COMPUERTA`); con `false` quedan creadas
+  pero **desactivadas**. Mientras la compuerta esté cerrada el agente solo tiene
+  `cancelar_reserva`, y la regla de respaldo del prompt le pide **no** agendar encima
+  de la anterior: cancelar primero (si tiene el `reserva_id`) o escalar a una persona.
+- **n8n** (`entrada-canal-universal`, nodo "Arma prompt"): párrafo "RE-AGENDAR UNA
+  CITA": usar `consultar_citas_proximas`, preguntar cuál si hay varias, conservar
+  servicio y proveedor, **avisar que se cancelará la cita actual** (y que quedará
+  como tardía si `cancelacion_seria_tardia`), pedir confirmación explícita y solo
+  entonces `reagendar_reserva`. Si el horario ya no está libre, la original sigue
+  vigente. Publicado el 2026-10-12.
+- **Límite conocido**: como en R32 de la regla de cancelación, `_encender` no pisa
+  descripciones editadas; los negocios existentes reciben las dos filas nuevas al
+  arrancar (`sincronizar_todos`), con la descripción de este módulo.
+
+Tests: `tests/test_reagendar_citas.py` (atomicidad, tardía, idempotencia, cita ajena,
+endpoints) y `test_herramientas_calendario.py` (las nueve filas y la compuerta).
 
 ### Control de acceso por plan
 

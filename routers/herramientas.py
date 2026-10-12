@@ -10,6 +10,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.concurrency import run_in_threadpool
 
+from config import settings
 from deps import (
     UsuarioActual,
     gerencia_actual,
@@ -329,6 +330,27 @@ async def actualizar(
     tenant_id: UUID = Depends(tenant_actual),
     _: UsuarioActual = Depends(gerencia_actual),
 ):
+    # Compuerta de despliegue (spec 002, R25): hasta que n8n publique, el
+    # historial no se puede activar. Primero debe existir (404 como siempre);
+    # el 409 rechaza el PATCH completo, también los textos del mismo cuerpo.
+    if (
+        datos.is_enabled is True
+        and not herramientas_calendario.compuerta_abierta(
+            tool_key, settings.HISTORIAL_CITAS_N8N_PUBLICADO
+        )
+    ):
+        existe = await fetch_one(
+            "SELECT 1 FROM tenant_tools WHERE tenant_id = $1 AND tool_key = $2",
+            tenant_id,
+            tool_key,
+        )
+        if existe is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Herramienta no encontrada")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Esta herramienta aún no está disponible para tu negocio.",
+        )
+
     fila = await fetch_one(
         """
         UPDATE tenant_tools SET

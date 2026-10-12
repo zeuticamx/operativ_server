@@ -33,6 +33,7 @@ from schemas import (
 )
 from services import adjuntos
 from services import asignacion_conversaciones as asig
+from services import avisos_conversacion as avisos
 from services import conversaciones as svc
 from services import meta
 
@@ -303,8 +304,16 @@ async def tomar(
     contestar (inversa de volver-a-ia). Vale si está sin asignar; si ya la
     tiene otro, 409 — solo el owner se la quita (PUT/DELETE .../asignacion).
     """
+    previo = await fetch_one(
+        "SELECT asignado_a FROM conversations WHERE id = $1 AND tenant_id = $2",
+        conversacion_id,
+        tenant_id,
+    )
     fila = await asig.tomar(tenant_id, conversacion_id, usuario.id)
     await emit_conversacion_estado(tenant_id, conversacion_id, fila["status"], fila["asignado_a"])
+    # Tomarla de nuevo siendo suya es idempotente y no es una novedad.
+    if previo is None or previo["asignado_a"] != usuario.id:
+        await avisos.tomada(tenant_id, conversacion_id, usuario.email)
     return ConversacionEstadoOut(**dict(fila))
 
 
@@ -327,6 +336,10 @@ async def volver_a_ia(
         tenant_id, conversacion_id, fila["status"], None,
         extra_usuarios=[previo["asignado_a"]] if previo else (),
     )
+    await avisos.devuelta_a_ia(
+        tenant_id, conversacion_id, previo["asignado_a"] if previo else None,
+        usuario.id, usuario.email,
+    )
     return ConversacionEstadoOut(**dict(fila))
 
 
@@ -348,6 +361,10 @@ async def asignar(
     await emit_conversacion_estado(
         tenant_id, conversacion_id, fila["status"], fila["asignado_a"], extra_usuarios=[anterior]
     )
+    if anterior != datos.asignado_a:
+        await avisos.liberada(
+            tenant_id, conversacion_id, anterior, usuario.id, usuario.email, reasignada=True
+        )
     if datos.asignado_a != usuario.id:
         await avisar_a_usuario(
             tenant_id,
@@ -377,6 +394,7 @@ async def soltar(
     await emit_conversacion_estado(
         tenant_id, conversacion_id, fila["status"], None, extra_usuarios=[anterior]
     )
+    await avisos.liberada(tenant_id, conversacion_id, anterior, usuario.id, usuario.email)
     return ConversacionEstadoOut(**dict(fila))
 
 
