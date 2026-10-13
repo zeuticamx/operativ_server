@@ -8,6 +8,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
+from services.limites_agente import HISTORIAL_MAX, HISTORIAL_MIN, MODELOS_AGENTE, ordenar_modelos
+
 
 # ============================================================
 # AUTH
@@ -227,6 +229,17 @@ class UsuarioOut(BaseModel):
 # ============================================================
 # AGENTE
 # ============================================================
+class LimitesAgenteOut(BaseModel):
+    """Lo que el plan deja elegir al agente (services/limites_agente.py)."""
+
+    plan: str | None
+    # Modelos que puede elegir hoy; si el plan no limita, todo el catálogo.
+    modelos_permitidos: list[str]
+    modelo_por_defecto: str | None
+    # Tope efectivo de history_window (HISTORIAL_MAX si el plan no limita).
+    historial_maximo: int
+
+
 class AgenteConfigOut(BaseModel):
     agent_name: str
     system_prompt: str
@@ -234,6 +247,7 @@ class AgenteConfigOut(BaseModel):
     temperature: float
     history_window: int
     is_active: bool
+    limites_plan: LimitesAgenteOut | None = None
 
 
 class AgenteConfigIn(BaseModel):
@@ -241,7 +255,7 @@ class AgenteConfigIn(BaseModel):
     system_prompt: str = Field(min_length=10, max_length=20000)
     model: str | None = None
     temperature: float = Field(default=0.7, ge=0.0, le=1.0)
-    history_window: int = Field(default=30, ge=5, le=200)
+    history_window: int = Field(default=30, ge=HISTORIAL_MIN, le=HISTORIAL_MAX)
     is_active: bool = True
 
 
@@ -1891,8 +1905,23 @@ class PlanGerenciaOut(BaseModel):
     # Price recurrente de Stripe (price_...). None = todavía no se puede
     # contratar en línea (crear-pago responde 409).
     stripe_price_id: str | None
+    # Límites del agente (45_limites_agente_plan.sql). None = sin límite.
+    modelos_permitidos: list[str] | None
+    historial_maximo: int | None
     creado_en: datetime
     actualizado_en: datetime
+
+
+def _validar_modelos_plan(v: list[str] | None) -> list[str] | None:
+    """Solo modelos del catálogo; se guarda sin repetidos y en orden barato → caro."""
+    if v is None:
+        return None
+    desconocidos = [m for m in v if m not in MODELOS_AGENTE]
+    if desconocidos:
+        raise ValueError(
+            f"Modelo desconocido: {', '.join(desconocidos)}. Opciones: {', '.join(MODELOS_AGENTE)}"
+        )
+    return ordenar_modelos(v)
 
 
 class PlanCrearIn(BaseModel):
@@ -1923,6 +1952,18 @@ class PlanCrearIn(BaseModel):
     # Price recurrente mensual creado en el panel de Stripe. Opcional: sin
     # él el plan existe (sirve para pruebas) pero no se contrata en línea.
     stripe_price_id: StripePriceId | None = None
+    # Límites del agente. None = sin límite. El primer modelo (en orden del
+    # catálogo) es el que se usa por defecto al recortar.
+    modelos_permitidos: list[str] | None = None
+    historial_maximo: int | None = Field(default=None, ge=HISTORIAL_MIN, le=HISTORIAL_MAX)
+
+    @field_validator("modelos_permitidos")
+    @classmethod
+    def _modelos(cls, v):
+        v = _validar_modelos_plan(v)
+        if v is not None and not v:
+            raise ValueError("Elige al menos un modelo, o déjalo en null para no limitar")
+        return v
 
 
 class PlanActualizarIn(BaseModel):
@@ -1958,6 +1999,21 @@ class PlanActualizarIn(BaseModel):
     # NULL (null sigue siendo "no tocar"). Hace falta para sacar un Price
     # que se archivó en Stripe.
     stripe_price_id: StripePriceIdOVacio | None = None
+    # Límites del agente. null = no tocar; [] / 0 = quitar el límite.
+    modelos_permitidos: list[str] | None = None
+    historial_maximo: int | None = Field(default=None, ge=0, le=HISTORIAL_MAX)
+
+    @field_validator("modelos_permitidos")
+    @classmethod
+    def _modelos(cls, v):
+        return _validar_modelos_plan(v)
+
+    @field_validator("historial_maximo")
+    @classmethod
+    def _historial(cls, v):
+        if v is not None and 0 < v < HISTORIAL_MIN:
+            raise ValueError(f"El historial máximo va de {HISTORIAL_MIN} a {HISTORIAL_MAX} (0 = sin límite)")
+        return v
 
     @model_validator(mode="after")
     def al_menos_uno(self):

@@ -487,10 +487,11 @@ DELETE /api/canales/{tipo}           Desconecta
 
 ### Agente
 ```
-GET    /api/agente           Config actual
-PUT    /api/agente           Actualiza prompt, modelo, parámetros
-GET    /api/agente/modelos   Lista blanca de modelos
+GET    /api/agente           Config actual + `limites_plan` (modelos e historial que deja el plan)
+PUT    /api/agente           Actualiza prompt, modelo, parámetros (402 si excede el plan)
+GET    /api/agente/modelos   Catálogo completo de modelos (lo que deja cada plan va en `limites_plan`)
 ```
+Ver "Límites del agente por plan".
 
 ### Conversaciones
 ```
@@ -1299,6 +1300,55 @@ una consulta por fila. Duplica la regla de `services/acceso_pagos.py`, que
 sigue siendo la fuente de verdad. `tests/test_gerencia.py` compara las dos
 implementaciones sobre una matriz de casos justamente para que no se
 separen en silencio; si cambias una, cambia la otra.
+
+### Límites del agente por plan (`sql/45_limites_agente_plan.sql`)
+
+El plan decide qué **modelos** puede elegir el negocio para su agente y
+cuántos **mensajes de historial** (`tenant_agent_config.history_window`, la
+"ventana de contexto": se cuenta en mensajes, no en tokens) puede darle.
+Vive en `planes` y se edita desde `/gerencia/planes`:
+
+| Columna | Significado |
+|---|---|
+| `modelos_permitidos TEXT[]` | `NULL` = sin límite. El **primero** (orden del catálogo, barato → caro) es el modelo por defecto del plan |
+| `historial_maximo INT` | `NULL` = sin límite; si hay valor, 5 a 200 |
+
+De fábrica: `starter` = Haiku y 50; `pro` = Haiku + Sonnet y 100; `enterprise` =
+`NULL`/`NULL` (todos los modelos, 200, y entran solos los que se agreguen). El
+seed solo corre si nadie tocó el plan (`updated_at = created_at`).
+
+`services/limites_agente.py` tiene el catálogo de modelos (`MODELOS_AGENTE`,
+única lista: se suma un modelo ahí **y** en n8n) y la regla pura. Dos capas:
+
+1. **API** — `PUT /api/agente` responde **402** con `codigo`
+   `modelo_no_incluido_en_plan` o `historial_excede_plan` (más `plan_actual`,
+   `modelos_permitidos` / `historial_maximo`). Sin modelo elegido, y con el
+   plan limitando modelos, guarda el por defecto del plan (`model = NULL`
+   dejaría a n8n usar el suyo, que puede no estar en el plan).
+2. **Triggers** — n8n lee `tenant_agent_config` directo, sin pasar por el
+   backend, así que la fila tiene que *estar* siempre dentro del plan.
+   `recortar_agente_a_plan(tenant)` baja el modelo (al por defecto del plan, si
+   el actual no cabe o es `NULL`) y el historial (`LEAST`), nunca sube nada, y
+   la disparan: alta o cambio de plan en `tenant_subscriptions`, un cambio de
+   `tenant_estado_plataforma.estado` (salir de `prueba`) y bajar los topes en
+   `planes`. Así cubre Stripe, piloto, onboarding, el panel y SQL a mano sin
+   acordarse de llamarlo en cada uno.
+
+El piloto (`prueba`) y un negocio sin suscripción **no tienen topes**, igual
+que `acceso_plan` (el piloto tiene todo abierto). Un plan `pausada`/`cancelada`
+conserva sus topes.
+
+`GET /gerencia/planes/modelos-agente` da el catálogo y el rango al formulario
+del panel. En `PATCH /gerencia/planes/{nombre}`: `null` = no tocar,
+`modelos_permitidos: []` / `historial_maximo: 0` = quitar el límite. Bajar un
+tope recorta de inmediato a los negocios que ya tienen el plan, y
+`gerencia_auditoria` (`plan_actualizado`) guarda `negocios_recortados`.
+
+Aplicar la migración **recorta de una vez** a los negocios existentes con
+`starter`/`pro` que tuvieran más de lo que ahora da su plan.
+
+Tests: `tests/test_limites_agente.py` y el portal en
+`app/(privado)/agente/__tests__/limites-plan.test.tsx`.
 
 ### Ver como el negocio (impersonación)
 

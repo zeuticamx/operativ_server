@@ -20,7 +20,11 @@ contratar). El renombre sigue sin exponerse (ver PlanActualizarIn), aunque
 la FK ya lo haría seguro con su ON UPDATE CASCADE.
 
 Además de precios y límites, cada plan dice qué herramientas del portal
-incluye (`*_activo`): es la matriz que evalúa services/acceso_plan.py.
+incluye (`*_activo`): es la matriz que evalúa services/acceso_plan.py. También
+qué modelos y cuánto historial puede dar al agente (`modelos_permitidos`,
+`historial_maximo`: services/limites_agente.py). Bajar esos topes recorta de
+inmediato la config de los negocios que ya tienen el plan (trigger en
+45_limites_agente_plan.sql) y el número queda en la auditoría.
 
 `stripe_price_id` es el Price recurrente creado en el panel de Stripe: lo
 que de verdad se cobra cada mes (ver services/stripe_suscripciones.py). Sin
@@ -33,6 +37,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from deps import UsuarioActual, gerencia_plataforma_actual
 from schemas import PlanActualizarIn, PlanCrearIn, PlanGerenciaOut
 from services.gerencia import registrar_auditoria
+from services.limites_agente import (
+    HISTORIAL_MAX,
+    HISTORIAL_MIN,
+    MODELOS_AGENTE,
+    contar_fuera_de_limite,
+)
 from session import fetch_all, transaccion
 
 router = APIRouter(
@@ -47,7 +57,7 @@ _COLUMNAS = """
     max_vendedores, max_proveedores, max_leads_mensuales, creditos_incluidos_mensual,
     agente_ia_activo, gestion_vendedores_activo,
     herramientas_activo, crm_campo_activo, calendario_activo, activo, orden,
-    stripe_price_id,
+    stripe_price_id, modelos_permitidos, historial_maximo,
     created_at AS creado_en, updated_at AS actualizado_en
 """
 
@@ -68,6 +78,19 @@ async def listar_planes():
     return [_out(f) for f in filas]
 
 
+@router.get("/modelos-agente")
+async def modelos_agente():
+    """
+    Catálogo de modelos que un plan puede permitir (barato → caro) y el rango
+    del historial, para que el formulario del panel no los repita a mano.
+    """
+    return {
+        "modelos": list(MODELOS_AGENTE),
+        "historial_min": HISTORIAL_MIN,
+        "historial_max": HISTORIAL_MAX,
+    }
+
+
 @router.post("", response_model=PlanGerenciaOut, status_code=status.HTTP_201_CREATED)
 async def crear_plan(
     datos: PlanCrearIn,
@@ -82,8 +105,10 @@ async def crear_plan(
                      max_vendedores, max_leads_mensuales, creditos_incluidos_mensual,
                      agente_ia_activo, gestion_vendedores_activo,
                      herramientas_activo, crm_campo_activo, calendario_activo,
-                     activo, orden, stripe_price_id, max_proveedores)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                     activo, orden, stripe_price_id, max_proveedores,
+                     modelos_permitidos, historial_maximo)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                        $17, $18)
                 """,
                 datos.nombre,
                 datos.descripcion,
@@ -101,6 +126,8 @@ async def crear_plan(
                 datos.orden,
                 datos.stripe_price_id,
                 datos.max_proveedores,
+                datos.modelos_permitidos,
+                datos.historial_maximo,
             )
         except asyncpg.UniqueViolationError:
             raise HTTPException(
@@ -186,6 +213,17 @@ async def actualizar_plan(
                 col: anterior[col] if getattr(datos, col) is None else getattr(datos, col)
                 for col in ("herramientas_activo", "crm_campo_activo", "calendario_activo")
             },
+            # None = no tocar; [] / 0 = quitar el límite (ver PlanActualizarIn).
+            "modelos_permitidos": (
+                anterior["modelos_permitidos"]
+                if datos.modelos_permitidos is None
+                else (datos.modelos_permitidos or None)
+            ),
+            "historial_maximo": (
+                anterior["historial_maximo"]
+                if datos.historial_maximo is None
+                else (datos.historial_maximo or None)
+            ),
             "activo": anterior["activo"] if datos.activo is None else datos.activo,
             "orden": anterior["orden"] if datos.orden is None else datos.orden,
             # None = no tocar; "" = borrarlo (ver PlanActualizarIn).
@@ -195,6 +233,13 @@ async def actualizar_plan(
                 else (datos.stripe_price_id or None)
             ),
         }
+
+        # Cuántos negocios van a quedar recortados por los topes nuevos. Se
+        # cuenta ANTES del UPDATE: el trigger de 45_limites_agente_plan.sql
+        # los recorta en cuanto cambia la fila.
+        recortados = await contar_fuera_de_limite(
+            conn, nombre, nuevo["modelos_permitidos"], nuevo["historial_maximo"]
+        )
 
         await conn.execute(
             """
@@ -214,6 +259,8 @@ async def actualizar_plan(
                 orden = $14,
                 stripe_price_id = $15,
                 max_proveedores = $16,
+                modelos_permitidos = $17,
+                historial_maximo = $18,
                 updated_at = NOW()
             WHERE nombre = $1
             """,
@@ -233,6 +280,8 @@ async def actualizar_plan(
             nuevo["orden"],
             nuevo["stripe_price_id"],
             nuevo["max_proveedores"],
+            nuevo["modelos_permitidos"],
+            nuevo["historial_maximo"],
         )
 
         cambios = datos.model_dump(exclude_none=True)
@@ -249,6 +298,8 @@ async def actualizar_plan(
                 "cambios": {
                     k: (str(v) if hasattr(v, "quantize") else v) for k, v in cambios.items()
                 },
+                # Negocios cuyo agente se recortó al nuevo límite (modelo o historial).
+                "negocios_recortados": recortados,
             },
             conn=conn,
         )
