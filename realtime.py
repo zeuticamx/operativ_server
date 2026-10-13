@@ -34,6 +34,7 @@ los clientes conectados a otro proceso y hace falta un
 
 import logging
 from typing import Any, Iterable, Optional
+from urllib.parse import urlparse
 from uuid import UUID
 
 import jwt
@@ -48,9 +49,39 @@ from session import execute, fetch_all, fetch_one
 
 logger = logging.getLogger("operativai.websocket")
 
+
+def origen_permitido(origin: Optional[str], environ: dict) -> bool:
+    """
+    Qué `Origin` acepta el handshake del WebSocket.
+
+    - El portal web: FRONTEND_ORIGINS, como siempre.
+    - El propio dominio del API. La app móvil (crm-mobile-app) usa el WebSocket
+      de React Native, que en Android manda SIEMPRE `Origin: <esquema>://<host
+      del API>` (WebSocketModule.getDefaultOrigin). Con solo FRONTEND_ORIGINS,
+      python-engineio cerraba el handshake antes de aceptarlo y uvicorn lo
+      registraba como 403, sin llegar a mirar el token.
+
+    Se compara solo el host (con puerto): detrás del proxy el esquema que ve
+    uvicorn es http aunque el cliente use https. Aceptar el origen del propio
+    API no abre nada: un navegador en otro sitio no puede mandar ese Origin, y
+    la sesión va en el token del CONNECT, no en cookies.
+    """
+    if not origin:
+        return True
+    if origin in settings.FRONTEND_ORIGINS:
+        return True
+    host_origen = urlparse(origin).netloc.lower()
+    hosts_propios = {
+        h.split(",")[0].strip().lower()
+        for h in (environ.get("HTTP_HOST"), environ.get("HTTP_X_FORWARDED_HOST"))
+        if h
+    }
+    return bool(host_origen) and host_origen in hosts_propios
+
+
 sio = socketio.AsyncServer(
     async_mode="asgi",
-    cors_allowed_origins=settings.FRONTEND_ORIGINS,
+    cors_allowed_origins=origen_permitido,
 )
 
 # sid -> tenant_id. Hace falta en `disconnect`, donde socket.io ya no dice
