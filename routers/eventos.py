@@ -42,7 +42,7 @@ from services.calendario import (
 )
 from services.cancelacion_citas import segundos_hasta, texto_alerta_tardia
 from services.gerencia import registrar_uso_tokens
-from services.notificaciones import notificar_vendedor_nuevo_lead
+from services.notificaciones import avisar_leads_asignados, notificar_vendedor_nuevo_lead
 from services.pipeline import asignar_vendedor, get_or_create_pipeline, get_tenant_servicios
 from schemas import (
     AdjuntoEntranteIn,
@@ -166,6 +166,12 @@ async def on_mensaje_entrante(
             # Un aviso que no sale no puede tumbar el mensaje entrante del
             # cliente: n8n necesita su respuesta para seguir el workflow.
             log.exception("Falló el aviso de lead nuevo al vendedor %s", vendedor_id)
+
+    # La alerta en la app (WebSocket + push) sale siempre que el lead cambió
+    # de dueño, con o sin agente: aunque la IA esté contestando, el lead ya
+    # es del vendedor y tiene que verlo en su cartera. Nunca levanta excepción.
+    if asignado_ahora:
+        await avisar_leads_asignados(tenant_id, vendedor_id, [user_id])
 
     return MensajeEntranteOut(
         gestion_vendedores_activo=True,

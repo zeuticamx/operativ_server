@@ -1168,6 +1168,7 @@ class TipoAlerta(str, Enum):
     conversacion_tomada = "conversacion_tomada"
     conversacion_liberada = "conversacion_liberada"
     conversacion_devuelta_ia = "conversacion_devuelta_ia"
+    lead_asignado = "lead_asignado"
 
 class AlertaOut(BaseModel):
     id: UUID
@@ -1181,9 +1182,37 @@ class AlertaOut(BaseModel):
     # None = alerta del negocio (la ven todos); con valor = personal, solo
     # para ese usuario (p. ej. el recordatorio de perfil incompleto).
     portal_user_id: Optional[UUID] = None
-    
+
     class Config:
         from_attributes = True
+
+
+class ConteoAlertasOut(BaseModel):
+    """GET /alertas/mias/no-leidas: el número de la campana de la app."""
+    no_leidas: int
+
+
+class MarcarTodasLeidasOut(BaseModel):
+    """PATCH /alertas/mias/marcar-todas-leidas."""
+    marcadas: int
+
+
+class DispositivoPushIn(BaseModel):
+    """
+    Registro de un dispositivo de la app móvil para recibir push.
+    `token` es el Expo push token (`ExponentPushToken[...]`) que devuelve
+    `getExpoPushTokenAsync` en el teléfono.
+    """
+    token: str = Field(..., min_length=10, max_length=255)
+    plataforma: Literal["ios", "android"]
+
+    @field_validator("token")
+    @classmethod
+    def _formato_expo(cls, valor: str) -> str:
+        valor = valor.strip()
+        if not valor.startswith(("ExponentPushToken[", "ExpoPushToken[")) or not valor.endswith("]"):
+            raise ValueError("No es un Expo push token")
+        return valor
 
 # ============================================================
 # PAGOS (Stripe; Mercado Pago inhabilitado, ver PAYMENT_PROVIDER)

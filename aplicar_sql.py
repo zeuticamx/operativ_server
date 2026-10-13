@@ -42,6 +42,7 @@ TABLAS = [
     ("tenant_vendedor_config", "portal"),
     ("client_pipeline", "portal"),
     ("pipeline_historial", "portal"),
+    ("dispositivos_push", "portal"),
     ("clientes", "portal"),
     ("visitas", "portal"),
     ("tareas_seguimiento", "portal"),

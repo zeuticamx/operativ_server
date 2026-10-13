@@ -27,6 +27,7 @@ from routers import (
     conversaciones,
     conversaciones_historial,
     cuenta,
+    dispositivos,
     equipo,
     acceso_soporte,
     eventos,
@@ -110,6 +111,9 @@ app.include_router(vendedores.router_tenants, prefix="/api")
 app.include_router(vendedores.router_pipeline, prefix="/api")
 app.include_router(pipeline_config.router, prefix="/api")
 app.include_router(alertas.router, prefix="/api")
+# Tokens de push de la app móvil: cada alerta de broadcast_alerta sale
+# también como push (services/push.py) a los mismos destinatarios.
+app.include_router(dispositivos.router, prefix="/api")
 
 # Cobros. La pasarela activa la decide PAYMENT_PROVIDER: hoy Stripe, con
 # Mercado Pago inhabilitado pero sin borrar. Cada una tiene su webhook, y

@@ -27,6 +27,7 @@ from services.acceso_plan import (
 )
 from services.agenda import avisar_cambio_vendedores
 from services.asignacion import asignar_vendedor_automatico, leer_config
+from services.notificaciones import avisar_leads_asignados
 from services.asignacion_conversaciones import reasignar_de_cuenta
 from deps import (
     ROL_VENDEDOR,
@@ -643,6 +644,14 @@ async def reasignar_pendientes(
         await avisar_cambio_vendedores(
             tenant_id, [vendedor_id, *{m["vendedor_nuevo_id"] for m in movimientos}]
         )
+        # Una alerta personal por vendedor que recibió leads, no una por lead.
+        por_destino: dict[UUID, list[UUID]] = {}
+        for m in movimientos:
+            por_destino.setdefault(m["vendedor_nuevo_id"], []).append(m["cliente_id"])
+        for destino, clientes in por_destino.items():
+            await avisar_leads_asignados(
+                tenant_id, destino, clientes, actor_portal_user_id=usuario.id
+            )
 
     return ReasignacionOut(
         vendedor_id=vendedor_id,
@@ -714,7 +723,17 @@ async def asignar_cliente(
         )
 
     await avisar_cambio_vendedores(tenant_id, [anterior, destino])
-    return _a_pipeline_out(fila)
+    resultado = _a_pipeline_out(fila)
+    # Reasignar al mismo vendedor que ya lo tenía no es un lead nuevo para él.
+    if destino is not None and destino != anterior:
+        await avisar_leads_asignados(
+            tenant_id,
+            destino,
+            [user_id],
+            actor_portal_user_id=usuario.id,
+            cliente_nombre=resultado.cliente_nombre,
+        )
+    return resultado
 
 
 @router_pipeline.patch("/{user_id}/estado", response_model=PipelineOut)
@@ -1329,6 +1348,14 @@ async def crear_cliente(
             "monto": str(resultado.monto_estimado) if resultado.monto_estimado is not None else None,
             "canal": datos.canal,
         },
+    )
+    # La de arriba es del negocio (no le llega al vendedor); esta es la suya.
+    await avisar_leads_asignados(
+        tenant_id,
+        vendedor_id,
+        [user_id],
+        actor_portal_user_id=usuario.id,
+        cliente_nombre=resultado.cliente_nombre,
     )
 
     return resultado

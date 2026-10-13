@@ -43,6 +43,7 @@ from config import settings
 from deps import ROLES_NEGOCIO
 from routers.alertas import crear_alerta
 from security import decodificar_token
+from services.push import programar_push_alerta
 from session import execute, fetch_all, fetch_one
 
 logger = logging.getLogger("operativai.websocket")
@@ -274,6 +275,26 @@ async def marcar_leida(sid: str, data: Optional[dict]) -> None:
     await sio.emit("alerta_leida", {"alerta_id": alerta_id}, room=sala)
 
 
+async def emitir_alertas_leidas(tenant_id: UUID, filas: Iterable[Any]) -> None:
+    """
+    `alerta_leida` para cada alerta marcada por HTTP (PATCH
+    /alertas/mias/marcar-todas-leidas), a la misma room que usa
+    `marcar_leida`: así las otras sesiones abiertas bajan su contador sin
+    volver a pedir nada. `filas` trae `id` y `portal_user_id`.
+    Best-effort: el UPDATE ya quedó hecho.
+    """
+    try:
+        for fila in filas:
+            sala = (
+                _sala_usuario(fila["portal_user_id"])
+                if fila["portal_user_id"]
+                else _sala(tenant_id)
+            )
+            await sio.emit("alerta_leida", {"alerta_id": str(fila["id"])}, room=sala)
+    except Exception:  # pragma: no cover - el aviso es best-effort
+        logger.exception("No se pudo emitir alerta_leida (tenant=%s)", tenant_id)
+
+
 async def broadcast_alerta(
     tenant_id: UUID,
     tipo: str,
@@ -289,8 +310,21 @@ async def broadcast_alerta(
 
     sio.emit a una room sin nadie conectado es un no-op — no hace falta
     revisar antes si hay alguien escuchando.
+
+    Además sale como push a la app móvil (services/push.py), a los mismos
+    destinatarios que la room: así llega también con la app cerrada. El
+    push va en segundo plano y no demora a quien llama.
     """
     alerta = await crear_alerta(tenant_id, tipo, titulo, mensaje, datos, portal_user_id)
+    programar_push_alerta(
+        tenant_id,
+        portal_user_id,
+        alerta.id,
+        getattr(alerta.tipo, "value", alerta.tipo),
+        alerta.titulo,
+        alerta.mensaje,
+        alerta.datos,
+    )
     await sio.emit(
         "nueva_alerta",
         {

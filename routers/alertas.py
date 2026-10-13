@@ -12,16 +12,17 @@ import logging
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from deps import (
     ROLES_GERENCIA,
+    ROLES_NEGOCIO,
     UsuarioActual,
     gerencia_actual,
     usuario_actual,
     verificar_acceso_tenant,
 )
-from schemas import AlertaOut
+from schemas import AlertaOut, ConteoAlertasOut, MarcarTodasLeidasOut
 from services.correo import ErrorEnvioCorreo, enviar_alerta_critica
 from session import execute, fetch_all, fetch_one
 
@@ -69,6 +70,102 @@ async def obtener_alertas(
 
     alertas = await fetch_all(query, *params)
     return [dict(a) for a in alertas]
+
+
+@router.get("/alertas/mias", response_model=list[AlertaOut])
+async def mis_alertas(
+    leido: Optional[bool] = None,
+    limite: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    usuario: UsuarioActual = Depends(usuario_actual),
+):
+    """
+    Las alertas que este usuario recibe en vivo, para cualquier rol: las
+    personales y, si está en la room del negocio (deps.ROLES_NEGOCIO), las
+    del negocio. Mismo criterio que `realtime.connect`, para que lo que se
+    lista por HTTP coincida con lo que llega por WebSocket y push.
+
+    Existe aparte de GET /tenants/{id}/alertas porque aquel es solo de
+    gerencia: un vendedor no tenía cómo leer sus propias alertas.
+    """
+    if usuario.tenant_id is None:
+        return []
+
+    query = f"""
+        SELECT id, tenant_id, tipo, titulo, mensaje, datos, leido, creado_en,
+               portal_user_id
+        FROM alertas
+        WHERE {_VISIBLES_PARA_USUARIO}
+    """
+    params: list = _params_visibles(usuario)
+
+    if leido is not None:
+        params.append(leido)
+        query += f" AND leido = ${len(params)}"
+
+    params.extend([limite, offset])
+    query += f" ORDER BY creado_en DESC LIMIT ${len(params) - 1} OFFSET ${len(params)}"
+
+    return [dict(a) for a in await fetch_all(query, *params)]
+
+
+# Lo que ve un usuario en /alertas/mias y en el socket: sus personales y, si su
+# rol está en la room del negocio, las del negocio. $1 tenant, $2 usuario,
+# $3 "ve las del negocio". Compartido por los tres endpoints de /alertas/mias
+# para que listado, contador y "marcar todas" no puedan desalinearse.
+_VISIBLES_PARA_USUARIO = """
+    tenant_id = $1
+    AND (portal_user_id = $2 OR (portal_user_id IS NULL AND $3))
+"""
+
+
+def _params_visibles(usuario: UsuarioActual) -> list:
+    return [usuario.tenant_id, usuario.id, usuario.role in ROLES_NEGOCIO]
+
+
+@router.get("/alertas/mias/no-leidas", response_model=ConteoAlertasOut)
+async def contar_mis_no_leidas(usuario: UsuarioActual = Depends(usuario_actual)):
+    """
+    Cuántas alertas sin leer tiene el usuario, sin tope: la campana de la app
+    lo muestra tal cual. El listado de /alertas/mias está paginado (máx. 100),
+    así que contarlo en el cliente daría un número falso con muchas pendientes.
+    """
+    if usuario.tenant_id is None:
+        return ConteoAlertasOut(no_leidas=0)
+    total = await fetch_one(
+        f"SELECT COUNT(*)::int AS total FROM alertas WHERE {_VISIBLES_PARA_USUARIO} AND NOT leido",
+        *_params_visibles(usuario),
+    )
+    return ConteoAlertasOut(no_leidas=total["total"] if total else 0)
+
+
+@router.patch("/alertas/mias/marcar-todas-leidas", response_model=MarcarTodasLeidasOut)
+async def marcar_todas_mis_leidas(usuario: UsuarioActual = Depends(usuario_actual)):
+    """
+    Marca leídas, de una vez, todas las alertas que el usuario ve (mismo
+    criterio que /alertas/mias). Una sola consulta en vez de un evento de
+    socket por alerta.
+
+    Las del negocio quedan leídas para todo el negocio, igual que al marcar
+    una por el socket (`realtime.marcar_leida`): `leido` es una columna de la
+    alerta, no por usuario. Avisa a las otras sesiones con `alerta_leida`.
+    """
+    if usuario.tenant_id is None:
+        return MarcarTodasLeidasOut(marcadas=0)
+    filas = await fetch_all(
+        f"""
+        UPDATE alertas SET leido = true
+         WHERE {_VISIBLES_PARA_USUARIO} AND NOT leido
+        RETURNING id, portal_user_id
+        """,
+        *_params_visibles(usuario),
+    )
+    if filas:
+        # Import perezoso: realtime importa este módulo (crear_alerta).
+        from realtime import emitir_alertas_leidas
+
+        await emitir_alertas_leidas(usuario.tenant_id, filas)
+    return MarcarTodasLeidasOut(marcadas=len(filas))
 
 
 @router.patch("/alertas/{alerta_id}/marcar-leida")

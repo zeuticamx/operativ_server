@@ -315,6 +315,13 @@ class Settings:
         if c.strip()
     )
 
+    # ---- Push a la app móvil (Expo Push Service) ----
+    # Opcional: solo hace falta si en el proyecto de EAS se activó "Enhanced
+    # Security for Push Notifications". Sin él, Expo acepta el envío igual.
+    EXPO_ACCESS_TOKEN: str = os.getenv("EXPO_ACCESS_TOKEN", "")
+    # Apagar los push sin tocar código (pruebas, entorno local sin red).
+    PUSH_ACTIVO: bool = os.getenv("PUSH_ACTIVO", "true").strip().lower() in ("1", "true", "yes")
+
     # ---- CORS ----
     FRONTEND_ORIGINS: list[str] = [
         o.strip()
