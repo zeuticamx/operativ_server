@@ -43,6 +43,48 @@ class Settings:
         "si",
         "sí",
     )
+    # Compuerta de "limpiar el contexto del agente" (spec 003): el operador la
+    # enciende cuando n8n ya publicó el cambio del nodo "Carga historial" que
+    # lee solo los mensajes posteriores al último corte. Con false el botón y
+    # el endpoint quedan cerrados; los cortes ya registrados siguen vigentes.
+    CONTEXTO_CONVERSACION_N8N_PUBLICADO: bool = os.getenv("CONTEXTO_CONVERSACION_N8N_PUBLICADO", "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "si",
+        "sí",
+    )
+
+    # ---- Avisos de citas por WhatsApp desde la cuenta global (spec 004) ----
+    # Se leen en tiempo de petición/pasada (no se copian a constantes de
+    # módulo) para que los tests puedan cambiarlas con monkeypatch.
+    #
+    # Apagada = el job de recordatorios y el aviso de cancelación registran
+    # `omitido desactivado_por_configuracion` y no llaman al proveedor.
+    AVISOS_CITA_WHATSAPP_ACTIVOS: bool = os.getenv("AVISOS_CITA_WHATSAPP_ACTIVOS", "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "si",
+        "sí",
+    )
+    # Apagada = el webhook de NeuroAPI reenvía todo a n8n como siempre. Encendida
+    # = la respuesta de un cliente a un aviso recibe el texto fijo (no llega al agente).
+    AVISOS_CUENTA_GLOBAL_RESPUESTA_ACTIVA: bool = os.getenv("AVISOS_CUENTA_GLOBAL_RESPUESTA_ACTIVA", "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "si",
+        "sí",
+    )
+    # Tenant dueño de la línea de WhatsApp (NeuroAPI) que hace de "cuenta
+    # global". No es un secreto: la clave y el phone_number_id se leen de su
+    # fila de channel_credentials (services/cuenta_global_wa.py).
+    AVISOS_CUENTA_GLOBAL_TENANT_ID: str = os.getenv("AVISOS_CUENTA_GLOBAL_TENANT_ID", "").strip()
+    # Cada cuántos minutos corre el job de recordatorios, y cuánto tiempo sin
+    # latido hace que una ejecución se dé por muerta.
+    AVISOS_CITA_REVISION_MINUTOS: int = int(os.getenv("AVISOS_CITA_REVISION_MINUTOS", "5"))
+    AVISOS_EJECUCION_VIVA_MINUTOS: int = int(os.getenv("AVISOS_EJECUCION_VIVA_MINUTOS", "5"))
 
     # URL de producción del webhook `entrada-canal-universal` de n8n. El
     # backend le reenvía los mensajes entrantes de WhatsApp que NeuroAPI
@@ -431,6 +473,16 @@ class Settings:
             logging.getLogger("operativai.config").warning(
                 "SMTP sin configurar (falta SMTP_HOST o SMTP_FROM). Los códigos "
                 "de verificación se van a escribir en el log en vez de enviarse."
+            )
+
+        # Los avisos de citas por WhatsApp salen de la línea de un tenant
+        # (cuenta global). Con la bandera activa y sin tenant, todo envío
+        # quedaría `fallido`; mejor verlo al arrancar.
+        if self.AVISOS_CITA_WHATSAPP_ACTIVOS and not self.AVISOS_CUENTA_GLOBAL_TENANT_ID:
+            logging.getLogger("operativai.config").warning(
+                "AVISOS_CITA_WHATSAPP_ACTIVOS está activa pero "
+                "AVISOS_CUENTA_GLOBAL_TENANT_ID está vacío: los avisos de "
+                "citas por WhatsApp van a quedar como fallidos."
             )
 
         # Tampoco se exige: un tenant que solo usa el portal no necesita el

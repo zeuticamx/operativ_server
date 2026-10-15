@@ -11,7 +11,7 @@ lo que sostiene la disciplina 404-en-vez-de-403 en cada lookup por id.
 from datetime import date, datetime
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 
 from realtime import avisar_a_proveedor, broadcast_alerta, emitir_datos
 from deps import (
@@ -25,7 +25,7 @@ from deps import (
     usuario_actual,
     verificar_acceso_tenant,
 )
-from services import calendario
+from services import avisos_cita, calendario
 from services.asignacion_conversaciones import reasignar_de_cuenta
 from services.calendario import (
     CancelacionRechazada,
@@ -34,6 +34,7 @@ from services.calendario import (
     verificar_calendario_activo,
 )
 from schemas import (
+    AvisoCitaOut,
     CambiarEstadoReservaIn,
     CancelarReservaIn,
     CorteDiarioOut,
@@ -742,6 +743,7 @@ async def cancelar_reserva(
     reserva_id: UUID,
     datos: CancelarReservaIn,
     tenant_id: UUID,
+    fondo: BackgroundTasks,
     usuario: UsuarioActual = Depends(usuario_actual),
 ):
     verificar_acceso_tenant(usuario, tenant_id)
@@ -765,6 +767,10 @@ async def cancelar_reserva(
     if reserva is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reserva no encontrada")
 
+    # Aviso por WhatsApp al cliente (spec 004, RF-6): ya con la cancelación
+    # confirmada y fuera de la respuesta. Un fallo del aviso no la deshace.
+    fondo.add_task(avisos_cita.procesar_cancelacion, tenant_id, reserva_id)
+
     alerta = (
         "reserva_cancelada",
         "Reserva cancelada",
@@ -779,6 +785,25 @@ async def cancelar_reserva(
         await avisar_a_proveedor(tenant_id, cuenta, *alerta)
     await emitir_datos(tenant_id, "reservas", [cuenta])
     return _a_reserva_out(reserva)
+
+
+@router_calendario.get(
+    "/{tenant_id}/calendario/reservas/{reserva_id}/avisos", response_model=list[AvisoCitaOut]
+)
+async def listar_avisos_reserva(
+    reserva_id: UUID,
+    tenant_id: UUID,
+    usuario: UsuarioActual = Depends(gerencia_actual),
+):
+    """
+    Registros de los avisos por WhatsApp de una cita (RF-16). Solo gerencia
+    (owner/superadmin): no está en `permitir_a_proveedor`. Una reserva de otro
+    negocio da 404, igual que una inexistente.
+    """
+    verificar_acceso_tenant(usuario, tenant_id)
+    await _exigir_reserva(reserva_id, tenant_id)
+    filas = await avisos_cita.listar_avisos_de_reserva(tenant_id, reserva_id)
+    return [AvisoCitaOut(**f) for f in filas]
 
 
 @router_calendario.patch(

@@ -219,6 +219,50 @@ async def enviar_alerta_critica(destino: str, titulo: str, mensaje: str) -> None
 
 
 # ============================================================
+# Correo espejo de una notificación (services/correo_espejo.py)
+# ============================================================
+_TEXTO_NOTIFICACION = """{titulo}
+
+{mensaje}
+
+Abrir OperativAI: {url}
+"""
+
+_HTML_NOTIFICACION = """\
+<div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1c1c1c">
+  <p style="margin:0 0 16px;font-size:18px;font-weight:600">{titulo}</p>
+  <p style="margin:0 0 24px;font-size:14px;color:#333">{mensaje}</p>
+  <p style="margin:0">
+    <a href="{url}" style="font-size:13px;color:#3b82f6;text-decoration:none">
+      Abrir OperativAI →
+    </a>
+  </p>
+</div>"""
+
+
+async def enviar_notificacion_negocio(destino: str, titulo: str, mensaje: str) -> None:
+    """
+    Mismo título y mensaje que la notificación del WebSocket (RF-2), con enlace
+    a la raíz del portal (redirige según la sesión y el rol). Título y mensaje
+    pueden traer datos de usuarios: se escapan para HTML. Lanza ErrorEnvioCorreo
+    si el SMTP falla (quien llama decide qué hacer).
+    """
+    url = settings.BASE_URL_FRONTEND or "/"
+    # Un salto de línea en el asunto haría fallar al armar el mensaje.
+    asunto_titulo = " ".join(titulo.split())
+    await enviar_correo(
+        destino,
+        asunto=f"{asunto_titulo} - OperativAI",
+        texto=_TEXTO_NOTIFICACION.format(titulo=titulo, mensaje=mensaje, url=url),
+        html=_HTML_NOTIFICACION.format(
+            titulo=html_mod.escape(titulo),
+            mensaje=html_mod.escape(mensaje),
+            url=html_mod.escape(url),
+        ),
+    )
+
+
+# ============================================================
 # Resumen diario de alertas sin leer
 # ============================================================
 _TEXTO_RESUMEN_ITEM = "  - {titulo}"

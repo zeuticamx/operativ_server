@@ -459,6 +459,12 @@ class ConversacionEstadoOut(BaseModel):
     asignado_a: UUID | None = None
 
 
+class LimpiarContextoOut(BaseModel):
+    """Respuesta (201) de POST .../conversaciones/{id}/limpiar-contexto."""
+    conversacion_id: UUID
+    contexto_limpiado_en: datetime
+
+
 class AsignarConversacionIn(BaseModel):
     """Body de PUT .../conversaciones/{id}/asignacion."""
     asignado_a: UUID
@@ -483,6 +489,8 @@ class ConversacionDetalleOut(AsignacionConversacionOut):
     usuario_username: str | None = None
     ultimo_mensaje_cliente_at: datetime | None = None
     minutos_restantes_ventana: int | None = None
+    contexto_limpiado_en: datetime | None = None
+    puede_limpiar_contexto: bool = False
     mensajes: list[MensajeOut]
 
 
@@ -1169,6 +1177,7 @@ class TipoAlerta(str, Enum):
     conversacion_liberada = "conversacion_liberada"
     conversacion_devuelta_ia = "conversacion_devuelta_ia"
     lead_asignado = "lead_asignado"
+    aviso_cita_no_enviado = "aviso_cita_no_enviado"
 
 class AlertaOut(BaseModel):
     id: UUID
@@ -2343,6 +2352,23 @@ class ReservaAuditoriaOut(BaseModel):
     creado_en: datetime
 
 
+class AvisoCitaOut(BaseModel):
+    """
+    Registro de un aviso de cita por WhatsApp (spec 004, RF-16). Solo lectura,
+    solo gerencia. No expone el teléfono de destino ni la ejecución.
+    """
+
+    id: UUID
+    reserva_id: UUID
+    tipo: Literal["cancelacion", "recordatorio"]
+    hora_inicio: datetime
+    estado: Literal["en_curso", "enviado", "omitido", "fallido"]
+    motivo: str | None
+    sin_conversacion: bool
+    creado_en: datetime
+    cerrado_en: datetime | None
+
+
 class ReemplazarHorariosOut(BaseModel):
     """
     `reservas_en_conflicto` no se cancela ni se toca: son citas futuras que
@@ -2830,3 +2856,27 @@ class OnboardingGerenciaOut(BaseModel):
     omitido_en: datetime | None
     prueba_otorgada_en: datetime | None
     actualizado_en: datetime | None
+
+
+# ------------------------------------------------------------
+# Plantillas de WhatsApp de la cuenta global (spec 004, T8)
+# ------------------------------------------------------------
+EstadoPlantillaWhatsapp = Literal[
+    "no_solicitada", "pendiente_aprobacion", "aprobada", "rechazada", "pausada"
+]
+
+
+class PlantillaWhatsappOut(BaseModel):
+    nombre: str
+    estado: EstadoPlantillaWhatsapp
+    actualizada_en: datetime
+    # Cuenta de gerencia que la cambió; None si fue el sistema (evento de NeuroAPI o error de envío).
+    actualizada_por: UUID | None = None
+    actualizada_por_email: str | None = None
+    nota: str | None = None
+    puede_reintentar: bool
+
+
+class PlantillaWhatsappEstadoIn(BaseModel):
+    estado: EstadoPlantillaWhatsapp
+    nota: str | None = Field(default=None, max_length=500)

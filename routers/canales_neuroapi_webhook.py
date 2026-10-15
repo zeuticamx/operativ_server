@@ -30,7 +30,12 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, status
 
 from config import settings
-from services import entrada_mensajes, neuroapi_connect
+from services import (
+    entrada_mensajes,
+    neuroapi_connect,
+    plantillas_whatsapp,
+    respuesta_cuenta_global,
+)
 from session import execute, fetch_one
 
 router = APIRouter(prefix="/canales/whatsapp/neuroapi", tags=["canales"])
@@ -96,6 +101,16 @@ async def webhook(request: Request) -> dict[str, bool]:
         log.warning("Evento de NeuroAPI Connect que no es un objeto JSON")
         return {"recibido": True}
 
+    # Estado de las plantillas de la cuenta global (spec 004): lo manda Meta
+    # por NeuroAPI, ya con la firma verificada. No es un mensaje ni un alta.
+    if plantillas_whatsapp.es_evento_de_plantilla(evento):
+        try:
+            await plantillas_whatsapp.aplicar_evento_meta(evento)
+        except Exception:
+            # 200 igualmente: un reintento de NeuroAPI no arregla un fallo propio.
+            log.exception("No se pudo aplicar el evento de estado de plantilla")
+        return {"recibido": True}
+
     fuentes = _fuentes(evento)
     tipo_evento = str(_campo(fuentes, "event", "type") or "").strip().lower()
 
@@ -127,6 +142,12 @@ async def _reenviar_mensaje(cuerpo_crudo: bytes, evento: dict[str, Any], tipo_ev
             "Mensaje de NeuroAPI sin phone_number_id receptor (evento=%r); %s",
             tipo_evento, _estructura(evento),
         )
+        return
+
+    # Respuesta de un cliente a un aviso de cita en la cuenta global (spec 004,
+    # D13): se contesta con el texto fijo y no llega al agente del tenant.
+    # Bandera apagada o cualquier otro mensaje: sigue el flujo de siempre.
+    if await respuesta_cuenta_global.desviar_si_es_respuesta(evento, phone_number_id):
         return
 
     tenant_id = await entrada_mensajes.tenant_por_numero(phone_number_id)

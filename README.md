@@ -501,6 +501,7 @@ GET    /api/conversaciones/{id}           Detalle con mensajes
 POST   /api/conversaciones/{id}/mensajes       Respuesta manual (handoff humano)
 POST   /api/conversaciones/{id}/tomar          Un humano toma el control y se la queda (status='transferred', sin acuse)
 POST   /api/conversaciones/{id}/volver-a-ia    Le devuelve el control a la IA (y termina la asignación)
+POST   /api/conversaciones/{id}/limpiar-contexto  Solo el dueño: el agente deja de usar lo anterior (no borra mensajes)
 PUT    /api/conversaciones/{id}/asignacion     Owner/superadmin asigna o reasigna {asignado_a, nota?}
 DELETE /api/conversaciones/{id}/asignacion     Deja la conversación sin asignar (owner, o el asignado la suya)
 GET    /api/conversaciones/asignables          Cuentas a las que se les puede asignar (solo gerencia)
@@ -1242,6 +1243,222 @@ n8n.
 
 Tests: `tests/test_reagendar_citas.py` (atomicidad, tardía, idempotencia, cita ajena,
 endpoints) y `test_herramientas_calendario.py` (las nueve filas y la compuerta).
+
+### Limpiar el contexto del agente (spec 003, `sql/47_conversacion_contexto_cortes.sql`)
+
+Cuando el agente responde mal, el dueño pulsa "Limpiar contexto del agente" en la
+conversación y el agente deja de usar lo anterior. **No se borra ni se modifica
+ningún mensaje**: el portal sigue mostrando todo el historial. Lo único que se hace
+es registrar un **corte** (una fila nueva en `conversacion_contexto_cortes`); n8n lee
+solo los mensajes posteriores al último corte de la conversación. No cambia el
+estado, la asignación ni la IA de la conversación, no genera alertas y no escribe en
+`gerencia_auditoria` (su bitácora es la propia tabla). La lógica vive en
+`services/contexto_conversacion.py` (`puede_limpiar_contexto` pura;
+`conversacion_de_cliente`, `registrar_corte` y `ultimo_corte` con SQL crudo y
+`tenant_id` en el WHERE).
+
+- **Endpoint**: `POST /api/conversaciones/{conversacion_id}/limpiar-contexto` → 201
+  `{conversacion_id, contexto_limpiado_en}`. Códigos, **en este orden** (responde la
+  primera condición que falla):
+
+  | Código | Cuándo |
+  |---|---|
+  | 403 | No es dueño con sesión propia: member, vendedor, proveedor, superadmin o "ver como" (aunque tenga escritura concedida). No mira el id ni busca la conversación. |
+  | 404 | Conversación inexistente, de otro negocio o de canal que no es `whatsapp`/`instagram`/`facebook` (`Conversación no encontrada`, idéntico en los casos). |
+  | 409 | `CONTEXTO_CONVERSACION_N8N_PUBLICADO` en `false`: `Limpiar el contexto del agente todavía no está disponible.` |
+  | 402 | El plan no incluye el agente (vencido, cancelado, sin plan) o cuenta suspendida; mismo cuerpo que `volver-a-ia`. |
+  | 422 | `conversacion_id` sin forma de UUID. |
+
+  `conversacion_id` se declara `str` y no `UUID` a propósito: con `UUID` FastAPI
+  respondería 422 antes de ejecutar la función y un id mal formado ganaría al 409 y
+  al 402. Así, con el flag apagado un id malformado da 409, con el flag activo y plan
+  sin agente da 402, y solo con todo en regla da 422.
+- **Guarda `owner_sin_impersonar`** (`deps.py`): acepta solo el rol `owner` y rechaza
+  la sesión de "ver como". No sirve `gerencia_actual`, porque admite también a
+  `superadmin`; ni `herramientas._solo_owner`, que compara el rol pero no mira la
+  impersonación. No declara parámetros de ruta, así que su 403 no depende del id y no
+  revela si la conversación existe. Vendedor y proveedor quedan cerrados por ella: el
+  endpoint **no** se añade a `permitir_a_roles_acotados` ni a `permitir_a_proveedor`.
+  Un intento de "ver como" con escritura concedida lo registra como
+  `impersonacion_escritura` la dependencia existente (`_validar_impersonacion`) antes
+  de este 403; no se añade otra fila.
+- **Router propio sin dependencias**: el endpoint cuelga de `router_contexto`
+  (`routers/conversaciones.py`, incluido en `main.py` con prefijo `/api`), no de
+  `router`. Este último tiene `requiere_herramienta("agente", lectura_sin_plan=True)`
+  a nivel de router, que se evalúa antes que las del endpoint y respondería 402 a un
+  member o a un superadmin con plan vencido antes de que la guarda dé el 403. El plan
+  se comprueba dentro del endpoint con `exigir_herramienta(tenant_id, "agente")`
+  (el mismo 402 que `volver-a-ia`), después del 409. Está cubierto por un test de
+  dependencias del router.
+- **Detalle**: `GET /api/conversaciones/{id}` devuelve `contexto_limpiado_en` (el
+  `creado_en` del último corte o `null`) y `puede_limpiar_contexto`, que es `true`
+  solo si a la vez: flag activo, dueño con sesión propia, canal de cliente y plan con
+  agente. El portal muestra el botón solo con ese dato. El detalle nunca lanza 402
+  (con plan vencido sigue en lectura y el dato es `false`). La pantalla de gerencia
+  no monta el botón.
+- **Tabla `conversacion_contexto_cortes`**: `id`, `tenant_id` (CASCADE),
+  `conversation_id` (CASCADE), `creado_en TIMESTAMPTZ NOT NULL DEFAULT now()` (el
+  instante lo fija la BD, no el navegador ni el servidor de aplicación) y
+  `realizado_por` (`portal_users`, `ON DELETE SET NULL`; no se guarda el correo).
+  Índice `(conversation_id, creado_en DESC)`. Cada pulsación inserta una fila y los
+  cortes anteriores se conservan; vale el más reciente. Idempotente (`IF NOT EXISTS`).
+- **Compuerta `CONTEXTO_CONVERSACION_N8N_PUBLICADO`** (`false` por defecto; ver
+  `.env.example`; mismo parseo que `HISTORIAL_CITAS_N8N_PUBLICADO`). Sin el cambio de
+  lectura en n8n, el botón prometería un efecto que no ocurre. Con `false`: el POST
+  responde 409, `puede_limpiar_contexto` es `false` y el portal no muestra el botón.
+  **Los cortes ya registrados siguen vigentes**: apagar el flag solo oculta el botón y
+  bloquea cortes nuevos; n8n los respeta mientras lea la tabla. Cambiar la variable
+  exige reiniciar el backend.
+- **Cambio requerido en n8n** (fuera de este repo; flujo `entrada-canal-universal`,
+  nodo "Carga historial"): hoy lee `SELECT role, content, created_at FROM messages
+  WHERE conversation_id = $1 AND id NOT IN (...) ORDER BY created_at DESC LIMIT $2`
+  (`$2` = `history_window`, 30 por defecto). Hay que leer el último corte
+  (`SELECT creado_en FROM conversacion_contexto_cortes WHERE conversation_id = $1
+  ORDER BY creado_en DESC LIMIT 1`) y añadir al `WHERE` (**antes del `LIMIT`**, o el
+  tope se llenaría con mensajes viejos) `AND created_at > (<corte.creado_en> AT TIME
+  ZONE '<huso de agente_db>')`. Motivo: `messages.created_at` es `TIMESTAMP` sin
+  huso, con la hora de reloj de la sesión que lo insertó, mientras el corte es un
+  instante absoluto; hay que convertirlo al huso de la base. El huso es el valor de
+  `SHOW timezone` de `agente_db`, en formato IANA (no una abreviatura, para que el
+  horario de verano se resuelva bien); no se fija en el repo. Si la tabla no existe
+  (migración 47 sin aplicar) o la consulta falla, n8n trata el caso como "sin corte",
+  deja un aviso en la ejecución y responde como hoy.
+- **Orden de despliegue** (no alterar):
+  1. Aplicar `python aplicar_sql.py sql/47_conversacion_contexto_cortes.sql`
+     (`--revisar` la lista como pendiente; aplicarla dos veces no da error).
+  2. Desplegar backend y portal con la variable en `false`.
+  3. En n8n, publicar el cambio de lectura de "Carga historial" (tolerando tabla
+     ausente y fallo de consulta). Un cambio solo en borrador no cuenta.
+  4. Prueba manual (criterio A9): `SHOW timezone` igual en la conexión de n8n y en la
+     del backend, y `NOW() AT TIME ZONE '<huso>' - created_at` de un mensaje de prueba
+     de segundos (si da horas, no se publica); tras un corte en una conversación real,
+     el historial de la ejecución de n8n no contiene mensajes con `created_at`
+     anterior o igual al corte; con la tabla ausente o la consulta fallando, la
+     respuesta sale igual y queda el aviso. Guardar la ejecución.
+  5. Solo con la prueba superada: `CONTEXTO_CONVERSACION_N8N_PUBLICADO=true` y
+     reiniciar el backend.
+- **Advertencia**: no poner la variable en `true` antes de superar el paso 4 (A9). Si
+  el huso no coincide, el corte no surte efecto y el dueño creería haber corregido al
+  agente cuando no es así. Mientras tanto el sistema no registra cortes ni muestra el
+  botón.
+- **Casos aceptados**: un mensaje que el cliente envía justo mientras el dueño
+  confirma, o una respuesta que n8n ya armó con el contexto viejo, salen con ese
+  contexto (el diálogo del portal lo avisa); dos pulsaciones dejan dos filas. No hay
+  forma de deshacer un corte: el siguiente solo mueve el instante hacia adelante. Una
+  conversación cerrada que el cliente reabre es una conversación nueva en n8n y no
+  hereda el corte. Quedan fuera el widget web, "ver como" y la acción masiva.
+
+Tests: `tests/test_contexto_conversacion.py` (flag, migración, guarda, lógica pura,
+servicio con BD, precedencia de códigos del endpoint y campos del detalle).
+
+### Avisos de cita y notificaciones por correo (spec 004, `sql/48` a `sql/51`)
+
+Tres cosas independientes, todas con la bandera apagada o inocuas por defecto.
+
+**Correo espejo.** Cada alerta que `realtime.py` emite por Socket.IO sale también por
+correo (SMTP, `services/correo_espejo.py` + `correo.enviar_notificacion_negocio`, con
+escape HTML y versión de texto) a las cuentas activas que la recibirían en el panel.
+Lo cubren también `sin_actividad` y `nuevo_lead`; solo quedan fuera `cuota_excedida`,
+`perfil_incompleto` y `solicitud_escritura` (`TIPOS_SIN_ESPEJO`). Si una misma persona
+recibe la transferida y la asignada de una conversación, llega un solo correo
+(`excluir_correo_a`). Un SMTP caído no lanza ni quita la alerta del panel.
+
+**Plantillas globales.** `notificacion_cancelacion` y `recordatorio_cita` (idioma
+`es_MX`) son plantillas de Meta únicas para todos los negocios, creadas **a mano** en
+Meta Business Manager (NeuroAPI no tiene API de plantillas). Su estado vive en
+`plantillas_whatsapp_globales` (`no_solicitada`, `pendiente_aprobacion`, `aprobada`,
+`rechazada`, `pausada`) y solo la plataforma lo gestiona:
+`GET /api/gerencia/plantillas-whatsapp`, `PATCH /{nombre}` y `POST /{nombre}/reintentar`
+(solo `gerencia_users`; cada cambio queda en `gerencia_auditoria`). El estado también
+cambia solo: por el evento `message_template_status_update` que NeuroAPI manda al
+webhook de canales (`APPROVED`, `REJECTED`/`DISABLED`, `PAUSED`, `PENDING`) o por un
+error de envío con código de Meta 132015 (`pausada`) o 132016 (`rechazada`).
+
+**Avisos al cliente por WhatsApp** (`services/avisos_cita.py`, reglas puras en
+`services/avisos_cita_reglas.py`). Salen siempre por la **cuenta global**: la línea del
+tenant `AVISOS_CUENTA_GLOBAL_TENANT_ID` (`services/cuenta_global_wa.py`, que reutiliza
+su `channel_credentials`; nunca se consulta el tenant de la reserva).
+- *Cancelación*: al cancelar una cita el owner, el superadmin o el proveedor (no el
+  agente ni una reagenda), tarea en segundo plano tras el `commit`; plantilla
+  `notificacion_cancelacion` con servicio y fecha `dd-mm-aaaa` en la zona del negocio.
+- *Recordatorio*: `jobs/recordatorios_cita_background.py`, cada 5 min
+  (`max_instances=1`, `coalesce=True`); avisa a las citas `confirmada` que entran en la
+  ventana de 5 h antes del inicio, con `recordatorio_cita` (negocio y fecha). Una cita
+  creada ya dentro de la ventana recibe el aviso en la siguiente pasada.
+- *Teléfono*: el de la reserva, normalizado a E.164 (10 dígitos = México `+52`, `00` =
+  `+`, E.164 válido tal cual; vacío = `sin_telefono`, otro = `telefono_invalido`). El
+  widget web queda `canal_no_soportado`; sin conversación se envía igual.
+- *Registro*: `avisos_cita`, única por `(reserva_id, tipo, hora_inicio)`; `en_curso` →
+  proveedor → `enviado`/`omitido`/`fallido` con motivo. Un `en_curso` de una ejecución
+  muerta pasa a `fallido resultado_desconocido`. `GET
+  /api/tenants/{tenant_id}/calendario/reservas/{reserva_id}/avisos` (owner y superadmin) los
+  lista. Una cancelación que no se pudo avisar genera la alerta personal
+  `aviso_cita_no_enviado` para cada owner y superadmin activo (no member).
+- *Contexto del agente*: un aviso `enviado` con conversación deja una fila en
+  `contexto_agente_eventos` (`cita_cancelada_por_negocio` / `recordatorio_cita_enviado`)
+  aunque el agente esté apagado.
+- **Regla fija: los avisos NUNCA usan texto libre**, solo plantilla aprobada
+  (`cuenta_global_wa.enviar_plantilla`). `enviar_texto_global` existe solo para la
+  respuesta fija de abajo.
+
+**Banderas** (`config.py`, todas apagadas o vacías por defecto):
+
+| Variable | Efecto |
+|---|---|
+| `AVISOS_CITA_WHATSAPP_ACTIVOS` | `false`: cada cita que entra en su ventana queda `omitido desactivado_por_configuracion` y **no** recibe un recordatorio tardío al encenderla. `validate()` avisa si está activa sin tenant. |
+| `AVISOS_CUENTA_GLOBAL_TENANT_ID` | Tenant de la línea (`a383f05c-7028-4d5f-8c5d-30232a80faf3`). |
+| `AVISOS_CUENTA_GLOBAL_RESPUESTA_ACTIVA` | Enciende la respuesta fija (siguiente apartado). |
+| `AVISOS_CITA_REVISION_MINUTOS`, `AVISOS_EJECUCION_VIVA_MINUTOS` | 5 y 5. |
+
+**Respuesta fija de la cuenta global** (`services/respuesta_cuenta_global.py`, gancho en
+`canales_neuroapi_webhook._reenviar_mensaje`, antes de `tenant_por_numero`). La línea es
+también el agente demo de su tenant, así que un cliente de otro negocio que responda a
+un aviso entraría a ese agente. Con la bandera encendida, el mensaje se **desvía** (no se
+reenvía a n8n, no crea evento de contexto) solo si: (1) el receptor es la línea global;
+(2) el remitente (`messages[].from`; se tratan igual `521…` y `52…` en México) tiene un
+aviso `enviado` en las últimas 24 h (`avisos_cita.telefono_destino`); (3) no es ya un
+`users` del tenant de la línea (`users.whatsapp_id`, solo lectura). Entonces recibe
+`Este mensaje es con fines informativos para mayor informacion comunicate al numero donde
+realizaste tu cita` (constante `TEXTO_RESPUESTA_CUENTA_GLOBAL`, ortografía literal) como
+máximo una vez cada 24 h (`cuenta_global_respuestas`, `puede_responder`). Si no se
+cumplen las tres, o falla cualquier consulta del gancho, el flujo es exactamente el de
+siempre. Si el envío de la respuesta falla, el mensaje igualmente no llega al agente y
+no se registra la respuesta (el siguiente mensaje reintenta).
+
+**Riesgos conocidos.** Unicidad de los avisos probada solo con fakes (no hay BD de
+pruebas); una cancelación entre la respuesta del cliente y el registro puede avisar de
+una cita ya cancelada; el correo espejo no tiene métrica ni límite diario; un número de
+10 dígitos se toma como de México; quien no respondió dentro de 24 h de un aviso y
+escribe a la línea cae en el agente del tenant (como hoy); la respuesta fija no se da a
+quien nunca recibió un aviso. Lo más limpio sería una línea dedicada sin agente.
+
+**Activación (en este orden).**
+1. Aplicar `sql/48` a `sql/51` (`python aplicar_sql.py --revisar`).
+2. Configurar `AVISOS_CUENTA_GLOBAL_TENANT_ID` con la línea del tenant activa.
+3. Crear y aprobar en Meta (`es_MX`) las dos plantillas; comprobar su estado en
+   `GET /api/gerencia/plantillas-whatsapp`.
+4. Con `AVISOS_CITA_WHATSAPP_ACTIVOS=false`, comprobar que una cita en ventana queda
+   `omitido desactivado_por_configuracion`; después encenderla.
+5. Probar cancelar una cita con teléfono válido y comprobar el correo espejo y el aviso a
+   gerencia (owner sí, member no).
+6. Con `AVISOS_CUENTA_GLOBAL_RESPUESTA_ACTIVA=true`, responder a un aviso desde el teléfono
+   de prueba: llega el texto fijo, no aparece conversación nueva en el tenant de la línea
+   y un segundo mensaje dentro de 24 h no recibe nada.
+
+**Pendientes del usuario.**
+- `[PENDIENTE usuario: webhook NeuroAPI cuenta global]` verificar en la práctica que los
+  mensajes entrantes llegan con `entry[].changes[]` (`messages[].from` y
+  `metadata.phone_number_id`) y si `POST /messaging/webhooks/api` reemplaza el destino
+  de las demás líneas (comparten API key). Mientras tanto
+  `AVISOS_CUENTA_GLOBAL_RESPUESTA_ACTIVA` queda apagada.
+- `[PENDIENTE usuario: ¿la línea del tenant a383... atiende también a clientes propios?]`
+- Publicar el cambio de lectura en n8n (lee `contexto_agente_eventos` por
+  `conversation_id`, tolerante a fallo) para que el agente vea los avisos.
+- Crear y aprobar las dos plantillas en Meta Business Manager.
+
+Tests: `test_correo_espejo.py`, `test_cuenta_global.py`, `test_avisos_cita_reglas.py`,
+`test_avisos_cita_servicio.py`, `test_avisos_cita_api.py`, `test_avisos_cita_jobs.py`,
+`test_plantillas_whatsapp*.py`, `test_avisos_sql.py`.
 
 ### Control de acceso por plan
 

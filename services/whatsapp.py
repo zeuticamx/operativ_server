@@ -49,9 +49,14 @@ class ResultadoEnvio:
 class ProveedorWhatsAppError(Exception):
     """Error al hablar con la API del proveedor (HTTP, credenciales, etc)."""
 
-    def __init__(self, mensaje: str, *, status_code: int | None = None):
+    def __init__(
+        self, mensaje: str, *, status_code: int | None = None, cuerpo: str | None = None
+    ):
         self.mensaje = mensaje
         self.status_code = status_code
+        # Cuerpo de la respuesta del proveedor (recortado). Spec 004: de ahí se
+        # lee el código de Meta de un error de plantilla; nunca se muestra al usuario.
+        self.cuerpo = cuerpo
         super().__init__(mensaje)
 
 
@@ -366,7 +371,9 @@ class NeuroApiProvider(ProveedorWhatsApp):
         if r.status_code >= 400:
             log.warning("NeuroAPI messaging/send -> %s: %s", r.status_code, r.text[:500])
             raise ProveedorWhatsAppError(
-                f"NeuroAPI respondió {r.status_code}", status_code=r.status_code
+                f"NeuroAPI respondió {r.status_code}",
+                status_code=r.status_code,
+                cuerpo=r.text[:2000],
             )
         try:
             return r.json()

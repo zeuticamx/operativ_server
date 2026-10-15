@@ -41,6 +41,7 @@ from routers import (
     onboarding,
     pagos,
     pagos_stripe,
+    plantillas_whatsapp,
     perfil,
     pipeline_config,
     reportes,
@@ -99,6 +100,7 @@ app.include_router(canales.router, prefix="/api")
 app.include_router(canales_neuroapi_webhook.router, prefix="/api")
 app.include_router(agente.router, prefix="/api")
 app.include_router(conversaciones.router, prefix="/api")
+app.include_router(conversaciones.router_contexto, prefix="/api")
 app.include_router(conversaciones_historial.router, prefix="/api")
 # Sin JWT: lo descargan NeuroAPI/Meta con un token aleatorio (routers/media.py).
 app.include_router(media.router, prefix="/api")
@@ -144,6 +146,7 @@ app.include_router(gerencia.router, prefix="/api")
 app.include_router(gerencia_operacion.router, prefix="/api")
 app.include_router(gerencia_planes.router, prefix="/api")
 app.include_router(gerencia_incidencias.router, prefix="/api")
+app.include_router(plantillas_whatsapp.router, prefix="/api")
 
 # Lo llama n8n con X-Internal-Token, no el frontend.
 app.include_router(eventos.router, prefix="/api")

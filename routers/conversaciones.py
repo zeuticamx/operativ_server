@@ -10,6 +10,7 @@ from deps import (
     ROLES_GERENCIA,
     UsuarioActual,
     gerencia_actual,
+    owner_sin_impersonar,
     permitir_a_roles_acotados,
     proveedor_actual,
     requiere_herramienta,
@@ -29,9 +30,13 @@ from schemas import (
     ConversacionOut,
     EnviarMensajeIn,
     MensajeOut,
+    LimpiarContextoOut,
     MetricasOut,
 )
+from config import settings
 from services import adjuntos
+from services import contexto_conversacion as contexto
+from services.acceso_plan import acceso_plan, exigir_herramienta
 from services import asignacion_conversaciones as asig
 from services import avisos_conversacion as avisos
 from services import conversaciones as svc
@@ -63,6 +68,12 @@ router = APIRouter(
         Depends(requiere_herramienta("agente", lectura_sin_plan=True)),
     ],
 )
+
+
+# Router propio, SIN dependencias a nivel de router (spec 003): las del router de
+# arriba (permitir_a_roles_acotados, requiere_herramienta) responderían 402 o
+# dejarían pasar roles antes de que `owner_sin_impersonar` dé su 403.
+router_contexto = APIRouter(prefix="/conversaciones", tags=["conversaciones"])
 
 
 async def _alcance(usuario: UsuarioActual) -> svc.Alcance | None:
@@ -193,6 +204,7 @@ async def metricas(tenant_id: UUID = Depends(tenant_actual)):
 @router.get("/{conversacion_id}", response_model=ConversacionDetalleOut)
 async def detalle(
     conversacion_id: UUID,
+    usuario: UsuarioActual = Depends(usuario_actual),
     tenant_id: UUID = Depends(tenant_actual),
     _: None = Depends(conversacion_visible),
 ):
@@ -206,8 +218,26 @@ async def detalle(
             detail="Conversación no encontrada",
         )
 
+    # Plan: `acceso_plan` (no `exigir_herramienta`, que lanza 402): el detalle
+    # nunca se corta por plan vencido (CL8), solo apaga el botón. Es la misma
+    # lectura que usa el 402 del POST, así que ambos coinciden.
+    es_owner_propio = (
+        usuario.role == "owner"
+        and usuario.impersonado_por is None
+        and usuario.impersonado_por_id is None
+    )
+    plan_incluye_agente = (await acceso_plan(tenant_id)).permite("agente") if es_owner_propio else False
+    corte = await contexto.ultimo_corte(tenant_id, conversacion_id)
+
     return ConversacionDetalleOut(
         **dict(cab),
+        contexto_limpiado_en=corte["creado_en"] if corte else None,
+        puede_limpiar_contexto=contexto.puede_limpiar_contexto(
+            es_owner_propio,
+            settings.CONTEXTO_CONVERSACION_N8N_PUBLICADO,
+            cab["channel_type"],
+            plan_incluye_agente,
+        ),
         mensajes=[MensajeOut(**dict(m)) for m in mensajes],
     )
 
@@ -341,6 +371,40 @@ async def volver_a_ia(
         usuario.id, usuario.email,
     )
     return ConversacionEstadoOut(**dict(fila))
+
+
+@router_contexto.post(
+    "/{conversacion_id}/limpiar-contexto", status_code=201, response_model=LimpiarContextoOut
+)
+async def limpiar_contexto(
+    conversacion_id: str,  # str a propósito: el 422 de formato se decide en el paso 5, no antes
+    usuario: UsuarioActual = Depends(owner_sin_impersonar),  # paso 1 (403), primera dependencia
+    tenant_id: UUID = Depends(tenant_actual),
+) -> LimpiarContextoOut:
+    """
+    Registra un corte de contexto: el agente solo usará los mensajes posteriores.
+    No borra ni cambia nada más. Orden: 403 (guarda), 404, 409 (flag), 402 (plan), 422 (id).
+    """
+    try:
+        id_conversacion: UUID | None = UUID(conversacion_id)
+    except ValueError:
+        id_conversacion = None
+    if id_conversacion is not None:
+        if await contexto.conversacion_de_cliente(tenant_id, id_conversacion) is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversación no encontrada")
+    if not settings.CONTEXTO_CONVERSACION_N8N_PUBLICADO:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Limpiar el contexto del agente todavía no está disponible.",
+        )
+    await exigir_herramienta(tenant_id, "agente")  # mismo 402 que volver-a-ia
+    if id_conversacion is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="conversacion_id no es un identificador válido",
+        )
+    corte = await contexto.registrar_corte(tenant_id, id_conversacion, usuario.id)
+    return LimpiarContextoOut(conversacion_id=id_conversacion, contexto_limpiado_en=corte["creado_en"])
 
 
 @router.put("/{conversacion_id}/asignacion", response_model=ConversacionEstadoOut)

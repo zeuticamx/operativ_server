@@ -286,8 +286,6 @@ async def conversacion_transferida(datos: ConversacionTransferidaIn):
         " ".join(detalle),
         {"conversation_id": str(datos.conversation_id), "canal": datos.canal},
     )
-    await broadcast_alerta(datos.tenant_id, *alerta)
-
     resultado = None
     try:
         resultado = await asignacion_conv.autoasignar(
@@ -295,6 +293,17 @@ async def conversacion_transferida(datos: ConversacionTransferidaIn):
         )
     except Exception:
         log.exception("Falló la asignación automática de la conversación %s", datos.conversation_id)
+
+    # Correo espejo (RF-4 e): si el asignado también recibe `conversacion_asignada`
+    # por este mismo hecho, ese es su único correo. La alerta en el panel sale igual.
+    # Por eso la asignación se resuelve antes de emitir (el aviso sigue saliendo
+    # aunque la asignación falle: arriba va en try/except).
+    sin_correo_transferida = (
+        (resultado.portal_user_id,)
+        if resultado is not None and not (resultado.cayo_en_owner and resultado.fallo)
+        else ()
+    )
+    await broadcast_alerta(datos.tenant_id, *alerta, excluir_correo_a=sin_correo_transferida)
 
     if resultado is None:
         # Sin asignar (ya tenía dueño, o falló): el aviso de siempre al

@@ -25,6 +25,8 @@ from jobs.gerencia_background import JOB_ID as JOB_ID_CONSUMO
 from jobs.gerencia_background import job_consumo_anomalo
 from jobs.perfil_background import JOB_ID as JOB_ID_PERFIL
 from jobs.perfil_background import job_recordatorio_perfil
+from jobs.recordatorios_cita_background import JOB_ID as JOB_ID_RECORDATORIOS_CITA
+from jobs.recordatorios_cita_background import job_recordatorios_cita
 from jobs.reservas_background import JOB_ID as JOB_ID_RESERVAS
 from jobs.reservas_background import job_reservas_vencidas
 from jobs.tareas_background import JOB_ID as JOB_ID_TAREAS
@@ -260,6 +262,17 @@ def iniciar_scheduler() -> AsyncIOScheduler:
         minutes=settings.RESERVAS_VENCIDAS_INTERVALO_MINUTOS,
         id=JOB_ID_RESERVAS,
         name="Dar por no asistidas las citas vencidas",
+        max_instances=1,
+        coalesce=True,
+    )
+    # Recordatorio de cita por WhatsApp 5 h antes (jobs/recordatorios_cita_background.py).
+    # La no duplicación la garantiza la unicidad en BD, no este scheduler.
+    scheduler.add_job(
+        job_recordatorios_cita,
+        "interval",
+        minutes=settings.AVISOS_CITA_REVISION_MINUTOS,
+        id=JOB_ID_RECORDATORIOS_CITA,
+        name="Recordatorio de cita por WhatsApp",
         max_instances=1,
         coalesce=True,
     )

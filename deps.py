@@ -345,6 +345,28 @@ async def gerencia_actual(
     return usuario
 
 
+async def owner_sin_impersonar(
+    usuario: UsuarioActual = Depends(usuario_actual),
+) -> UsuarioActual:
+    """
+    Solo el dueño con sesión propia. No acepta superadmin ni member, y rechaza
+    toda sesión de "ver como" aunque tenga concesión de escritura: es una
+    acción destructiva que debe hacer el dueño en persona. No declara
+    parámetros de ruta, así el 403 no depende del identificador del recurso.
+    """
+    if usuario.role != "owner":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo el dueño del negocio puede hacer esto",
+        )
+    if usuario.impersonado_por is not None or usuario.impersonado_por_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Esta acción no se puede hacer desde una sesión de «ver como»",
+        )
+    return usuario
+
+
 async def negocio_actual(
     usuario: UsuarioActual = Depends(usuario_actual),
 ) -> UsuarioActual:

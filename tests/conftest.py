@@ -160,3 +160,48 @@ async def precios_stripe(db):
             f["nombre"],
             f["stripe_price_id"],
         )
+
+
+@pytest.fixture(autouse=True)
+def sin_correo_real(monkeypatch):
+    """
+    Ningún test manda correo real. `backend/.env` trae SMTP y, desde la spec
+    004, cada alerta lanza un correo espejo a las cuentas de la BD: sin esto,
+    los tests que crean alertas escribirían a personas reales.
+
+    Doble defensa: se blanquea el SMTP de `config.settings` (sin host,
+    `enviar_correo` solo escribe en el log) y se sustituye
+    `services.correo._enviar_sync`, el único punto que abre la conexión, por
+    un doble que no envía nada. Devuelve la lista de mensajes que habrían
+    salido (solo se llena si un test fuerza un SMTP "configurado").
+    """
+    from config import settings
+    from services import correo
+
+    monkeypatch.setattr(settings, "SMTP_HOST", "")
+    monkeypatch.setattr(settings, "SMTP_USER", "")
+    monkeypatch.setattr(settings, "SMTP_PASSWORD", "")
+
+    bloqueados: list = []
+    monkeypatch.setattr(correo, "_enviar_sync", bloqueados.append)
+    return bloqueados
+
+
+@pytest.fixture(autouse=True)
+def sin_push_ni_tareas_colgadas(monkeypatch):
+    """
+    `PUSH_ACTIVO` es `true` por defecto: un test que cancela una reserva con
+    `broadcast_alerta` real dejaba una tarea de push en el set global
+    `services.push._tareas`, y el siguiente test (test_push) lo veía sucio.
+    Por defecto ningún test programa push; los que lo prueban fijan su propio
+    valor con monkeypatch. También se vacía el set de `correo_espejo` (tareas
+    que pudieron quedar de un test con otro loop).
+    """
+    from services import correo_espejo, push
+
+    monkeypatch.setattr(push.settings, "PUSH_ACTIVO", False)
+    push._tareas.clear()
+    correo_espejo._tareas.clear()
+    yield
+    push._tareas.clear()
+    correo_espejo._tareas.clear()

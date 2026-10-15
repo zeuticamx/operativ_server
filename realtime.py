@@ -41,9 +41,10 @@ import jwt
 import socketio
 
 from config import settings
-from deps import ROLES_NEGOCIO
+from deps import ROLES_GERENCIA, ROLES_NEGOCIO
 from routers.alertas import crear_alerta
 from security import decodificar_token
+from services.correo_espejo import programar_espejo
 from services.push import programar_push_alerta
 from session import execute, fetch_all, fetch_one
 
@@ -333,6 +334,7 @@ async def broadcast_alerta(
     mensaje: str,
     datos: Optional[dict] = None,
     portal_user_id: Optional[UUID] = None,
+    excluir_correo_a: Iterable[UUID] = (),
 ) -> None:
     """
     Punto de entrada para el resto del backend: crea la alerta en BD y la
@@ -345,6 +347,11 @@ async def broadcast_alerta(
     Además sale como push a la app móvil (services/push.py), a los mismos
     destinatarios que la room: así llega también con la app cerrada. El
     push va en segundo plano y no demora a quien llama.
+
+    Y sale como correo espejo (services/correo_espejo.py) a las cuentas
+    activas de esa audiencia, calculadas en BD por rol. También en segundo
+    plano y sin lanzar. `excluir_correo_a` quita cuentas del correo (no de la
+    alerta) cuando otra alerta del mismo hecho ya les llega por correo.
     """
     alerta = await crear_alerta(tenant_id, tipo, titulo, mensaje, datos, portal_user_id)
     programar_push_alerta(
@@ -355,6 +362,14 @@ async def broadcast_alerta(
         alerta.titulo,
         alerta.mensaje,
         alerta.datos,
+    )
+    programar_espejo(
+        tenant_id,
+        getattr(alerta.tipo, "value", alerta.tipo),
+        alerta.titulo,
+        alerta.mensaje,
+        portal_user_id,
+        excluir_correo_a,
     )
     await sio.emit(
         "nueva_alerta",
@@ -371,6 +386,48 @@ async def broadcast_alerta(
         },
         room=_sala_usuario(portal_user_id) if portal_user_id else _sala(tenant_id),
     )
+
+
+async def avisar_gerencia(
+    tenant_id: UUID,
+    tipo: str,
+    titulo: str,
+    mensaje: str,
+    datos: Optional[dict] = None,
+) -> None:
+    """
+    Aviso a gerencia: una alerta PERSONAL por cada cuenta activa owner o
+    superadmin del negocio, calculada en BD al emitir (como _emails_gerencia).
+    Una alerta sin portal_user_id la vería también `member` por la room del
+    negocio; la personal solo llega a `usuario_{id}` y a su correo espejo.
+
+    Nunca lanza: si falla la consulta o una alerta, solo se registra, para no
+    romper a quien avisa (services/avisos_cita.py).
+    """
+    try:
+        cuentas = await fetch_all(
+            """
+            SELECT id FROM portal_users
+            WHERE tenant_id = $1 AND role = ANY($2::text[]) AND is_active = true
+            """,
+            tenant_id,
+            list(ROLES_GERENCIA),
+        )
+    except Exception:
+        logger.exception("No se pudo leer la gerencia del negocio %s para el aviso %s", tenant_id, tipo)
+        return
+    for cuenta in cuentas:
+        try:
+            await broadcast_alerta(
+                tenant_id, tipo, titulo, mensaje, datos, portal_user_id=cuenta["id"]
+            )
+        except Exception:
+            logger.exception(
+                "No se pudo emitir el aviso %s a la cuenta %s (tenant=%s)",
+                tipo,
+                cuenta["id"],
+                tenant_id,
+            )
 
 
 async def _salas_de_conversacion(
