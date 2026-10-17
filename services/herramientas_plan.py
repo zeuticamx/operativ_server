@@ -160,7 +160,7 @@ async def catalogo(
     )
     filas = await conn.fetch(
         """
-        SELECT tool_key, tool_type, display_name, description
+        SELECT tool_key, tool_type, display_name, description, parametros_schema
         FROM tenant_tools
         WHERE tenant_id = $1 AND is_enabled = true
         ORDER BY display_name, tool_key
@@ -176,6 +176,8 @@ async def catalogo(
                 "tool_type": f["tool_type"],
                 "display_name": f["display_name"],
                 "description": f["description"],
+                # El prompt del agente necesita los parámetros de cada herramienta.
+                "parametros_schema": f["parametros_schema"] or {},
                 "familia": familia,
                 "activa": f["tool_key"] in activas,
                 "permitida_por_plan": familia is not None and permite_activar(familia, permitidas),

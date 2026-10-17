@@ -155,7 +155,7 @@ async def catalogo_herramientas(
     catalogo = "\n\n".join(
         f'- tool_key: "{f["tool_key"]}"\n'
         f'  Cuándo usarla: {f["description"]}\n'
-        f'  Parámetros: {f["parametros_schema"] or {}}'
+        f'  Parámetros: {f.get("parametros_schema") or {}}'
         for f in activas_permitidas
     )
     return catalogo, activas_permitidas
