@@ -284,6 +284,9 @@ class _Mundo:
         self.escrituras: list[tuple[str, tuple[Any, ...]]] = []
         self.reenvios: list[Any] = []
         self.consultas: list[str] = []
+        # Spec 005a: la línea también vale marcada en agentes_canal, sin
+        # credencial que coincida.
+        self.linea_por_marca = False
 
     def instalar(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mundo = self
@@ -291,7 +294,13 @@ class _Mundo:
         async def _fetch_one(sql: str, *args: Any) -> dict[str, Any] | None:
             mundo.consultas.append(sql)
             if "FROM channel_credentials" in sql:
+                if mundo.linea_por_marca:
+                    return None
                 return {"ok": 1} if args[1] == mundo.linea_global else None
+            if "FROM agentes_canal" in sql:
+                if mundo.linea_por_marca and args[1] == mundo.linea_global:
+                    return {"ok": 1}
+                return None
             if "FROM avisos_cita" in sql:
                 for v in args[0]:
                     if v in mundo.avisos:
@@ -371,6 +380,14 @@ async def test_respuesta_a_aviso_no_se_reenvia_y_recibe_texto_fijo(mundo):
     assert "cuenta_global_respuestas" in sql and args == (TELEFONO_AVISO,)
     # Nunca crea evento de contexto.
     assert all("contexto_agente_eventos" not in s for s, _ in mundo.escrituras)
+
+
+async def test_linea_marcada_en_numeros_tambien_desvia(mundo):
+    """Spec 005a RF-16: la marca es_linea_avisos vale sin credencial que coincida."""
+    mundo.linea_por_marca = True
+    await _recibir(_evento())
+    assert mundo.reenvios == []
+    assert mundo.envios == [(TELEFONO_AVISO, rcg.TEXTO_RESPUESTA_CUENTA_GLOBAL)]
 
 
 async def test_segundo_mensaje_dentro_de_24h_no_recibe_nada_ni_se_reenvia(mundo):

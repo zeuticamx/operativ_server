@@ -330,3 +330,180 @@ async def test_un_id_que_no_es_un_price_se_rechaza(http_client, gerente, nombre_
     """Pegar el Product (prod_...) en vez del Price es el error típico."""
     r = await _crear(http_client, gerente["headers"], nombre=nombre_plan, stripe_price_id=invalido)
     assert r.status_code == 422
+
+
+# ------------------------------------------------------------
+# 7. Cupo de números - spec 005a T4 (RF-1)
+# ------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_cupo_nulo_no_toca_cero_quita_y_entero_fija(http_client, gerente, nombre_plan):
+    await _crear(
+        http_client, gerente["headers"], nombre=nombre_plan, max_numeros_whatsapp=2
+    )
+    url = f"/api/gerencia/planes/{nombre_plan}"
+
+    r = await http_client.patch(url, json={"orden": 1}, headers=gerente["headers"])
+    assert r.json()["max_numeros_whatsapp"] == 2
+
+    r = await http_client.patch(url, json={"max_numeros_whatsapp": 0}, headers=gerente["headers"])
+    assert r.status_code == 200
+    assert r.json()["max_numeros_whatsapp"] is None
+
+    r = await http_client.patch(url, json={"max_numeros_whatsapp": 3}, headers=gerente["headers"])
+    assert r.json()["max_numeros_whatsapp"] == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalido", [-1, 1.5, True])
+async def test_cupo_invalido_da_400_sin_cambiar_el_plan(
+    http_client, gerente, nombre_plan, invalido
+):
+    await _crear(
+        http_client, gerente["headers"], nombre=nombre_plan, max_numeros_whatsapp=2
+    )
+    url = f"/api/gerencia/planes/{nombre_plan}"
+
+    r = await http_client.patch(url, json={"max_numeros_whatsapp": invalido}, headers=gerente["headers"])
+    assert r.status_code == 400
+    assert r.json()["detail"]["codigo"] == "cupo_no_valido"
+
+    fila = await fetch_one("SELECT max_numeros_whatsapp FROM planes WHERE nombre = $1", nombre_plan)
+    assert fila["max_numeros_whatsapp"] == 2
+
+
+@pytest.mark.asyncio
+async def test_cualquier_cargo_de_gerencia_puede_editar_el_cupo(
+    http_client, db, nombre_plan, gerente
+):
+    """D40: el cargo no influye en quién edita los planes."""
+    from uuid import uuid4 as _uuid4
+
+    await _crear(http_client, gerente["headers"], nombre=nombre_plan, max_numeros_whatsapp=1)
+
+    tid, uid = _uuid4(), _uuid4()
+    email = f"gerente-ventas-{uid}@ejemplo.com"
+    await execute("INSERT INTO tenants (id, name) VALUES ($1, 'Interno')", tid)
+    await execute(
+        """
+        INSERT INTO portal_users (id, tenant_id, email, password_hash, role, is_active)
+        VALUES ($1, $2, $3, $4, 'owner', true)
+        """,
+        uid,
+        tid,
+        email,
+        hash_password("x" * 12),
+    )
+    await execute(
+        "INSERT INTO gerencia_users (email, full_name, cargo) VALUES ($1, 'Test', 'ventas')",
+        email,
+    )
+    headers = {"Authorization": f"Bearer {crear_access_token(uid, tid, 'owner')}"}
+    try:
+        r = await http_client.patch(
+            f"/api/gerencia/planes/{nombre_plan}",
+            json={"max_numeros_whatsapp": 4},
+            headers=headers,
+        )
+        assert r.status_code == 200
+        assert r.json()["max_numeros_whatsapp"] == 4
+    finally:
+        await execute("DELETE FROM gerencia_users WHERE LOWER(email) = LOWER($1)", email)
+        await execute("DELETE FROM tenants WHERE id = $1", tid)
+
+
+@pytest.mark.asyncio
+async def test_la_gerencia_del_negocio_no_edita_el_cupo(
+    http_client, nombre_plan, tenant_y_usuario, headers_autenticado
+):
+    r = await http_client.patch(
+        f"/api/gerencia/planes/{nombre_plan}",
+        json={"max_numeros_whatsapp": 2},
+        headers=headers_autenticado,
+    )
+    assert r.status_code == 403
+
+
+# ------------------------------------------------------------
+# 8. Lista de herramientas por plan - spec 005a T4 (RF-9)
+# ------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_lista_nula_no_toca_vacia_es_ninguna_y_flags_derivados(
+    http_client, gerente, nombre_plan
+):
+    await _crear(http_client, gerente["headers"], nombre=nombre_plan)
+    url = f"/api/gerencia/planes/{nombre_plan}"
+
+    r = await http_client.patch(url, json={"orden": 9}, headers=gerente["headers"])
+    completa = set(r.json()["herramientas_plan"])
+    assert completa == {"calendario", "sql_lectura", "http", "google_sheets", "google_docs"}
+
+    r = await http_client.patch(
+        url, json={"herramientas_plan": ["calendario"]}, headers=gerente["headers"]
+    )
+    assert r.json()["herramientas_plan"] == ["calendario"]
+    assert r.json()["calendario_activo"] is True
+    assert r.json()["herramientas_activo"] is False
+
+    r = await http_client.patch(url, json={"herramientas_plan": []}, headers=gerente["headers"])
+    assert r.json()["herramientas_plan"] == []
+    assert r.json()["calendario_activo"] is False
+    assert r.json()["herramientas_activo"] is False
+
+
+@pytest.mark.asyncio
+async def test_catalogo_de_familias_para_el_panel(http_client, gerente, headers_autenticado):
+    r = await http_client.get("/api/gerencia/planes/familias-herramientas", headers=gerente["headers"])
+    assert r.status_code == 200
+    assert r.json() == {
+        "familias": ["calendario", "sql_lectura", "http", "google_sheets", "google_docs"]
+    }
+
+    r = await http_client.get(
+        "/api/gerencia/planes/familias-herramientas", headers=headers_autenticado
+    )
+    assert r.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_cambios_de_cupo_precio_y_herramientas_quedan_auditados(
+    http_client, gerente, nombre_plan
+):
+    await _crear(
+        http_client,
+        gerente["headers"],
+        nombre=nombre_plan,
+        precio_monthly="100.00",
+        max_numeros_whatsapp=2,
+    )
+    url = f"/api/gerencia/planes/{nombre_plan}"
+
+    await http_client.patch(
+        url,
+        json={"max_numeros_whatsapp": 5, "precio_monthly": "120.00", "herramientas_plan": ["http"]},
+        headers=gerente["headers"],
+    )
+
+    cupo = await fetch_one(
+        "SELECT detalle FROM gerencia_auditoria WHERE accion = 'cupo_cambiado' "
+        "AND actor_email = $1 ORDER BY created_at DESC LIMIT 1",
+        gerente["email"],
+    )
+    assert cupo["detalle"]["nombre"] == nombre_plan
+    assert cupo["detalle"]["anterior"] == 2
+    assert cupo["detalle"]["nuevo"] == 5
+
+    precio = await fetch_one(
+        "SELECT detalle FROM gerencia_auditoria WHERE accion = 'precio_del_plan_cambiado' "
+        "AND actor_email = $1 ORDER BY created_at DESC LIMIT 1",
+        gerente["email"],
+    )
+    assert precio["detalle"]["anterior"] == "100.00"
+    assert precio["detalle"]["nuevo"] == "120.00"
+
+    herramientas = await fetch_one(
+        "SELECT detalle FROM gerencia_auditoria WHERE accion = 'herramientas_del_plan_cambiadas' "
+        "AND actor_email = $1 ORDER BY created_at DESC LIMIT 1",
+        gerente["email"],
+    )
+    assert herramientas["detalle"]["nombre"] == nombre_plan
+    assert herramientas["detalle"]["nuevas"] == ["http"]

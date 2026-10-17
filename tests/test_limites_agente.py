@@ -205,11 +205,34 @@ async def test_plan_sin_topes_deja_elegir_cualquier_modelo(
 
 
 @pytest.mark.asyncio
-async def test_el_piloto_no_tiene_topes(
+async def test_el_piloto_con_plan_usa_los_topes_del_plan(
     http_client, tenant_y_usuario, headers_autenticado, plan_limitado
 ):
+    """Spec 005a D14: la prueba vigente con plan asociado usa sus límites."""
     tid = tenant_y_usuario["tenant_id"]
     await _suscribir(tid, plan_limitado)
+    await execute(
+        """
+        INSERT INTO tenant_estado_plataforma (tenant_id, estado) VALUES ($1, 'prueba')
+        ON CONFLICT (tenant_id) DO UPDATE SET estado = 'prueba'
+        """,
+        tid,
+    )
+
+    r = await http_client.put(
+        "/api/agente", json=_cuerpo(model=OPUS, history_window=150), headers=headers_autenticado
+    )
+
+    assert r.status_code == 402
+    assert r.json()["detail"]["codigo"] == "modelo_no_incluido_en_plan"
+
+
+@pytest.mark.asyncio
+async def test_el_piloto_sin_plan_no_tiene_topes(
+    http_client, tenant_y_usuario, headers_autenticado
+):
+    """Sin plan asociado, la prueba vigente sigue sin límites (D14)."""
+    tid = tenant_y_usuario["tenant_id"]
     await execute(
         """
         INSERT INTO tenant_estado_plataforma (tenant_id, estado) VALUES ($1, 'prueba')
@@ -263,7 +286,8 @@ async def test_recortar_nunca_sube_un_valor(tenant_y_usuario, plan_limitado):
 
 
 @pytest.mark.asyncio
-async def test_el_piloto_no_se_recorta(tenant_y_usuario, plan_limitado):
+async def test_el_piloto_con_plan_se_recorta(tenant_y_usuario, plan_limitado):
+    """Spec 005a D14: el recorte aplica a la prueba con plan asociado."""
     tid = tenant_y_usuario["tenant_id"]
     await execute(
         """
@@ -275,6 +299,22 @@ async def test_el_piloto_no_se_recorta(tenant_y_usuario, plan_limitado):
     await _config(tid, model=OPUS, history_window=150)
 
     await _suscribir(tid, plan_limitado)
+
+    fila = await _leer(tid)
+    assert (fila["model"], fila["history_window"]) == (HAIKU, 60)
+
+
+@pytest.mark.asyncio
+async def test_el_piloto_sin_plan_no_se_recorta(tenant_y_usuario):
+    tid = tenant_y_usuario["tenant_id"]
+    await execute(
+        """
+        INSERT INTO tenant_estado_plataforma (tenant_id, estado) VALUES ($1, 'prueba')
+        ON CONFLICT (tenant_id) DO UPDATE SET estado = 'prueba'
+        """,
+        tid,
+    )
+    await _config(tid, model=OPUS, history_window=150)
 
     fila = await _leer(tid)
     assert (fila["model"], fila["history_window"]) == (OPUS, 150)

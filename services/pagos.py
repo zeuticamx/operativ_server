@@ -30,6 +30,7 @@ from fastapi import HTTPException, status
 
 from config import settings
 from schemas import CrearPagoIn
+from services import numeros_reevaluacion
 from services.creditos import cargar_creditos_plan
 from session import execute, fetch_one, transaccion
 
@@ -167,7 +168,7 @@ async def activar_suscripcion(
     """
     if conn is None:
         async with transaccion() as nueva:
-            return await activar_suscripcion(
+            activada = await activar_suscripcion(
                 tenant_id,
                 plan,
                 fecha_renovacion=fecha_renovacion,
@@ -176,6 +177,12 @@ async def activar_suscripcion(
                 referencia=referencia,
                 conn=nueva,
             )
+        if activada:
+            # Spec 005a, RF-11 casos 1 y 6: un plan con otro cupo (o una prueba que
+            # pasa a pago) se reevalúa en la misma petición, ya confirmado. Si llamas
+            # con `conn`, quien llama debe hacerlo tras confirmar su transacción.
+            await numeros_reevaluacion.reevaluar_tras_cambio(tenant_id)
+        return activada
 
     plan_fila = await conn.fetchrow(
         """

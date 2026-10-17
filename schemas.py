@@ -3,7 +3,7 @@
 import re
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
@@ -306,6 +306,133 @@ class IniciarNeuroApiConnectOut(BaseModel):
     connect_url: str
 
 
+class EstadoNeuroApiConnectOut(BaseModel):
+    """GET /api/canales/whatsapp/neuroapi/estado — resultado del alta por NeuroAPI."""
+
+    session_id: str
+    estado: str
+    # Resultado de la vinculación: vinculado | propio | ajeno | rechazado.
+    resultado: str | None = None
+    # Código RF-2 cuando no se vinculó (p. ej. numero_no_encontrado).
+    codigo: str | None = None
+    phone_number_id: str | None = None
+
+
+# ============================================================
+# VARIOS NÚMEROS DE WHATSAPP (spec 005a, T5)
+# ============================================================
+class NumeroWhatsAppOut(BaseModel):
+    """Un número vinculado (activo o pausado) con su configuración de agente."""
+
+    id: UUID
+    phone_number_id: str
+    telefono_visible: str | None = None
+    bsp_provider: str = "neuroapi"
+    estado: str
+    es_principal: bool = False
+    es_linea_avisos: bool = False
+    vinculado_en: datetime | None = None
+    pausado_en: datetime | None = None
+    motivo_pausa: str | None = None
+    agent_name: str = ""
+    system_prompt: str = ""
+    model: str | None = None
+    temperature: float = 0.7
+    history_window: int = 30
+    agente_activo: bool = True
+    configuracion_incompleta: bool = False
+    herramientas: list[str] = Field(default_factory=list)
+
+
+class ListaNumerosOut(BaseModel):
+    numeros: list[NumeroWhatsAppOut] = Field(default_factory=list)
+    # Cupo del plan (None = sin tope) y plazas usadas (P17).
+    tope: int | None = None
+    plazas_usadas: int = 0
+    plazas_libres: int | None = None
+
+
+class VincularNumeroIn(BaseModel):
+    phone_number_id: str = Field(min_length=1, max_length=100)
+    telefono_visible: str | None = Field(default=None, max_length=40)
+
+
+class ElegirPrincipalIn(BaseModel):
+    numero_id: UUID
+
+
+class PausarNumeroOut(BaseModel):
+    numero: NumeroWhatsAppOut
+    # La pausa dejó al negocio sin números activos (la confirmación advierte
+    # que no responderá por WhatsApp, D5; la línea de avisos no cuenta).
+    sin_numero_activo: bool = False
+
+
+class NumeroAgenteOut(BaseModel):
+    """Configuración de agente de un número + límites del plan y herramientas."""
+
+    id: UUID
+    phone_number_id: str
+    estado: str
+    es_principal: bool = False
+    es_linea_avisos: bool = False
+    agent_name: str = ""
+    system_prompt: str = ""
+    model: str | None = None
+    temperature: float = 0.7
+    history_window: int = 30
+    agente_activo: bool = True
+    configuracion_incompleta: bool = False
+    limites_plan: LimitesAgenteOut | None = None
+    herramientas: list[str] = Field(default_factory=list)
+
+
+class NumeroAgenteIn(BaseModel):
+    """Edición parcial (RF-5). Solo los campos presentes se tocan.
+
+    La temperatura se declara sin rango a propósito: fuera de [0, 1] el
+    servicio responde 400 `temperatura_fuera_de_rango`, no el 422 de Pydantic.
+    """
+
+    agent_name: str | None = Field(default=None, max_length=100)
+    system_prompt: str | None = Field(default=None, max_length=20000)
+    model: str | None = None
+    temperature: Any = None
+    history_window: int | None = None
+    agente_activo: bool | None = None
+
+
+class HerramientaNumeroOut(BaseModel):
+    tool_key: str
+    tool_type: str | None = None
+    display_name: str | None = None
+    description: str | None = None
+    familia: str | None = None
+    activa: bool = False
+    permitida_por_plan: bool = False
+
+
+class HerramientasNumeroIn(BaseModel):
+    """Activación por número (RF-6): todo o nada."""
+
+    activar: list[str] = Field(default_factory=list)
+    desactivar: list[str] = Field(default_factory=list)
+
+
+class ConversacionOcultaOut(BaseModel):
+    id: UUID
+    channel_type: str
+    status: str
+    started_at: datetime | None = None
+    last_message_at: datetime | None = None
+    asignado_a: UUID | None = None
+    agente_canal_id: UUID | None = None
+    desvinculado_en: datetime | None = None
+    telefono_visible: str | None = None
+    phone_number_id: str | None = None
+    usuario_nombre: str | None = None
+
+
 # ============================================================
 # HERRAMIENTAS
 # ============================================================
@@ -445,6 +572,12 @@ class MensajeOut(BaseModel):
     # correo de quien la mandó. None para 'user'/'assistant'.
     enviado_por: str | None = None
     adjuntos: list[AdjuntoOut] = Field(default_factory=list)
+
+
+class ConversacionOcultaDetalleOut(ConversacionOcultaOut):
+    """Detalle de una oculta: la cabecera y sus mensajes (solo lectura)."""
+
+    mensajes: list[MensajeOut] = Field(default_factory=list)
 
 
 class EnviarMensajeIn(BaseModel):
@@ -1178,6 +1311,10 @@ class TipoAlerta(str, Enum):
     conversacion_devuelta_ia = "conversacion_devuelta_ia"
     lead_asignado = "lead_asignado"
     aviso_cita_no_enviado = "aviso_cita_no_enviado"
+    # Spec 005a (RF-20): avisos de varios números de WhatsApp (sql/60).
+    numeros_pausados = "numeros_pausados"
+    numeros_recortados = "numeros_recortados"
+    numero_configuracion_incompleta = "numero_configuracion_incompleta"
 
 class AlertaOut(BaseModel):
     id: UUID
@@ -1946,6 +2083,12 @@ class PlanGerenciaOut(BaseModel):
     # Límites del agente (45_limites_agente_plan.sql). None = sin límite.
     modelos_permitidos: list[str] | None
     historial_maximo: int | None
+    # Cupo de números de WhatsApp (57_planes_cupo_herramientas.sql, spec 005a
+    # RF-1). None = sin tope. En el panel, 0 lo quita.
+    max_numeros_whatsapp: int | None = None
+    # Lista de herramientas del agente por familia (plan_herramientas, RF-9).
+    # Vacía = ninguna.
+    herramientas_plan: list[str] = Field(default_factory=list)
     creado_en: datetime
     actualizado_en: datetime
 
@@ -1960,6 +2103,19 @@ def _validar_modelos_plan(v: list[str] | None) -> list[str] | None:
             f"Modelo desconocido: {', '.join(desconocidos)}. Opciones: {', '.join(MODELOS_AGENTE)}"
         )
     return ordenar_modelos(v)
+
+
+_FAMILIAS_PLAN = ("calendario", "sql_lectura", "http", "google_sheets", "google_docs")
+
+
+def _validar_familias_plan(v: list[str] | None) -> list[str] | None:
+    """Solo familias del catálogo base (P5); se guarda sin repetidos y ordenada."""
+    if v is None:
+        return None
+    desconocidas = [f for f in v if f not in _FAMILIAS_PLAN]
+    if desconocidas:
+        raise ValueError(f"Familia desconocida: {', '.join(desconocidas)}. Opciones: {', '.join(_FAMILIAS_PLAN)}")
+    return sorted(set(v))
 
 
 class PlanCrearIn(BaseModel):
@@ -1994,6 +2150,13 @@ class PlanCrearIn(BaseModel):
     # catálogo) es el que se usa por defecto al recortar.
     modelos_permitidos: list[str] | None = None
     historial_maximo: int | None = Field(default=None, ge=HISTORIAL_MIN, le=HISTORIAL_MAX)
+    # Cupo de números de WhatsApp (spec 005a RF-1). None = sin tope. Se declara
+    # Any para no recibir el 422 automático de Pydantic con un no entero:
+    # el router lo valida y responde 400 `cupo_no_valido`.
+    max_numeros_whatsapp: Any = None
+    # Lista de herramientas del agente por familia (RF-9). None = se siembra
+    # desde los flags; [] = ninguna.
+    herramientas_plan: list[str] | None = None
 
     @field_validator("modelos_permitidos")
     @classmethod
@@ -2002,6 +2165,11 @@ class PlanCrearIn(BaseModel):
         if v is not None and not v:
             raise ValueError("Elige al menos un modelo, o déjalo en null para no limitar")
         return v
+
+    @field_validator("herramientas_plan")
+    @classmethod
+    def _herramientas(cls, v):
+        return _validar_familias_plan(v)
 
 
 class PlanActualizarIn(BaseModel):
@@ -2040,11 +2208,21 @@ class PlanActualizarIn(BaseModel):
     # Límites del agente. null = no tocar; [] / 0 = quitar el límite.
     modelos_permitidos: list[str] | None = None
     historial_maximo: int | None = Field(default=None, ge=0, le=HISTORIAL_MAX)
+    # Cupo de números (RF-1). null = no tocar; 0 = quitar el tope. Se declara
+    # Any para validar a mano con 400 y no con el 422 de Pydantic.
+    max_numeros_whatsapp: Any = None
+    # Lista de herramientas por familia (RF-9). null = no tocar; [] = ninguna.
+    herramientas_plan: list[str] | None = None
 
     @field_validator("modelos_permitidos")
     @classmethod
     def _modelos(cls, v):
         return _validar_modelos_plan(v)
+
+    @field_validator("herramientas_plan")
+    @classmethod
+    def _herramientas(cls, v):
+        return _validar_familias_plan(v)
 
     @field_validator("historial_maximo")
     @classmethod

@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Respon
 from deps import (
     ROL_PROVEEDOR,
     ROL_VENDEDOR,
+    ROLES_ACOTADOS_CONVERSACIONES,
     ROLES_GERENCIA,
     UsuarioActual,
     gerencia_actual,
@@ -19,7 +20,7 @@ from deps import (
     vendedor_actual,
 )
 from realtime import avisar_a_usuario, emit_conversacion_estado, emit_mensaje
-from session import execute, fetch_one
+from session import conexion, execute, fetch_one
 from schemas import (
     AdjuntoOut,
     AsignableOut,
@@ -27,6 +28,8 @@ from schemas import (
     ContactoOut,
     ConversacionDetalleOut,
     ConversacionEstadoOut,
+    ConversacionOcultaDetalleOut,
+    ConversacionOcultaOut,
     ConversacionOut,
     EnviarMensajeIn,
     MensajeOut,
@@ -36,6 +39,7 @@ from schemas import (
 from config import settings
 from services import adjuntos
 from services import contexto_conversacion as contexto
+from services import conversaciones_ocultas as ocultas
 from services.acceso_plan import acceso_plan, exigir_herramienta
 from services import asignacion_conversaciones as asig
 from services import avisos_conversacion as avisos
@@ -165,10 +169,18 @@ async def listar(
     estado: str | None = Query(None),
     buscar: str | None = Query(None, max_length=100),
     asignada: str | None = Query(None, max_length=36),
+    numero_id: UUID | None = Query(None),
     limite: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     usuario: UsuarioActual = Depends(usuario_actual),
 ):
+    # Spec 005a RF-18: la vista por número es de la gerencia y member; el
+    # vendedor y el proveedor conservan sus asignadas en la lista normal.
+    if numero_id is not None and usuario.role in ROLES_ACOTADOS_CONVERSACIONES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Esta vista no está disponible para tu rol",
+        )
     filas = await svc.listar(
         tenant_id,
         canal,
@@ -179,6 +191,7 @@ async def listar(
         alcance=await _alcance(usuario),
         asignada=_filtro_asignada(asignada),
         yo=usuario.id,
+        numero_id=numero_id,
     )
     return [ConversacionOut(**dict(f)) for f in filas]
 
@@ -198,6 +211,38 @@ async def metricas(tenant_id: UUID = Depends(tenant_actual)):
     return MetricasOut(
         **dict(fila),
         por_canal={c["channel_type"]: c["n"] for c in canales},
+    )
+
+
+@router.get("/ocultas", response_model=list[ConversacionOcultaOut])
+async def listar_ocultas(
+    tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(gerencia_actual),
+    limite: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """Conversaciones de números desvinculados, en solo lectura (RF-14)."""
+    async with conexion() as conn:
+        filas = await ocultas.listar_ocultas(conn, tenant_id, limite=limite, desplazamiento=offset)
+    return [ConversacionOcultaOut(**dict(f)) for f in filas]
+
+
+@router.get("/ocultas/{conversacion_id}", response_model=ConversacionOcultaDetalleOut)
+async def detalle_oculta(
+    conversacion_id: UUID,
+    tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(gerencia_actual),
+):
+    async with conexion() as conn:
+        encontrada = await ocultas.detalle_oculta(conn, tenant_id, conversacion_id)
+    if encontrada is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversación no encontrada",
+        )
+    return ConversacionOcultaDetalleOut(
+        **dict(encontrada["conversacion"]),
+        mensajes=[MensajeOut(**dict(m)) for m in encontrada["mensajes"]],
     )
 
 

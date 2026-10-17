@@ -344,3 +344,57 @@ async def exigir_herramienta(tenant_id: UUID, herramienta: str) -> AccesoPlan:
         status_code=status.HTTP_402_PAYMENT_REQUIRED,
         detail=detalle_bloqueo(acceso, herramienta, catalogo),
     )
+
+
+# ============================================================
+# Cupo de números de WhatsApp por plan (spec 005a RF-11)
+# ============================================================
+async def cupo_numeros(tenant_id: UUID, conn: asyncpg.Connection | None = None) -> Cupo:
+    """Tope de números activos y plazas usadas (RF-11).
+
+    El tope sale de `limites_efectivos`: prueba vigente -> sin tope,
+    suscripción vigente -> su plan, sin suscripción -> plan más bajo activo,
+    sin ningún plan activo -> sin tope. Las plazas cuentan los números en
+    estado activo sin la línea de avisos (Definiciones).
+    """
+    consulta_tope = "SELECT tope, plan FROM limites_efectivos($1)"
+    consulta_plazas = (
+        "SELECT COUNT(*) FROM agentes_canal "
+        "WHERE tenant_id = $1 AND estado = 'activo' AND NOT COALESCE(es_linea_avisos, false)"
+    )
+    if conn is not None:
+        fila = await conn.fetchrow(consulta_tope, tenant_id)
+        activos = await conn.fetchval(consulta_plazas, tenant_id)
+    else:
+        fila = await fetch_one(consulta_tope, tenant_id)
+        plazas = await fetch_one("SELECT COUNT(*) AS n FROM agentes_canal WHERE tenant_id = $1 AND estado = 'activo' AND NOT COALESCE(es_linea_avisos, false)", tenant_id)
+        activos = plazas["n"] if plazas is not None else 0
+    if fila is None:
+        return Cupo(plan=None, maximo=None, activos=int(activos or 0))
+    return Cupo(plan=fila["plan"], maximo=fila["tope"], activos=int(activos or 0))
+
+
+async def exigir_cupo_numeros(tenant_id: UUID, conn: asyncpg.Connection) -> Cupo:
+    """402 `cupo_numeros_whatsapp` si el negocio ya llenó su cupo (RF-2, RF-15)."""
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtext($1 || ':' || $2::text))",
+        "cupo_numeros_whatsapp",
+        str(tenant_id),
+    )
+    actual = await cupo_numeros(tenant_id, conn)
+    if actual.disponible:
+        return actual
+    plan = actual.plan.capitalize() if actual.plan else "actual"
+    raise HTTPException(
+        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        detail={
+            "codigo": "cupo_numeros_whatsapp",
+            "mensaje": (
+                f"Tu plan {plan} permite {actual.maximo} números de WhatsApp activos y ya los tienes. "
+                "Pausa uno o mejora tu plan para vincular otro."
+            ),
+            "plan_actual": actual.plan,
+            "maximo": actual.maximo,
+            "activos": actual.activos,
+        },
+    )

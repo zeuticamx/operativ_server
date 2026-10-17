@@ -77,6 +77,21 @@ def ruta_sensible(path: str) -> bool:
     return any(path == p or path.startswith(p + "/") for p in RUTAS_SENSIBLES)
 
 
+# Rutas que introducen o tocan las CREDENCIALES de las herramientas del
+# negocio (spec 005a, P14, RF-6, RF-19): ni con concesión de escritura una
+# sesión de soporte puede usarlas (403). Es una lista aparte para no cerrar
+# toda la familia de /api/herramientas: leer herramientas, activarlas por
+# número o en Instagram/Facebook sí se permite con concesión.
+RUTAS_CREDENCIALES_CERRADAS = (
+    "/api/herramientas/google-sheets",
+    "/api/herramientas/google-docs",
+)
+
+
+def ruta_credencial_cerrada(path: str) -> bool:
+    return any(path == p or path.startswith(p + "/") for p in RUTAS_CREDENCIALES_CERRADAS)
+
+
 class SolicitudInvalida(Exception):
     """Regla de negocio incumplida; `codigo` es el HTTP status sugerido."""
 

@@ -17,8 +17,18 @@ from services.limites_agente import (
     exigir_dentro_del_plan,
     limites_de_tenant,
 )
-from session import fetch_one
-from schemas import AgenteConfigIn, AgenteConfigOut, LimitesAgenteOut
+from session import conexion, fetch_one
+from schemas import (
+    AgenteConfigIn,
+    AgenteConfigOut,
+    LimitesAgenteOut,
+    NumeroAgenteIn,
+    NumeroAgenteOut,
+)
+from services import herramientas_plan
+from services import numeros_whatsapp as numeros
+from services.numeros_bitacora import Autor
+from services.numeros_reglas import configuracion_incompleta
 
 router = APIRouter(
     prefix="/agente",
@@ -121,3 +131,57 @@ async def modelos():
     # Catálogo completo; lo que cada plan deja elegir viene en `limites_plan`
     # de GET /api/agente.
     return {"modelos": sorted(MODELOS_PERMITIDOS)}
+
+
+# ============================================================
+# Configuración por número (spec 005a, RF-5; T5)
+# ============================================================
+async def _numero_out(conn, tenant_id: UUID, fila) -> NumeroAgenteOut:
+    limites = await limites_de_tenant(tenant_id)
+    herramientas = await herramientas_plan.herramientas_de_numero(conn, tenant_id, fila["id"])
+    return NumeroAgenteOut(
+        id=fila["id"],
+        phone_number_id=fila["phone_number_id"],
+        estado=fila["estado"],
+        es_principal=bool(fila["es_principal"]),
+        es_linea_avisos=bool(fila["es_linea_avisos"]),
+        agent_name=fila["agent_name"] or "",
+        system_prompt=fila["system_prompt"] or "",
+        model=fila["model"],
+        temperature=float(fila["temperature"]),
+        history_window=fila["history_window"],
+        agente_activo=bool(fila["agente_activo"]),
+        configuracion_incompleta=configuracion_incompleta(fila["agent_name"], fila["system_prompt"]),
+        limites_plan=_limites_out(limites),
+        herramientas=herramientas,
+    )
+
+
+@router.get("/numeros/{numero_id}", response_model=NumeroAgenteOut)
+async def obtener_numero(
+    numero_id: UUID,
+    tenant_id: UUID = Depends(tenant_actual),
+):
+    """Lee la configuración de un número (RF-18: member lee, sin credenciales)."""
+    async with conexion() as conn:
+        fila = await numeros.numero_del_negocio(conn, tenant_id, numero_id)
+        return await _numero_out(conn, tenant_id, fila)
+
+
+@router.put("/numeros/{numero_id}", response_model=NumeroAgenteOut)
+async def actualizar_numero(
+    numero_id: UUID,
+    datos: NumeroAgenteIn,
+    tenant_id: UUID = Depends(tenant_actual),
+    usuario: UsuarioActual = Depends(gerencia_actual),
+):
+    """Edita la configuración de un número (400 temperatura, 402 plan, 404 ajeno)."""
+    cambios = {k: v for k, v in datos.model_dump().items() if v is not None}
+    # `model: null` explícito = default del plan (D32): se guarda NULL.
+    if datos.model is None and "model" in datos.model_fields_set:
+        cambios["model"] = None
+    async with conexion() as conn:
+        fila = await numeros.editar_configuracion(
+            conn, tenant_id, numero_id, cambios, Autor.gerencia(usuario.id, usuario.email)
+        )
+        return await _numero_out(conn, tenant_id, fila)

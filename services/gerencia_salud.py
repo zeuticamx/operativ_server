@@ -113,9 +113,15 @@ async def canales_silenciosos() -> list[Problema]:
          AND m.created_at >= NOW() - INTERVAL '30 days'
         LEFT JOIN tenant_estado_plataforma ep ON ep.tenant_id = t.id
         WHERE COALESCE(ep.estado, 'activo') IN ('activo', 'prueba')
-          AND EXISTS (
-              SELECT 1 FROM channel_credentials cc
-              WHERE cc.tenant_id = t.id AND cc.is_active
+          AND (
+              EXISTS (
+                  SELECT 1 FROM channel_credentials cc
+                  WHERE cc.tenant_id = t.id AND cc.is_active
+              )
+              OR EXISTS (
+                  SELECT 1 FROM agentes_canal ac
+                  WHERE ac.tenant_id = t.id AND ac.estado = 'activo'
+              )
           )
         GROUP BY t.id, t.name
         HAVING MAX(m.created_at) < NOW() - make_interval(hours => $1)

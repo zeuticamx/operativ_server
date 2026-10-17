@@ -150,6 +150,11 @@ async def _validar_impersonacion(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Esta acción no está permitida desde 'ver como', ni con permiso de edición",
             )
+        if acceso_soporte.ruta_credencial_cerrada(path):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Las credenciales de herramientas solo las edita la gerencia del negocio",
+            )
         await registrar_auditoria(
             actor_email=gerente["email"],
             actor_portal_user_id=gerente_id,

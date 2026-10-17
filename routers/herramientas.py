@@ -19,7 +19,7 @@ from deps import (
     tenant_actual,
     usuario_actual,
 )
-from session import execute, fetch_all, fetch_one
+from session import conexion, execute, fetch_all, fetch_one
 from schemas import (
     ActualizarHerramientaIn,
     ConectarGoogleDocIn,
@@ -28,9 +28,14 @@ from schemas import (
     ConsumoResumenOut,
     HerramientaInfoOut,
     HerramientaOut,
+    HerramientaNumeroOut,
+    HerramientasNumeroIn,
 )
 from services import consumo_creditos as consumo_svc
 from services import google_tools, herramientas_calendario
+from services import herramientas_plan
+from services import numeros_whatsapp as numeros
+from services.numeros_bitacora import Autor
 
 router = APIRouter(
     prefix="/herramientas",
@@ -406,3 +411,72 @@ async def eliminar(
         tenant_id,
         tool_key,
     )
+
+
+# ============================================================
+# Herramientas por número e Instagram/Facebook (spec 005a, RF-6, RF-17; T5)
+# ============================================================
+def _herramienta_out(f: dict) -> HerramientaNumeroOut:
+    return HerramientaNumeroOut(
+        tool_key=f["tool_key"],
+        tool_type=f.get("tool_type"),
+        display_name=f.get("display_name"),
+        description=f.get("description"),
+        familia=f.get("familia"),
+        activa=bool(f["activa"]),
+        permitida_por_plan=bool(f["permitida_por_plan"]),
+    )
+
+
+@router.get("/numeros/{numero_id}", response_model=list[HerramientaNumeroOut])
+async def listar_de_numero(
+    numero_id: UUID,
+    tenant_id: UUID = Depends(tenant_actual),
+):
+    """Herramientas del negocio con `activa` en ese número y `permitida_por_plan`."""
+    async with conexion() as conn:
+        await numeros.numero_del_negocio(conn, tenant_id, numero_id)
+        return [_herramienta_out(f) for f in await herramientas_plan.catalogo(conn, tenant_id, numero_id)]
+
+
+@router.put("/numeros/{numero_id}", response_model=list[HerramientaNumeroOut])
+async def editar_de_numero(
+    numero_id: UUID,
+    datos: HerramientasNumeroIn,
+    tenant_id: UUID = Depends(tenant_actual),
+    usuario: UsuarioActual = Depends(gerencia_actual),
+):
+    """Activa/desactiva herramientas en un número (402 si el plan no la incluye)."""
+    autor = Autor.gerencia(usuario.id, usuario.email)
+    async with conexion() as conn:
+        if datos.activar:
+            await herramientas_plan.activar_herramientas_de_numero(
+                conn, tenant_id, numero_id, datos.activar, autor
+            )
+        if datos.desactivar:
+            await herramientas_plan.desactivar_herramientas_de_numero(
+                conn, tenant_id, numero_id, datos.desactivar, autor
+            )
+        return [_herramienta_out(f) for f in await herramientas_plan.catalogo(conn, tenant_id, numero_id)]
+
+
+@router.get("/social", response_model=list[HerramientaNumeroOut])
+async def listar_social(tenant_id: UUID = Depends(tenant_actual)):
+    """Conjunto de Instagram, Facebook y el widget (RF-17)."""
+    async with conexion() as conn:
+        return [_herramienta_out(f) for f in await herramientas_plan.catalogo(conn, tenant_id, None)]
+
+
+@router.put("/social", response_model=list[HerramientaNumeroOut])
+async def editar_social(
+    datos: HerramientasNumeroIn,
+    tenant_id: UUID = Depends(tenant_actual),
+    usuario: UsuarioActual = Depends(gerencia_actual),
+):
+    autor = Autor.gerencia(usuario.id, usuario.email)
+    async with conexion() as conn:
+        if datos.activar:
+            await herramientas_plan.activar_herramientas_social(conn, tenant_id, datos.activar, autor)
+        if datos.desactivar:
+            await herramientas_plan.desactivar_herramientas_social(conn, tenant_id, datos.desactivar, autor)
+        return [_herramienta_out(f) for f in await herramientas_plan.catalogo(conn, tenant_id, None)]

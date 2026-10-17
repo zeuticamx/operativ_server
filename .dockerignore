@@ -1,0 +1,20 @@
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Secretos: en producción las variables entran por el entorno del servicio,
+# nunca dentro de la imagen.
+.env
+.env.*
+!.env.example
+
+tests
+.git
+.gitignore
+.vscode
+.idea
+*.log

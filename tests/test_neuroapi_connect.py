@@ -14,10 +14,12 @@ La API de NeuroAPI no se llama nunca: lo que se prueba es nuestro lado.
 import hashlib
 import hmac
 import json
+from uuid import uuid4
 
 import pytest
 
 from config import settings
+from security import crear_access_token, hash_password
 from services import entrada_mensajes, neuroapi_connect
 from services.neuroapi_connect import verificar_webhook
 from session import execute, fetch_one, fetch_value
@@ -301,9 +303,10 @@ async def test_la_linea_activada_queda_lista_para_que_n8n_conteste(
 
 
 @pytest.mark.asyncio
-async def test_reconectar_con_otro_numero_deja_el_nuevo(
+async def test_reconectar_con_otro_numero_no_sobrescribe_la_credencial(
     http_client, tenant_y_usuario, con_secreto, monkeypatch
 ):
+    """P2: channel_credentials guarda el primer número (la lee cuenta_global_wa)."""
     monkeypatch.setattr(settings, "NEUROAPI_API_KEY", "clave-de-prueba")
     tenant_id = tenant_y_usuario["tenant_id"]
     await _sesion_pendiente(tenant_id, "sess_uno")
@@ -314,19 +317,26 @@ async def test_reconectar_con_otro_numero_deja_el_nuevo(
     cred = await fetch_one(
         "SELECT * FROM get_channel_credentials($1, 'whatsapp')", tenant_id
     )
-    assert cred["phone_number_id"] == "5215522222222"
+    assert cred["phone_number_id"] == "5215511111111"
     assert cred["bsp_provider"] == "neuroapi"
     assert cred["access_token"] == "clave-de-prueba"
 
+    vinculados = await fetch_value(
+        "SELECT COUNT(*) FROM agentes_canal "
+        "WHERE tenant_id = $1 AND estado IN ('activo', 'pausado')",
+        tenant_id,
+    )
+    assert vinculados == 2
+
 
 @pytest.mark.asyncio
-async def test_desconectar_avisa_que_es_neuroapi_y_corta_los_mensajes(
+async def test_desconectar_en_bloque_ya_no_existe_usar_numeros(
     http_client, tenant_y_usuario, con_secreto, monkeypatch
 ):
     """
-    NeuroAPI no tiene endpoint de baja: el portal necesita saber que la línea
-    era suya para pedir que se retire el acceso en Meta, y lo que siga
-    mandando NeuroAPI no debe llegar a n8n.
+    Spec 005a: WhatsApp se gestiona número por número. Tras desvincular el
+    número, lo que siga mandando NeuroAPI no llega a n8n (no resuelve a
+    ningún tenant).
     """
     monkeypatch.setattr(settings, "NEUROAPI_API_KEY", "clave-de-prueba")
     monkeypatch.setattr(settings, "N8N_WEBHOOK_ENTRADA_URL", "https://n8n.ejemplo.com/webhook/x")
@@ -338,13 +348,27 @@ async def test_desconectar_avisa_que_es_neuroapi_y_corta_los_mensajes(
         "/api/canales/whatsapp",
         headers={"Authorization": f"Bearer {tenant_y_usuario['token']}"},
     )
-    assert respuesta.status_code == 200
-    assert respuesta.json() == {"desconectado": "whatsapp", "proveedor": "neuroapi"}
+    assert respuesta.status_code == 409
+    assert respuesta.json()["detail"]["codigo"] == "usar_numeros"
 
-    reenvios: list[str] = []
+    numero_id = await fetch_value(
+        "SELECT id FROM agentes_canal WHERE tenant_id = $1 AND phone_number_id = $2",
+        tenant_id,
+        "5215533330000",
+    )
+    respuesta = await http_client.delete(
+        f"/api/canales/whatsapp/numeros/{numero_id}",
+        headers={"Authorization": f"Bearer {tenant_y_usuario['token']}"},
+    )
+    assert respuesta.status_code == 204
+
+    # El número desvinculado se sigue atribuyendo a su último dueño (RF-16):
+    # el mensaje se reenvía y ya no recibe respuesta (lo guarda en ocultas
+    # la entrada del agente, T7).
+    reenvios: list[tuple] = []
 
     async def no_reenviar(cuerpo_crudo, tenant, destino):
-        reenvios.append(destino)
+        reenvios.append((tenant, destino))
 
     monkeypatch.setattr(entrada_mensajes, "reenviar", no_reenviar)
     mensaje = json.dumps({
@@ -361,7 +385,7 @@ async def test_desconectar_avisa_que_es_neuroapi_y_corta_los_mensajes(
         headers={"x-hub-signature-256": firmar(mensaje), "content-type": "application/json"},
     )
     assert respuesta.status_code == 200
-    assert reenvios == []
+    assert reenvios == [(tenant_id, "https://n8n.ejemplo.com/webhook/x")]
 
 
 @pytest.mark.asyncio
@@ -515,3 +539,168 @@ async def test_una_sesion_fallida_no_activa_ningun_canal(
         tenant_id,
     )
     assert canal is None
+
+
+# ============================================================
+# T6: iniciar comprueba cupo y bloqueo; el webhook vincula por RF-2
+# ============================================================
+async def _alta_ajena(http_client, headers, pnid):
+    r = await http_client.post(
+        "/api/canales/whatsapp/conectar", json={"phone_number_id": pnid}, headers=headers
+    )
+    return r
+
+
+@pytest.mark.asyncio
+async def test_iniciar_con_cupo_lleno_da_402_sin_abrir_sesion(
+    http_client, tenant_y_usuario, neuroapi_simulado
+):
+    nombre = f"cupo6-{uuid4().hex[:10]}"
+    await execute(
+        "INSERT INTO planes (nombre, precio_monthly, max_numeros_whatsapp, activo)"
+        " VALUES ($1, 9999, 1, true)",
+        nombre,
+    )
+    try:
+        await execute(
+            "INSERT INTO tenant_subscriptions (tenant_id, plan, estado, precio_monthly)"
+            " VALUES ($1, $2, 'activa', 10)"
+            " ON CONFLICT (tenant_id) DO UPDATE SET plan = EXCLUDED.plan, estado = 'activa'",
+            tenant_y_usuario["tenant_id"],
+            nombre,
+        )
+        headers = {"Authorization": f"Bearer {tenant_y_usuario['token']}"}
+        r = await _alta_ajena(http_client, headers, "5215500000001")
+        assert r.status_code == 201
+
+        neuroapi_simulado(_RespuestaFalsa({"success": True, "data": {"session_id": "s", "url": "https://x"}}))
+        r = await http_client.post("/api/canales/whatsapp/neuroapi/iniciar", headers=headers)
+        assert r.status_code == 402
+        assert r.json()["detail"]["codigo"] == "cupo_numeros_whatsapp"
+        assert _ClienteFalso.ultimo_payload is None
+    finally:
+        await execute("DELETE FROM tenant_subscriptions WHERE plan = $1", nombre)
+        await execute("DELETE FROM planes WHERE nombre = $1", nombre)
+
+
+@pytest.mark.asyncio
+async def test_iniciar_bloqueado_da_429_sin_abrir_sesion(
+    http_client, tenant_y_usuario, neuroapi_simulado, db
+):
+    from uuid import uuid4 as _uuid4
+
+    headers = {"Authorization": f"Bearer {tenant_y_usuario['token']}"}
+    tid_otro = _uuid4()
+    await execute("INSERT INTO tenants (id, name) VALUES ($1, 'Otro')", tid_otro)
+    try:
+        uid = _uuid4()
+        await execute(
+            """
+            INSERT INTO portal_users (id, tenant_id, email, password_hash, role, is_active)
+            VALUES ($1, $2, $3, $4, 'owner', true)
+            """,
+            uid,
+            tid_otro,
+            f"owner-{uid}@ejemplo.com",
+            hash_password("x" * 12),
+        )
+        await execute(
+            "INSERT INTO tenant_subscriptions (tenant_id, plan, estado, precio_monthly)"
+            " VALUES ($1, 'enterprise', 'activa', 299.99)",
+            tid_otro,
+        )
+        from security import crear_access_token as _token
+
+        h_otro = {"Authorization": f"Bearer {_token(uid, tid_otro, 'owner')}"}
+        r = await _alta_ajena(http_client, h_otro, "5215500000002")
+        assert r.status_code == 201
+        for _ in range(5):
+            assert (await _alta_ajena(http_client, headers, "5215500000002")).status_code == 404
+
+        neuroapi_simulado(_RespuestaFalsa({"success": True, "data": {"session_id": "s", "url": "https://x"}}))
+        r = await http_client.post("/api/canales/whatsapp/neuroapi/iniciar", headers=headers)
+        assert r.status_code == 429
+        assert r.json()["detail"]["codigo"] == "demasiados_intentos"
+        assert _ClienteFalso.ultimo_payload is None
+    finally:
+        await execute("DELETE FROM tenants WHERE id = $1", tid_otro)
+
+
+@pytest.mark.asyncio
+async def test_webhook_vincula_libre_ignora_propio_y_rechaza_ajeno(
+    http_client, tenant_y_usuario, con_secreto
+):
+    from uuid import uuid4 as _uuid4
+
+    tid = tenant_y_usuario["tenant_id"]
+    headers = {"Authorization": f"Bearer {tenant_y_usuario['token']}"}
+
+    await _sesion_pendiente(tid, "sess_libre")
+    await _completar(http_client, "sess_libre", "5215560000001")
+    fila = await fetch_one(
+        "SELECT estado, telefono_visible FROM agentes_canal WHERE tenant_id = $1 AND phone_number_id = $2",
+        tid,
+        "5215560000001",
+    )
+    assert fila["estado"] == "activo"
+
+    await _sesion_pendiente(tid, "sess_propia")
+    await _completar(http_client, "sess_propia", "5215560000001")
+    assert await fetch_value(
+        "SELECT COUNT(*) FROM agentes_canal WHERE phone_number_id = $1 AND estado IN ('activo', 'pausado')",
+        "5215560000001",
+    ) == 1
+
+    tid_otro = _uuid4()
+    await execute("INSERT INTO tenants (id, name) VALUES ($1, 'Otro')", tid_otro)
+    try:
+        await _sesion_pendiente(tid_otro, "sess_ajena")
+        cuerpo = json.dumps(
+            {"session_id": "sess_ajena", "status": "completado", "phone_number_id": "5215560000001"}
+        ).encode()
+        r = await http_client.post(
+            "/api/canales/whatsapp/neuroapi/webhook",
+            content=cuerpo,
+            headers={"x-hub-signature-256": firmar(cuerpo), "content-type": "application/json"},
+        )
+        assert r.status_code == 200
+        assert await fetch_value(
+            "SELECT COUNT(*) FROM agentes_canal WHERE tenant_id = $1", tid_otro
+        ) == 0
+        intentos = await fetch_value(
+            "SELECT COUNT(*) FROM intentos_alta_ajena WHERE tenant_id = $1", tid_otro
+        )
+        assert intentos == 1
+    finally:
+        await execute("DELETE FROM tenants WHERE id = $1", tid_otro)
+
+
+@pytest.mark.asyncio
+async def test_estado_muestra_el_resultado_del_webhook(
+    http_client, tenant_y_usuario, con_secreto
+):
+    tid = tenant_y_usuario["tenant_id"]
+    headers = {"Authorization": f"Bearer {tenant_y_usuario['token']}"}
+    await _sesion_pendiente(tid, "sess_estado")
+    await _completar(http_client, "sess_estado", "5215570000001")
+
+    r = await http_client.get(
+        "/api/canales/whatsapp/neuroapi/estado",
+        params={"session_id": "sess_estado"},
+        headers=headers,
+    )
+    assert r.status_code == 200
+    assert r.json() == {
+        "session_id": "sess_estado",
+        "estado": "completado",
+        "resultado": "vinculado",
+        "codigo": None,
+        "phone_number_id": "5215570000001",
+    }
+
+    r = await http_client.get(
+        "/api/canales/whatsapp/neuroapi/estado",
+        params={"session_id": "sess_ajena_xxx"},
+        headers=headers,
+    )
+    assert r.status_code == 404

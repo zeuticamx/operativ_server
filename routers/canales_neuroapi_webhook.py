@@ -16,11 +16,12 @@ El parser acepta además variantes en snake_case, con los datos en la raíz o
 en `data`, y el sobre estándar de Meta (`entry[].changes[].value`).
 
 Una vez vinculada la cuenta, NeuroAPI manda a esta misma URL los mensajes
-entrantes. Para esos, el backend actúa de proxy hacia n8n
-(services/entrada_mensajes.py): la firma ya se validó aquí, se identifica
-el tenant por el número receptor y se reenvía el cuerpo intacto. Así no
+entrantes. Para esos, el backend actúa de proxy (services/entrada_mensajes.py):
+la firma ya se validó aquí, se identifica el tenant por el número receptor y
+se reenvía el cuerpo intacto hacia n8n o hacia el propio agente en código,
+según `AGENTE_EN_CODIGO` (decide `entrada_mensajes.destino_para`). Así no
 hace falta una segunda llamada a NeuroAPI para apuntar los mensajes a otra
-URL tras la vinculación.
+URL tras la vinculación, ni para migrar de uno al otro.
 """
 
 import json
@@ -250,10 +251,24 @@ async def _procesar_conexion(
 
     if estado == "completado":
         if phone_number_id:
-            await _activar_whatsapp(fila["tenant_id"], str(phone_number_id))
+            resultado = await _activar_whatsapp(
+                fila["tenant_id"], str(phone_number_id), telefono_visible=phone_number,
+            )
+            await execute(
+                "UPDATE neuroapi_connect_sessions SET detalle = $2, updated_at = NOW() "
+                "WHERE session_id = $1",
+                str(session_id),
+                json.dumps(
+                    {
+                        "resultado": resultado.resultado,
+                        "codigo": resultado.codigo,
+                        "phone_number_id": resultado.phone_number_id,
+                    }
+                ),
+            )
             log.warning(
-                "WhatsApp activado vía NeuroAPI Connect: tenant=%s sesión=%s phone_number_id=%s",
-                fila["tenant_id"], session_id, phone_number_id,
+                "WhatsApp vía NeuroAPI Connect: tenant=%s sesión=%s phone_number_id=%s resultado=%s",
+                fila["tenant_id"], session_id, phone_number_id, resultado.resultado,
             )
         else:
             log.warning(
@@ -262,24 +277,48 @@ async def _procesar_conexion(
             )
 
 
-async def _activar_whatsapp(tenant_id: Any, phone_number_id: str) -> None:
-    # La API key de la plataforma va como access_token con
-    # bsp_provider='neuroapi': es lo que n8n manda en x-api-key al contestar
-    # (ver sql/30_whatsapp_neuroapi_credenciales.sql). Sin key la línea se
-    # activa igual, para no perder la vinculación, pero n8n no podrá
-    # contestar hasta que se configure y se reconecte.
+async def _activar_whatsapp(
+    tenant_id: Any, phone_number_id: str, telefono_visible: str | None = None
+):
+    """
+    Alta por el webhook (T6): un número libre se vincula; uno propio se ignora
+    (sin duplicar ni reactivar); uno ajeno se rechaza sin revelar y cuenta
+    para los intentos. Devuelve el resultado para dejarlo en la sesión
+    (`GET .../neuroapi/estado`).
+
+    `channel_credentials` solo guarda el PRIMER número (P2): es lo que lee
+    `cuenta_global_wa` para los avisos. El alta de un segundo número no la
+    sobrescribe.
+    """
+    from services import numeros_whatsapp as numeros
+    from session import conexion
+
+    async with conexion() as conn:
+        resultado = await numeros.vincular_desde_proveedor(
+            conn, tenant_id, phone_number_id, telefono_visible=telefono_visible
+        )
+
+    if resultado.resultado != "vinculado":
+        return resultado
+
     if not settings.NEUROAPI_API_KEY:
         log.error(
             "NEUROAPI_API_KEY sin configurar: WhatsApp del tenant %s queda vinculado "
             "pero n8n no podrá contestar por NeuroAPI",
             tenant_id,
         )
-    await fetch_one(
-        "SELECT set_whatsapp_neuroapi($1, $2, $3)",
+    actual = await fetch_one(
+        "SELECT phone_number_id FROM channel_credentials "
+        "WHERE tenant_id = $1 AND channel_type = 'whatsapp'",
         tenant_id,
-        phone_number_id,
-        settings.NEUROAPI_API_KEY or None,
     )
+    if actual is None or not actual["phone_number_id"]:
+        await fetch_one(
+            "SELECT set_whatsapp_neuroapi($1, $2, $3)",
+            tenant_id,
+            phone_number_id,
+            settings.NEUROAPI_API_KEY or None,
+        )
     await execute(
         """
         INSERT INTO tenant_channels (tenant_id, channel_type)
@@ -288,6 +327,7 @@ async def _activar_whatsapp(tenant_id: Any, phone_number_id: str) -> None:
         """,
         tenant_id,
     )
+    return resultado
 
 
 def _campo(fuentes: list[dict[str, Any]], *nombres: str) -> Any:

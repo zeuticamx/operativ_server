@@ -14,10 +14,11 @@ WhatsApp (hoy vía Kontesta, ver services/whatsapp.py):
   POST /canales/whatsapp/conectar solo registra qué línea es de qué tenant.
 """
 
+import json
 import logging
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
 from config import settings
 from deps import (
@@ -27,16 +28,25 @@ from deps import (
     requiere_herramienta,
     tenant_actual,
 )
-from session import execute, fetch_all, fetch_one
+from session import conexion, execute, fetch_all, fetch_one
 from schemas import (
     ActivarCanalesIn,
     CanalOut,
     ConectarMetaIn,
     ConectarWhatsAppIn,
+    ElegirPrincipalIn,
+    EstadoNeuroApiConnectOut,
     IniciarNeuroApiConnectOut,
+    ListaNumerosOut,
+    NumeroWhatsAppOut,
     PaginaDisponible,
+    PausarNumeroOut,
 )
 from services import meta, neuroapi_connect
+from services import herramientas_plan
+from services import numeros_whatsapp as numeros
+from services.numeros_bitacora import Autor
+from services.numeros_reglas import configuracion_incompleta
 
 log = logging.getLogger("operativai.canales")
 
@@ -242,70 +252,129 @@ async def activar_canales(
 
 
 # ============================================================
+# Varios números de WhatsApp por negocio (spec 005a, T5)
+# ============================================================
+def _numero_out(fila, herramientas: list[str] | None = None) -> NumeroWhatsAppOut:
+    incompleta = configuracion_incompleta(fila["agent_name"], fila["system_prompt"])
+    if herramientas is None and "herramientas" in fila:
+        herramientas = list(fila["herramientas"] or [])
+    return NumeroWhatsAppOut(
+        id=fila["id"],
+        phone_number_id=fila["phone_number_id"],
+        telefono_visible=fila["telefono_visible"],
+        bsp_provider=fila["bsp_provider"],
+        estado=fila["estado"],
+        es_principal=bool(fila["es_principal"]),
+        es_linea_avisos=bool(fila["es_linea_avisos"]),
+        vinculado_en=fila["vinculado_en"],
+        pausado_en=fila["pausado_en"],
+        motivo_pausa=fila["motivo_pausa"],
+        agent_name=fila["agent_name"] or "",
+        system_prompt=fila["system_prompt"] or "",
+        model=fila["model"],
+        temperature=float(fila["temperature"]),
+        history_window=fila["history_window"],
+        agente_activo=bool(fila["agente_activo"]),
+        configuracion_incompleta=incompleta,
+        herramientas=herramientas or [],
+    )
+
+
+@router.get("/whatsapp/numeros", response_model=ListaNumerosOut)
+async def listar_numeros(tenant_id: UUID = Depends(tenant_actual)):
+    """Números vinculados con plazas del cupo (RF-18: vendedor y proveedor reciben 403)."""
+    async with conexion() as conn:
+        lista = await numeros.listar(conn, tenant_id)
+    return ListaNumerosOut(
+        numeros=[_numero_out(f) for f in lista.numeros],
+        tope=lista.tope,
+        plazas_usadas=lista.plazas_usadas,
+        plazas_libres=lista.plazas_libres,
+    )
+
+
+@router.post("/whatsapp/numeros/{numero_id}/pausar", response_model=PausarNumeroOut)
+async def pausar_numero(
+    numero_id: UUID,
+    tenant_id: UUID = Depends(tenant_actual),
+    usuario: UsuarioActual = Depends(gerencia_actual),
+):
+    async with conexion() as conn:
+        resultado = await numeros.pausar_manual(
+            conn, tenant_id, numero_id, Autor.gerencia(usuario.id, usuario.email)
+        )
+        herramientas = await herramientas_plan.herramientas_de_numero(conn, tenant_id, numero_id)
+    return PausarNumeroOut(
+        numero=_numero_out(resultado.numero, herramientas),
+        sin_numero_activo=resultado.sin_numero_activo,
+    )
+
+
+@router.post("/whatsapp/numeros/{numero_id}/reactivar", response_model=NumeroWhatsAppOut)
+async def reactivar_numero(
+    numero_id: UUID,
+    tenant_id: UUID = Depends(tenant_actual),
+    usuario: UsuarioActual = Depends(gerencia_actual),
+):
+    async with conexion() as conn:
+        fila = await numeros.reactivar(
+            conn, tenant_id, numero_id, Autor.gerencia(usuario.id, usuario.email)
+        )
+        herramientas = await herramientas_plan.herramientas_de_numero(conn, tenant_id, numero_id)
+    return _numero_out(fila, herramientas)
+
+
+@router.delete("/whatsapp/numeros/{numero_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def desvincular_numero(
+    numero_id: UUID,
+    tenant_id: UUID = Depends(tenant_actual),
+    usuario: UsuarioActual = Depends(gerencia_actual),
+):
+    async with conexion() as conn:
+        await numeros.desvincular(
+            conn, tenant_id, numero_id, Autor.gerencia(usuario.id, usuario.email)
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.put("/whatsapp/principal", response_model=NumeroWhatsAppOut)
+async def elegir_principal(
+    datos: ElegirPrincipalIn,
+    tenant_id: UUID = Depends(tenant_actual),
+    usuario: UsuarioActual = Depends(gerencia_actual),
+):
+    async with conexion() as conn:
+        fila = await numeros.elegir_principal(
+            conn, tenant_id, datos.numero_id, Autor.gerencia(usuario.id, usuario.email)
+        )
+        herramientas = await herramientas_plan.herramientas_de_numero(conn, tenant_id, datos.numero_id)
+    return _numero_out(fila, herramientas)
+
+
+# ============================================================
 # WhatsApp (vía Kontesta)
 # ============================================================
-@router.post("/whatsapp/conectar")
+@router.post("/whatsapp/conectar", status_code=status.HTTP_201_CREATED)
 async def conectar_whatsapp(
     datos: ConectarWhatsAppIn,
     tenant_id: UUID = Depends(tenant_actual),
-    _: UsuarioActual = Depends(gerencia_actual),
+    usuario: UsuarioActual = Depends(gerencia_actual),
 ):
     """
-    Registra qué línea de Kontesta corresponde a este tenant.
-
-    A diferencia de Meta no hay OAuth ni token que guardar: la API key de
-    Kontesta es una sola para toda la plataforma (KONTESTA_API_KEY) y el
-    número del negocio ya vive como línea dentro de esa cuenta. Lo que hace
-    falta guardar es la correspondencia línea → tenant, que es de donde n8n
-    saca el tenant de cada mensaje entrante.
-
-    ⚠️ No se verifica contra Kontesta que la línea exista ni que sea de este
-    negocio: la API de Kontesta no documenta un endpoint para consultarlas.
-    Mientras tanto el alta es declarativa y el único control es que nadie
-    pueda reclamar una línea que otro tenant ya tiene registrada.
+    Da de alta un número (spec 005a RF-2): 429 si el negocio agotó sus
+    intentos, 402 si el cupo está lleno, 409 si ya es propio, 404 si es
+    ajeno, 201 si estaba libre.
     """
-    # channel_credentials es tabla del lado de n8n, así que la unicidad de
-    # la línea se comprueba acá y no con un índice: sin esto, un tenant
-    # podría reclamar el número de otro y quedarse con su conversación.
-    # Queda una ventana de carrera mínima entre el SELECT y el INSERT; el
-    # arreglo de fondo es un índice único parcial, que le toca a quien sea
-    # dueño del esquema de n8n.
-    ocupada = await fetch_one(
-        """
-        SELECT 1 FROM channel_credentials
-        WHERE channel_type = 'whatsapp'
-          AND phone_number_id = $1
-          AND is_active
-          AND tenant_id <> $2
-        """,
-        datos.phone_number_id,
-        tenant_id,
-    )
-    if ocupada is not None:
-        # Sin decir de quién es: mismo criterio que el 404 de tenant ajeno,
-        # no confirmar qué otras cuentas existen.
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Ese número ya está conectado en otra cuenta",
+    async with conexion() as conn:
+        fila = await numeros.vincular(
+            conn,
+            tenant_id,
+            datos.phone_number_id,
+            Autor.gerencia(usuario.id, usuario.email),
+            bsp_provider="kontesta",
         )
-
-    # access_token va en NULL a propósito: con Kontesta no hay credencial
-    # por tenant que cifrar, solo el id de la línea.
-    await fetch_one(
-        "SELECT set_channel_credentials($1, 'whatsapp', NULL, $2, NULL, NULL)",
-        tenant_id,
-        datos.phone_number_id,
-    )
-    await execute(
-        """
-        INSERT INTO tenant_channels (tenant_id, channel_type)
-        VALUES ($1, 'whatsapp')
-        ON CONFLICT (tenant_id, channel_type) DO UPDATE SET is_active = true
-        """,
-        tenant_id,
-    )
-
-    return {"conectado": True, "phone_number_id": datos.phone_number_id}
+        herramientas = await herramientas_plan.herramientas_de_numero(conn, tenant_id, fila["id"])
+    return _numero_out(fila, herramientas)
 
 
 # ============================================================
@@ -329,6 +398,11 @@ async def iniciar_neuroapi_connect(
             detail="La vinculación automática de WhatsApp no está configurada",
         )
 
+    # RF-2 pasos 1 y 2 antes de abrir la sesión: con bloqueo o cupo lleno no
+    # se abre el trámite (el resultado final se consulta en .../neuroapi/estado).
+    async with conexion() as conn:
+        await numeros.comprobar_alta_previa(conn, tenant_id)
+
     datos = await neuroapi_connect.crear_connect_session(tenant_id)
     connect_url = datos.get("url") or datos.get("connect_url")
     session_id = datos.get("session_id") or datos.get("id")
@@ -351,6 +425,41 @@ async def iniciar_neuroapi_connect(
     return IniciarNeuroApiConnectOut(connect_url=connect_url)
 
 
+@router.get("/whatsapp/neuroapi/estado", response_model=EstadoNeuroApiConnectOut)
+async def estado_neuroapi_connect(
+    session_id: str = Query(..., min_length=1, max_length=200),
+    tenant_id: UUID = Depends(tenant_actual),
+):
+    """Resultado del alta por NeuroAPI: estado de la sesión y código RF-2 si falló."""
+    fila = await fetch_one(
+        "SELECT session_id, status, detalle FROM neuroapi_connect_sessions "
+        "WHERE session_id = $1 AND tenant_id = $2",
+        session_id,
+        tenant_id,
+    )
+    if fila is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Sesión no encontrada",
+        )
+    resultado = codigo = phone_number_id = None
+    try:
+        datos = json.loads(fila["detalle"]) if fila["detalle"] else None
+    except (ValueError, TypeError):
+        datos = None
+    if isinstance(datos, dict):
+        resultado = datos.get("resultado")
+        codigo = datos.get("codigo")
+        phone_number_id = datos.get("phone_number_id")
+    return EstadoNeuroApiConnectOut(
+        session_id=fila["session_id"],
+        estado=fila["status"],
+        resultado=resultado,
+        codigo=codigo,
+        phone_number_id=phone_number_id,
+    )
+
+
 # ============================================================
 # Desconectar
 # ============================================================
@@ -360,7 +469,17 @@ async def desconectar_canal(
     tenant_id: UUID = Depends(tenant_actual),
     _: UsuarioActual = Depends(gerencia_actual),
 ):
-    if channel_type not in ("facebook", "instagram", "whatsapp"):
+    # Spec 005a: WhatsApp se gestiona por número (pausar/desvincular en
+    # /canales/whatsapp/numeros); la baja en bloque ya no existe.
+    if channel_type == "whatsapp":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "codigo": "usar_numeros",
+                "mensaje": "WhatsApp se gestiona número por número: pausa o desvincula cada número desde la lista de números.",
+            },
+        )
+    if channel_type not in ("facebook", "instagram"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Canal no válido: {channel_type}",

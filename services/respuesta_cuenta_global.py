@@ -89,6 +89,8 @@ def _tenant_global() -> UUID | None:
 
 
 async def _es_linea_global(tenant_id: UUID, phone_number_id: str) -> bool:
+    # La credencial (primer número, P2) o la marca de línea de avisos en
+    # agentes_canal (spec 005a RF-16): cualquiera de las dos vale.
     fila = await fetch_one(
         """
         SELECT 1 AS ok
@@ -97,6 +99,21 @@ async def _es_linea_global(tenant_id: UUID, phone_number_id: str) -> bool:
            AND channel_type = 'whatsapp'
            AND phone_number_id = $2
            AND is_active = true
+         LIMIT 1
+        """,
+        tenant_id,
+        phone_number_id,
+    )
+    if fila is not None:
+        return True
+    fila = await fetch_one(
+        """
+        SELECT 1 AS ok
+          FROM agentes_canal
+         WHERE tenant_id = $1
+           AND phone_number_id = $2
+           AND es_linea_avisos
+           AND estado IN ('activo', 'pausado')
          LIMIT 1
         """,
         tenant_id,

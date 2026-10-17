@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from routers import (
     agenda,
     agente,
+    agente_webhook,
     alertas,
     auth,
     calendario,
@@ -98,6 +99,10 @@ app.include_router(canales.router, prefix="/api")
 # módulo de canales sin JWT, autenticado por firma HMAC (ver comentario del
 # bloque de cobros más abajo, mismo criterio).
 app.include_router(canales_neuroapi_webhook.router, prefix="/api")
+# Webhook de entrada del agente (WhatsApp/Instagram/Facebook/widget). Sin
+# JWT, como los dos de arriba: cada camino trae su propia firma. Reemplaza
+# a `/canal-entrada` de n8n y solo atiende con AGENTE_EN_CODIGO encendida.
+app.include_router(agente_webhook.router, prefix="/api")
 app.include_router(agente.router, prefix="/api")
 app.include_router(conversaciones.router, prefix="/api")
 app.include_router(conversaciones.router_contexto, prefix="/api")

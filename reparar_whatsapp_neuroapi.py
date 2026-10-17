@@ -5,7 +5,8 @@ sql/30_whatsapp_neuroapi_credenciales.sql.
 Esas filas de channel_credentials quedaron con access_token NULL y
 bsp_provider 'meta', así que n8n no puede contestar por ellas. Este script
 les guarda la API key de la plataforma (NEUROAPI_API_KEY) con
-bsp_provider='neuroapi', con la misma función que usa ahora la vinculación.
+bsp_provider='neuroapi', con la misma función que usa ahora la vinculación,
+y les crea su fila en agentes_canal si no la tienen (spec 005a).
 
 Lee el mismo DATABASE_URL que la app, igual que aplicar_sql.py. Sin
 --aplicar solo lista lo que cambiaría.
@@ -101,6 +102,23 @@ async def main() -> None:
                     f["tenant_id"],
                     f["phone_number_id"],
                     settings.NEUROAPI_API_KEY,
+                )
+                # Spec 005a: la línea también vive en agentes_canal (si no
+                # está, se crea incompleta para que la gerencia la complete).
+                await conn.execute(
+                    """
+                    INSERT INTO agentes_canal
+                        (tenant_id, phone_number_id, bsp_provider, estado,
+                         agent_name, system_prompt, agente_activo)
+                    SELECT $1, $2, 'neuroapi', 'activo', '', '', true
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM agentes_canal
+                         WHERE phone_number_id = $2
+                           AND estado IN ('activo', 'pausado')
+                    )
+                    """,
+                    f["tenant_id"],
+                    f["phone_number_id"],
                 )
         print(f"\n{len(filas)} línea(s) reparada(s).")
     finally:

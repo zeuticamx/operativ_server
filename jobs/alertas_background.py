@@ -23,6 +23,14 @@ from jobs.pagos_background import job_pausar_suscripciones_vencidas
 from jobs.pagos_background import JOB_ID as JOB_ID_PAGOS
 from jobs.gerencia_background import JOB_ID as JOB_ID_CONSUMO
 from jobs.gerencia_background import job_consumo_anomalo
+from jobs.numeros_background import JOB_ID_INTENTOS as JOB_ID_NUMEROS_INTENTOS
+from jobs.numeros_background import JOB_ID_REEVALUACION as JOB_ID_NUMEROS_REEVALUACION
+from jobs.numeros_background import JOB_ID_RETENCION as JOB_ID_NUMEROS_RETENCION
+from jobs.numeros_background import (
+    job_limpiar_intentos,
+    job_numeros_reevaluacion,
+    job_retencion_ocultas,
+)
 from jobs.perfil_background import JOB_ID as JOB_ID_PERFIL
 from jobs.perfil_background import job_recordatorio_perfil
 from jobs.recordatorios_cita_background import JOB_ID as JOB_ID_RECORDATORIOS_CITA
@@ -284,6 +292,35 @@ def iniciar_scheduler() -> AsyncIOScheduler:
         minutes=settings.TAREAS_VENCIDAS_INTERVALO_MINUTOS,
         id=JOB_ID_TAREAS,
         name="Marcar vencidas las tareas de seguimiento",
+        max_instances=1,
+        coalesce=True,
+    )
+    # Varios números de WhatsApp (spec 005a, jobs/numeros_background.py): cola de
+    # reevaluación del cupo y suscripciones vencidas (la primera pasada lanza el
+    # despliegue de una sola vez), limpieza de intentos y retención de 12 meses.
+    scheduler.add_job(
+        job_numeros_reevaluacion,
+        "interval",
+        minutes=settings.NUMEROS_REEVALUACION_INTERVALO_MINUTOS,
+        id=JOB_ID_NUMEROS_REEVALUACION,
+        name="Reevaluar el cupo de números de WhatsApp",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        job_limpiar_intentos,
+        "interval",
+        hours=1,
+        id=JOB_ID_NUMEROS_INTENTOS,
+        name="Limpiar intentos de alta ajena de números",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        job_retencion_ocultas,
+        CronTrigger(hour=settings.NUMEROS_RETENCION_HORA_UTC, minute=15),
+        id=JOB_ID_NUMEROS_RETENCION,
+        name="Retención de 12 meses de conversaciones ocultas",
         max_instances=1,
         coalesce=True,
     )

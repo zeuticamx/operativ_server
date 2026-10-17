@@ -199,11 +199,14 @@ async def listar(
     alcance: Alcance | None = None,
     asignada: str | None = None,
     yo: UUID | None = None,
+    numero_id: UUID | None = None,
 ):
     """
     Con `alcance` (rol acotado), solo lo suyo (_visible_acotado).
     `asignada`: 'mias' (requiere `yo`), 'sin_asignar' o el uuid (texto) de
     una persona; None = sin filtro.
+    `numero_id`: filtra por número (spec 005a, RF-13). Las conversaciones de
+    números desvinculados nunca salen acá: son las ocultas (RF-14).
     """
     return await fetch_all(
         f"""
@@ -233,6 +236,9 @@ async def listar(
         JOIN users u ON u.id = c.user_id
         LEFT JOIN portal_users pa ON pa.id = c.asignado_a
         WHERE c.tenant_id = $1
+          AND NOT EXISTS (SELECT 1 FROM agentes_canal ac_oc
+                          WHERE ac_oc.id = c.agente_canal_id AND ac_oc.estado = 'desvinculado')
+          AND ($12::uuid IS NULL OR c.agente_canal_id = $12::uuid)
           AND ($2::varchar IS NULL OR c.channel_type = $2)
           AND ($3::varchar IS NULL OR c.status = $3)
           AND (
@@ -261,6 +267,7 @@ async def listar(
         alcance.vendedor_id if alcance else None,
         asignada,
         yo,
+        numero_id,
     )
 
 
@@ -296,7 +303,7 @@ async def metricas(tenant_id: UUID):
 
 
 async def detalle(tenant_id: UUID, conversacion_id: UUID):
-    """None si no existe o no es de este tenant (404 lo decide el router)."""
+    """None si no existe, no es de este tenant o está oculta (RF-14: el 404 lo decide el router)."""
     cab = await fetch_one(
         f"""
         SELECT
@@ -316,6 +323,8 @@ async def detalle(tenant_id: UUID, conversacion_id: UUID):
         JOIN users u ON u.id = c.user_id
         LEFT JOIN portal_users pa ON pa.id = c.asignado_a
         WHERE c.id = $1 AND c.tenant_id = $2
+          AND NOT EXISTS (SELECT 1 FROM agentes_canal ac_oc
+                          WHERE ac_oc.id = c.agente_canal_id AND ac_oc.estado = 'desvinculado')
         """,
         conversacion_id,
         tenant_id,
@@ -351,10 +360,15 @@ async def _conversacion_para_escritura(tenant_id: UUID, conversacion_id: UUID):
     """
     fila = await fetch_one(
         """
-        SELECT c.id, c.status, c.channel_type, c.asignado_a,
-               u.whatsapp_id, u.instagram_id, u.facebook_id
+        SELECT c.id, c.status, c.channel_type, c.asignado_a, c.agente_canal_id,
+               u.whatsapp_id, u.instagram_id, u.facebook_id,
+               ac.estado AS numero_estado,
+               ac.phone_number_id AS numero_phone_number_id,
+               ac.agent_name AS numero_agent_name,
+               ac.system_prompt AS numero_system_prompt
         FROM conversations c
         JOIN users u ON u.id = c.user_id
+        LEFT JOIN agentes_canal ac ON ac.id = c.agente_canal_id
         WHERE c.id = $1 AND c.tenant_id = $2
         """,
         conversacion_id,
@@ -443,6 +457,29 @@ async def _preparar_envio(tenant_id: UUID, conversacion_id: UUID):
     """
     conv = await _conversacion_para_escritura(tenant_id, conversacion_id)
 
+    # Spec 005a RF-12: el número por el que entró manda, en este orden. Solo
+    # aplica a conversaciones con número (WhatsApp); Instagram, Facebook y el
+    # widget no tienen agente_canal_id y siguen como hoy.
+    if conv.get("agente_canal_id") is not None:
+        if conv.get("numero_estado") == "desvinculado":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"codigo": "numero_desvinculado", "mensaje": "El número ya no pertenece al negocio."},
+            )
+        if conv.get("numero_estado") == "pausado":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"codigo": "numero_no_activo", "mensaje": "El número está pausado."},
+            )
+        if not (conv.get("numero_system_prompt") or "").strip() or not (conv.get("numero_agent_name") or "").strip():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "codigo": "configuracion_incompleta",
+                    "mensaje": "El número tiene la configuración incompleta: falta el nombre del agente o sus instrucciones.",
+                },
+            )
+
     if conv["status"] != "transferred":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -472,6 +509,10 @@ async def _preparar_envio(tenant_id: UUID, conversacion_id: UUID):
             status_code=status.HTTP_409_CONFLICT,
             detail=f"El canal {canal} no está conectado",
         )
+    # Spec 005a RF-13: se responde con el número de la conversación, nunca con
+    # otro del negocio. La credencial es por negocio (P2); solo cambia el remitente.
+    if conv.get("agente_canal_id") is not None and conv.get("numero_phone_number_id"):
+        cred = {**dict(cred), "phone_number_id": conv["numero_phone_number_id"]}
     return canal, destinatario, cred
 
 

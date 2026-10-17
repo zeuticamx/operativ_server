@@ -337,3 +337,94 @@ async def test_vendedor_no_crea_leads_del_embudo(http_client, negocio):
         headers=_h(negocio["vendedor"]),
     )
     assert r.status_code == 403
+
+
+# ============================================================
+# Varios números de WhatsApp (spec 005a T5, RF-18)
+# ============================================================
+async def _vincular_numero(http_client, headers) -> str:
+    r = await http_client.post(
+        "/api/canales/whatsapp/conectar",
+        json={"phone_number_id": f"pn-{uuid4().hex[:10]}"},
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_member_lee_numeros_pero_no_los_configura(http_client, negocio):
+    h_owner, h_member = _h(negocio["owner"]), _h(negocio["member"])
+    nid = await _vincular_numero(http_client, h_owner)
+
+    assert (await http_client.get("/api/canales/whatsapp/numeros", headers=h_member)).status_code == 200
+
+    r = await http_client.get(f"/api/agente/numeros/{nid}", headers=h_member)
+    assert r.status_code == 200
+    assert "access_token" not in r.text
+
+    assert (
+        await http_client.put(
+            f"/api/agente/numeros/{nid}", json={"agent_name": "X"}, headers=h_member
+        )
+    ).status_code == 403
+    assert (
+        await http_client.put(
+            f"/api/herramientas/numeros/{nid}", json={"activar": []}, headers=h_member
+        )
+    ).status_code == 403
+    assert (
+        await http_client.get(f"/api/herramientas/numeros/{nid}", headers=h_member)
+    ).status_code == 200
+    assert (
+        await http_client.get("/api/herramientas/social", headers=h_member)
+    ).status_code == 200
+    assert (
+        await http_client.put("/api/herramientas/social", json={"activar": []}, headers=h_member)
+    ).status_code == 403
+    assert (
+        await http_client.get("/api/conversaciones/ocultas", headers=h_member)
+    ).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_vendedor_y_proveedor_no_ven_numeros_pero_conservan_lo_suyo(
+    http_client, negocio
+):
+    h_owner = _h(negocio["owner"])
+    nid = await _vincular_numero(http_client, h_owner)
+
+    uid_prov = uuid4()
+    await execute(
+        """
+        INSERT INTO portal_users (id, tenant_id, email, password_hash, role, is_active)
+        VALUES ($1, $2, $3, $4, 'proveedor', true)
+        """,
+        uid_prov,
+        negocio["tid"],
+        f"proveedor-{uid_prov}@ejemplo.com",
+        hash_password("test_password"),
+    )
+    await execute(
+        "INSERT INTO proveedores (tenant_id, portal_user_id, nombre) VALUES ($1, $2, 'Alex')",
+        negocio["tid"],
+        uid_prov,
+    )
+    headers_acotados = [
+        _h(negocio["vendedor"]),
+        {"Authorization": f"Bearer {crear_access_token(uid_prov, negocio['tid'], 'proveedor')}"},
+    ]
+    for headers in headers_acotados:
+        assert (
+            await http_client.get("/api/canales/whatsapp/numeros", headers=headers)
+        ).status_code == 403
+        assert (
+            await http_client.get(f"/api/agente/numeros/{nid}", headers=headers)
+        ).status_code == 403
+        assert (
+            await http_client.get(f"/api/conversaciones?numero_id={nid}", headers=headers)
+        ).status_code == 403
+        # En la lista normal conservan lo suyo (acceso 200, aunque sea vacía).
+        assert (
+            await http_client.get("/api/conversaciones", headers=headers)
+        ).status_code == 200

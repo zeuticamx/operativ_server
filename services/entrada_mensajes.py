@@ -1,13 +1,16 @@
 """
-Proxy de mensajes entrantes de WhatsApp (NeuroAPI) hacia n8n.
+Proxy de mensajes entrantes de WhatsApp (NeuroAPI) hacia n8n o hacia el
+agente en código, según `AGENTE_EN_CODIGO`.
 
 NeuroAPI manda a la misma `webhook_url` de la Connect Session tanto el alta
 de la cuenta como los mensajes posteriores. El backend valida la firma una
 sola vez (routers/canales_neuroapi_webhook.py), identifica de qué tenant es
-el número receptor y reenvía el cuerpo *intacto* al flujo que le toca. n8n
-recibe exactamente el mismo JSON que mandaría NeuroAPI, más cabeceras con lo
-que el backend ya resolvió, y se autentica por X-Internal-Token en vez de
-recalcular el HMAC.
+el número receptor y reenvía el cuerpo *intacto* al flujo que le toca. El
+destino recibe exactamente el mismo JSON que mandaría NeuroAPI, más cabeceras
+con lo que el backend ya resolvió, y se autentica por X-Internal-Token en vez
+de recalcular el HMAC — n8n en `/webhook/entrada-canal-universal`, el agente
+en código en `/api/canales/entrada` (routers/agente_webhook.py), que valida
+esa misma cabecera.
 
 Sin SDK, con httpx directo, igual que el resto de integraciones.
 """
@@ -75,18 +78,13 @@ def extraer_phone_number_id(evento: dict[str, Any]) -> str | None:
 
 async def tenant_por_numero(phone_number_id: str) -> UUID | None:
     """
-    Tenant dueño de la línea. Solo atribuye el mensaje: si el agente contesta
-    o no lo sigue decidiendo n8n, así que aquí no se mira tenant_channels.
+    Tenant dueño de la línea (spec 005a RF-16, T6): el número vinculado
+    (activo o pausado) y, si se desvinculó, el último dueño (sus mensajes van
+    a las ocultas de ese negocio, sin respuesta). Solo atribuye el mensaje:
+    si el agente contesta o no lo decide el agente (T7).
     """
     fila = await fetch_one(
-        """
-        SELECT tenant_id
-          FROM channel_credentials
-         WHERE channel_type = 'whatsapp'
-           AND phone_number_id = $1
-           AND is_active = true
-         LIMIT 1
-        """,
+        "SELECT tenant_id FROM resuelve_numero($1) LIMIT 1",
         phone_number_id,
     )
     return fila["tenant_id"] if fila else None
@@ -96,10 +94,19 @@ def destino_para(tenant_id: UUID) -> str:
     """
     URL a la que se reenvían los mensajes de este tenant.
 
-    Hoy todos van al webhook `entrada-canal-universal` de n8n. Este es el
-    punto donde se enrutaría por tenant (otra cola, otro agente) sin tocar el
+    Con `AGENTE_EN_CODIGO` encendida va al propio backend
+    (routers/agente_webhook.py), que es quien a partir de ahí atiende el
+    mensaje; apagada, sigue yendo al webhook `entrada-canal-universal` de
+    n8n, que es el destino real mientras dure la migración. La decisión es
+    global y no por tenant: `AGENTE_EN_CODIGO` es una bandera de proceso, no
+    de negocio — ver el docstring de `services/agente/__init__.py`.
+
+    `tenant_id` no entra en la decisión hoy; queda en la firma para el día
+    que haga falta enrutar por tenant (otra cola, otro agente) sin tocar el
     router ni la validación de la firma.
     """
+    if settings.AGENTE_EN_CODIGO:
+        return f"{settings.BASE_URL_BACKEND}/api/canales/entrada"
     return settings.N8N_WEBHOOK_ENTRADA_URL
 
 

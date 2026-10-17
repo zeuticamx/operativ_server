@@ -94,11 +94,65 @@ class Settings:
     # Vacío = esos mensajes se responden 503 y NeuroAPI los reintenta.
     N8N_WEBHOOK_ENTRADA_URL: str = os.getenv("N8N_WEBHOOK_ENTRADA_URL", "")
 
+    # ---- Agente de IA en código (migración desde n8n) ----
+    # Interruptor del traslado. Apagada (default): el webhook propio
+    # (/api/canales/entrada) responde 503 y los mensajes de NeuroAPI se
+    # siguen reenviando a n8n como hasta ahora. Encendida: los atiende
+    # services/agente/ y n8n deja de recibirlos.
+    #
+    # Nunca deben estar los dos atendiendo el mismo tráfico: el cliente
+    # recibiría cada respuesta dos veces. Por eso el default es apagado y el
+    # endpoint falla cerrado en vez de abrirse solo.
+    AGENTE_EN_CODIGO: bool = os.getenv("AGENTE_EN_CODIGO", "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "si",
+        "sí",
+    )
+    # Clave de la API de Anthropic para el agente. Sin esto el bucle del
+    # modelo no arranca (el resto del flujo sí: guardar el mensaje, avisar
+    # al vendedor, escalar a humano).
+    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+    # Tope de tokens de salida por llamada al modelo. Cuenta el razonamiento
+    # además del texto visible: en los modelos actuales el pensamiento viene
+    # activado por defecto, así que un tope ajustado a la respuesta corta la
+    # contestación a media frase. Una respuesta de chat usa unos cientos.
+    AGENTE_MAX_TOKENS: int = int(os.getenv("AGENTE_MAX_TOKENS", "8192"))
+    # Dominios a los que puede llamar una herramienta `http_generico` o
+    # `http_post_json` del tenant. Vacío = ninguna llamada externa.
+    #
+    # `url_template` la configura el dueño del negocio y la petición sale de
+    # la red del servidor, así que sin lista servía para alcanzar servicios
+    # internos (hallazgo 5 de la auditoría). Se aceptan subdominios: con
+    # "ejemplo.com" pasa "api.ejemplo.com". Además se rechaza todo host que
+    # resuelva a una IP privada, aunque su dominio esté en la lista.
+    AGENTE_DOMINIOS_PERMITIDOS: tuple[str, ...] = tuple(
+        d.strip().lower()
+        for d in os.getenv("AGENTE_DOMINIOS_PERMITIDOS", "").split(",")
+        if d.strip()
+    )
+    # Cuánto se espera antes de contestar, para juntar los mensajes sueltos
+    # de una ráfaga ("hola" / "una pregunta" / "sobre un corte") en una sola
+    # respuesta. Mismo valor que tenía el nodo Wait de n8n.
+    AGENTE_ANTIFLOOD_SEGUNDOS: float = float(os.getenv("AGENTE_ANTIFLOOD_SEGUNDOS", "5"))
+    # Acepta `dominio_permitido = '*'` en el widget. Es una puerta abierta a
+    # cualquier sitio y venía de una prueba de desarrollo (hallazgo 9 de la
+    # auditoría del 15/10/2026): en producción se deja apagada y cada tenant
+    # registra su dominio real.
+    WIDGET_COMODIN_PERMITIDO: bool = os.getenv(
+        "WIDGET_COMODIN_PERMITIDO", "false"
+    ).strip().lower() in ("1", "true", "yes", "si", "sí")
+
     # ---- Meta ----
     META_APP_ID: str = os.getenv("META_APP_ID", "")
     META_APP_SECRET: str = os.getenv("META_APP_SECRET", "")
     META_API_VERSION: str = os.getenv("META_API_VERSION", "v26.0")
     META_REDIRECT_URI: str = os.getenv("META_REDIRECT_URI", "")
+    # Token del handshake de suscripción del webhook (`hub.verify_token`).
+    # Sin valor, el handshake se rechaza: en n8n había uno de respaldo
+    # escrito en el propio workflow (hallazgo 6 de la auditoría).
+    META_VERIFY_TOKEN: str = os.getenv("META_VERIFY_TOKEN", "")
 
     # ---- WhatsApp (envío de mensajes, ver services/whatsapp.py) ----
     # Proveedor activo detrás de ProveedorWhatsApp: "kontesta" | "neuroapi" |
@@ -211,6 +265,15 @@ class Settings:
     TAREAS_VENCIDAS_INTERVALO_MINUTOS: int = int(
         os.getenv("TAREAS_VENCIDAS_INTERVALO_MINUTOS", "15")
     )
+
+    # Varios números de WhatsApp (spec 005a, jobs/numeros_background.py): cada
+    # cuántos minutos se drena la cola de reevaluación del cupo y se revisan las
+    # suscripciones vencidas; hora UTC de la retención de 12 meses de las
+    # conversaciones ocultas. La limpieza de intentos de alta ajena es horaria.
+    NUMEROS_REEVALUACION_INTERVALO_MINUTOS: int = int(
+        os.getenv("NUMEROS_REEVALUACION_INTERVALO_MINUTOS", "1")
+    )
+    NUMEROS_RETENCION_HORA_UTC: int = int(os.getenv("NUMEROS_RETENCION_HORA_UTC", "3"))
 
     # ---- Reportes de incidencias (services/reportes.py) ----
     # Tope por usuario y hora: un formulario abierto a todos los roles no
@@ -570,12 +633,46 @@ class Settings:
                 "completará."
             )
 
-        if not self.N8N_WEBHOOK_ENTRADA_URL:
+        # Con el agente ya en código, n8n deja de recibir mensajes y esta
+        # variable no hace falta. Solo se avisa mientras siga siendo el
+        # destino real.
+        if not self.AGENTE_EN_CODIGO and not self.N8N_WEBHOOK_ENTRADA_URL:
             logging.getLogger("operativai.config").warning(
                 "N8N_WEBHOOK_ENTRADA_URL sin configurar: los mensajes de "
                 "WhatsApp que lleguen por NeuroAPI se van a responder 503 y "
                 "no llegarán a n8n."
             )
+
+        # El agente en código atiende el mismo tráfico que n8n: si está
+        # encendido a medias, los clientes se quedan sin respuesta (o la
+        # reciben dos veces si además n8n sigue suscrito al webhook).
+        if self.AGENTE_EN_CODIGO:
+            log_agente = logging.getLogger("operativai.config")
+            if not self.ANTHROPIC_API_KEY:
+                log_agente.warning(
+                    "AGENTE_EN_CODIGO está encendida pero falta ANTHROPIC_API_KEY: "
+                    "el agente no va a poder responder."
+                )
+            if not self.META_VERIFY_TOKEN:
+                log_agente.warning(
+                    "AGENTE_EN_CODIGO está encendida pero falta META_VERIFY_TOKEN: "
+                    "no se podrá (re)suscribir el webhook en Meta."
+                )
+            if not self.N8N_INTERNAL_TOKEN:
+                log_agente.warning(
+                    "AGENTE_EN_CODIGO está encendida pero falta N8N_INTERNAL_TOKEN: "
+                    "WhatsApp por NeuroAPI no llegará al agente (el proxy interno "
+                    "de services/entrada_mensajes.py no puede autenticarse contra "
+                    "/api/canales/entrada) y esos mensajes se rechazarán con 403. "
+                    "Meta directo, Instagram, Facebook y el widget no dependen de "
+                    "esto."
+                )
+            if self.WIDGET_COMODIN_PERMITIDO:
+                log_agente.warning(
+                    "WIDGET_COMODIN_PERMITIDO está encendida: un tenant con "
+                    "dominio_permitido='*' acepta su widget desde cualquier sitio. "
+                    "Apágala en producción."
+                )
 
         # Tampoco se exige: el alta y el login con correo siguen funcionando
         # sin esto. Pero si falta, POST /auth/google responde 503 y el botón

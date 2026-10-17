@@ -122,7 +122,7 @@ surte efecto en su siguiente llamada.
 |---|---|---|---|
 | `owner` | `/auth/registro` (o Google) | Todo el negocio | Todo |
 | `superadmin` | a mano | Todo el negocio | Todo |
-| `member` ("colaborador") | invitación | Conversaciones, embudo, agenda, métricas | Nada (agente, canales, herramientas, equipo, pagos) |
+| `member` ("colaborador") | invitación | Conversaciones, embudo, agenda, métricas y la configuración de los números de WhatsApp (agente y herramientas por número), sin credenciales de herramientas | Nada (agente, canales, herramientas, equipo, pagos): si intenta editar, 403 |
 | `vendedor` | invitación ligada a su ficha | **Solo lo suyo**: su ficha, sus leads, su cartera de campo y las conversaciones que le asignaron (o de sus leads sin dueño) | Nada |
 | `proveedor` | invitación ligada a su ficha del calendario | **Solo lo suyo**: su agenda y las conversaciones que le asignaron (o de sus clientes sin dueño) | Sus descansos y días libres |
 
@@ -481,8 +481,9 @@ GET    /api/canales                  Canales conectados
 POST   /api/canales/meta/conectar    code → user token de larga duración
 GET    /api/canales/meta/paginas     Páginas que el usuario autorizó
 POST   /api/canales/meta/activar     Guarda tokens + suscribe webhooks
-POST   /api/canales/whatsapp/conectar  Registra la línea de Kontesta del tenant
-DELETE /api/canales/{tipo}           Desconecta
+POST   /api/canales/whatsapp/conectar  Registra la línea de Kontesta del tenant (un número más; sujeto al cupo del plan)
+DELETE /api/canales/{tipo}           Desconecta (Meta). Para WhatsApp, `DELETE /api/canales/whatsapp` responde 409 `usar_numeros`:
+                                     se desvincula número a número (ver "Varios números de WhatsApp por negocio")
 ```
 
 ### Agente
@@ -1542,8 +1543,10 @@ seed solo corre si nadie tocó el plan (`updated_at = created_at`).
    `modelos_permitidos` / `historial_maximo`). Sin modelo elegido, y con el
    plan limitando modelos, guarda el por defecto del plan (`model = NULL`
    dejaría a n8n usar el suyo, que puede no estar en el plan).
-2. **Triggers** — n8n lee `tenant_agent_config` directo, sin pasar por el
-   backend, así que la fila tiene que *estar* siempre dentro del plan.
+2. **Triggers** — el agente de la plataforma lee la configuración directo de
+   la base (`agentes_canal` por número y `tenant_agent_config` para Instagram,
+   Facebook y el widget), sin pasar por la API, así que las filas tienen que
+   *estar* siempre dentro del plan.
    `recortar_agente_a_plan(tenant)` baja el modelo (al por defecto del plan, si
    el actual no cabe o es `NULL`) y el historial (`LEAST`), nunca sube nada, y
    la disparan: alta o cambio de plan en `tenant_subscriptions`, un cambio de
@@ -1551,9 +1554,22 @@ seed solo corre si nadie tocó el plan (`updated_at = created_at`).
    `planes`. Así cubre Stripe, piloto, onboarding, el panel y SQL a mano sin
    acordarse de llamarlo en cada uno.
 
-El piloto (`prueba`) y un negocio sin suscripción **no tienen topes**, igual
-que `acceso_plan` (el piloto tiene todo abierto). Un plan `pausada`/`cancelada`
-conserva sus topes.
+**Qué plan aplica (spec 005a, sustituye a "el piloto y un negocio sin
+suscripción no tienen topes").** Se evalúa en este orden y gana el primero:
+
+| Situación | Límites de modelo/historial, lista de herramientas y cupo de números |
+|---|---|
+| Prueba vigente (cualquier suscripción de origen `prueba` que no terminó, incluida la de 14 días del cuestionario y el piloto sin fecha de fin; una prueba pausada o cancelada no es vigente) | Los del plan asociado a la prueba; si no tiene plan, sin límites y catálogo base completo. **Nunca tope de números** |
+| Suscripción vigente (`activa` de pago, y el periodo pagado de una cancelada hasta su fin) | Los de su plan, aunque el plan esté desactivado en el catálogo |
+| Sin suscripción vigente (vencida, pausada, prueba terminada sin pagar, o nunca contrató) | Los del **plan más bajo activo**: menor `precio_monthly`; empate: menor cupo (sin tope cuenta como mayor); luego menor id |
+| Ningún plan activo | Sin topes ni límites y catálogo base completo; queda en `gerencia_auditoria` (`plan_sin_tope_por_falta_de_plan_activo`) |
+
+Antes de la spec 005a un negocio sin suscripción y el piloto quedaban sin
+topes; ahora el primero se recorta al plan más bajo activo, y una prueba con
+plan asociado usa los límites de ese plan. Recortar nunca sube un valor; un
+modelo retirado pasa al modelo por defecto del plan y eso no deja el número
+incompleto. Lo implementa `limites_efectivos` (SQL) con paridad probada contra
+el núcleo puro `services/numeros_reglas.py`.
 
 `GET /gerencia/planes/modelos-agente` da el catálogo y el rango al formulario
 del panel. En `PATCH /gerencia/planes/{nombre}`: `null` = no tocar,
@@ -1566,6 +1582,93 @@ Aplicar la migración **recorta de una vez** a los negocios existentes con
 
 Tests: `tests/test_limites_agente.py` y el portal en
 `app/(privado)/agente/__tests__/limites-plan.test.tsx`.
+
+### Varios números de WhatsApp por negocio (spec 005a, `sql/56` a `sql/59`)
+
+Estado: documentado en la tarea T0, antes del código. Hasta que se apliquen las
+migraciones y las tareas T1 a T9 de `specs/005a-varios-numeros-whatsapp/tasks.md`,
+el comportamiento real sigue siendo un número por negocio.
+
+Un negocio vincula varios números de WhatsApp. Cada uno tiene su configuración
+de agente (nombre, system prompt, modelo, temperatura, ventana de historial y
+agente encendido o apagado) y su lista de herramientas. **La plataforma decide
+por número si el agente responde** (principio 2.5): responde si el número está
+activo, el agente encendido y la configuración completa (system prompt no vacío
+ni solo espacios, y nombre de agente), con la configuración y las herramientas
+de ese número y nunca las de otro.
+
+| Concepto | Regla |
+|---|---|
+| Tabla | `agentes_canal`: una fila por número, estado `activo`/`pausado`/`desvinculado`, marcas `es_principal` y `es_linea_avisos`. `phone_number_id` vinculado en un solo negocio. Instagram, Facebook y el widget siguen en `tenant_agent_config` + `social_herramientas`, fuera del cupo |
+| Cupo | `planes.max_numeros_whatsapp` (NULL = sin tope, `0` en el panel lo quita, entero >= 1 lo fija; negativo o no entero = 400 `cupo_no_valido`). Plazas = números activos, salvo la línea de avisos. Lo edita cualquier cuenta de `gerencia_users`, sea cual sea su cargo; la gerencia del negocio recibe 403 |
+| Herramientas por plan | `plan_herramientas`, por familia: `calendario`, `sql_lectura`, `http`, `google_sheets`, `google_docs`. Los flags `herramientas_activo` y `calendario_activo` pasan a derivarse de la lista |
+| Principal | Número activo con configuración completa que sirve de fuente de copia para los nuevos. Lo elige la gerencia del negocio; si no hay, pasa a serlo el activo completo más antiguo (desempate: menor id). Nunca es la línea de avisos ni uno incompleto |
+| Pausa por cupo | Si los activos superan el cupo se pausan, sin borrar, los más recientes primero (el principal también). Reactivar es siempre manual y sujeto al cupo; subir el cupo no reactiva nada |
+| Línea de avisos | La línea de `AVISOS_CUENTA_GLOBAL_TENANT_ID` (spec 004) es un número vinculado de ese negocio, marcado; no cuenta para el cupo ni puede ser principal. La gerencia del negocio no puede pausarla, desvincularla ni elegirla principal (403) |
+| Mensajes que no se responden | Número pausado, con agente apagado o incompleto: el mensaje se guarda sin respuesta y, al volver a responder, no se contesta a los anteriores. Número sin vincular: no se atribuye a ningún negocio |
+| Desvincular | Libera la plaza. Las conversaciones quedan ocultas, asignadas al owner que creó el negocio (o su relevo), legibles en solo lectura por owner y superadmin; nadie las responde. Se conservan 12 meses. Un número revinculado no recupera las anteriores |
+| Bitácoras | Negocio: `numeros_bitacora` (motivo, número y autor). Plataforma: `gerencia_auditoria` (`cupo_cambiado`, `precio_del_plan_cambiado`, `herramientas_del_plan_cambiadas`, `plan_sin_tope_por_falta_de_plan_activo`, `alta_ajena_rechazada`, `altas_bloqueadas`) |
+
+**Alta, en este orden (el primero que aplica decide):** 429
+`demasiados_intentos` (5 altas ajenas rechazadas en 24 h, ventana deslizante;
+con la hora de liberación, también en `Retry-After`) -> 402
+`cupo_numeros_whatsapp` (cupo lleno, sea cual sea el número) -> 409
+`numero_ya_vinculado` (propio, activo o pausado) -> 404 `numero_no_encontrado`
+(vinculado a otro negocio; cuenta para el bloqueo) -> alta libre como activo.
+El 404 de alta ajena revela que el número está tomado: riesgo residual aceptado
+(D13 de la spec, tensión abierta con la constitución 3.4).
+
+**Endpoints** (guarda: `negocio_actual` = owner, superadmin y member;
+`gerencia_actual` = owner y superadmin):
+
+| Ruta | Guarda | Respuestas |
+|---|---|---|
+| `GET /api/canales/whatsapp/numeros` | `negocio_actual` | 200 con `numeros[]`, `tope`, `plazas_usadas`, `plazas_libres`; 403 vendedor y proveedor |
+| `POST /api/canales/whatsapp/conectar` (Kontesta) | `gerencia_actual` | 201; 429, 402, 409, 404 como el orden del alta |
+| `POST /api/canales/whatsapp/neuroapi/iniciar` | `gerencia_actual` | Comprueba 429 y 402 antes de abrir la sesión; el resultado del webhook en `GET .../neuroapi/estado` |
+| `POST /api/canales/whatsapp/numeros/{id}/pausar` | `gerencia_actual` | 200 (`pausa_manual`, sin aviso; se permite pausar el último); 403 línea de avisos; 404 |
+| `POST /api/canales/whatsapp/numeros/{id}/reactivar` | `gerencia_actual` | 200; 402 `cupo_numeros_whatsapp`; 404 |
+| `DELETE /api/canales/whatsapp/numeros/{id}` | `gerencia_actual` | 204; 403 línea de avisos; 404 |
+| `PUT /api/canales/whatsapp/principal` | `gerencia_actual` | 200; 409 `numero_no_activo`; 409 `configuracion_incompleta`; 403 línea de avisos; 404 |
+| `DELETE /api/canales/whatsapp` | `gerencia_actual` | 409 `usar_numeros` |
+| `GET/PUT /api/agente/numeros/{id}` | lectura `negocio_actual`, escritura `gerencia_actual` | 400 `temperatura_fuera_de_rango` (0 y 1 se aceptan); 402 `modelo_no_incluido_en_plan` / `historial_excede_plan`; 404; member lee sin credenciales y no edita (403) |
+| `GET/PUT /api/herramientas/numeros/{id}` y `/api/herramientas/social` | lectura `negocio_actual`, escritura `gerencia_actual` | 402 `herramienta_no_incluida_en_plan`; 404 |
+| `GET /api/conversaciones/ocultas[/{id}]` | `gerencia_actual` | Solo lectura; 404 si no es del negocio |
+| `POST /api/conversaciones/{id}/mensajes` | como hoy | Añade 409 `numero_desvinculado`, `numero_no_activo`, `configuracion_incompleta` (en ese orden; con agente apagado la respuesta humana se permite) |
+| `POST/PATCH /api/gerencia/planes` | `gerencia_plataforma_actual` | Añade `max_numeros_whatsapp` y `herramientas_plan`; 400 `cupo_no_valido` |
+
+Códigos 403: sin código propio para rol sin permiso o sesión de soporte sin
+concesión; `linea_avisos_gestionada_por_plataforma` para la línea de avisos.
+Precedencia: primero el permiso del rol y del tipo de acción (403), después la
+pertenencia (404, idéntico para número ajeno, ajeno pausado e inexistente).
+
+**Sesiones de soporte ("ver como").** Pueden leer la configuración de los
+números sin concesión. Con concesión editan la configuración de agente, las
+herramientas y la de Instagram y Facebook (con auditoría), pero no vinculan,
+pausan, reactivan, desvinculan ni cambian el principal (`/api/canales` sigue en
+`RUTAS_SENSIBLES`) ni editan credenciales de herramientas
+(`RUTAS_CREDENCIALES_CERRADAS`, restricción nueva).
+
+**Reevaluación del cupo (RF-11).** Siete casos: cambio de plan a menos cupo,
+fin de suscripción por cancelación o vencimiento (al terminar el periodo
+pagado; una suscripción o prueba pausada o cancelada, en el acto), prueba
+terminada sin pago, cambio del cupo del plan contratado, recálculo continuo
+cuando cambia el plan más bajo activo (para los negocios sin suscripción
+vigente), prueba que pasa a pago (`pausa_por_pago_de_prueba`) y despliegue
+(`pausa_por_despliegue`, solo si el plan más bajo activo tiene tope). Cada
+pausa avisa una vez a owner y superadmin (portal y correo, agrupado), salvo la
+pausa manual y la desvinculación pedida. Los negocios suspendidos o de baja no
+se reevalúan hasta reactivarse. Un job (`jobs/numeros_background.py`) drena la
+cola de reevaluación y aplica la retención de 12 meses.
+
+**Al desplegar:** un número existente con configuración completa pasa a
+principal sin cambios; uno sin configuración completa deja de responder y avisa;
+los planes existentes arrancan sin tope; las pruebas con plan asociado pasan a
+usar sus límites y su lista de herramientas.
+
+Tests (cuando se implementen): `tests/test_numeros_reglas.py` (puro),
+`test_numeros_sql.py`, `test_numeros_servicio.py`, `test_numeros_planes.py`,
+`test_numeros_endpoints.py`, `test_agente_numeros.py`, `test_numeros_jobs.py`.
 
 ### Ver como el negocio (impersonación)
 
@@ -1604,7 +1707,8 @@ idempotente (una ya resuelta o vencida devuelve su estado, sin efecto); un id
 de otro negocio es 404. La concesión se relee de BD en cada petición, no viaja
 en el token: revocar o vencerse cierra la escritura en la siguiente llamada.
 Con concesión siguen cerradas las rutas de `services.acceso_soporte.RUTAS_SENSIBLES`
-(contraseña, equipo, pagos, credenciales de canales, perfil, borrar cuenta) y cada
+(contraseña, equipo, pagos, credenciales de canales, perfil, onboarding, borrar cuenta), y
+las credenciales de herramientas (`RUTAS_CREDENCIALES_CERRADAS`, spec 005a), y cada
 escritura queda en `gerencia_auditoria` (`impersonacion_escritura`, más las acciones
 `acceso_escritura_*`). Tests: `tests/test_acceso_soporte.py`.
 
@@ -1921,6 +2025,12 @@ Se puede desarrollar y probar todo hoy con las páginas propias.
   `X-Tenant-Id`, `X-Canal`, `X-Proveedor` y `X-Internal-Token`. Si n8n no lo
   recibe responde 502/503 para que NeuroAPI reintente. El enrutamiento por
   tenant a otro destino se agrega en `entrada_mensajes.destino_para`.
+- **Varios números (spec 005a)**: el alta y la atribución del mensaje pasan a la
+  tabla `agentes_canal` (índice único parcial por `phone_number_id` vinculado, que
+  cierra la carrera del alta pendiente arriba) y la plataforma responde por número;
+  `channel_credentials` queda como credencial por negocio. Los puntos de abajo sobre
+  n8n describen el flujo anterior y quedan obsoletos para WhatsApp cuando se
+  implemente la spec (ver "Varios números de WhatsApp por negocio").
 - **Respuestas por NeuroAPI**: las manda n8n, no el backend. Al vincular, el
   backend guarda la línea con `set_whatsapp_neuroapi`
   (`sql/30_whatsapp_neuroapi_credenciales.sql`): `bsp_provider='neuroapi'` y

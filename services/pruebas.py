@@ -32,7 +32,7 @@ from uuid import UUID, uuid4
 from fastapi import HTTPException, status
 
 from schemas import OtorgarPruebaIn, UnidadDuracionPrueba
-from services import herramientas_calendario
+from services import herramientas_calendario, numeros_reevaluacion
 from services.creditos import cargar_creditos_plan, expirar_creditos_plan
 from services.gerencia import registrar_auditoria
 from session import transaccion
@@ -256,6 +256,10 @@ async def otorgar_prueba(
     if plan["calendario_activo"]:
         await herramientas_calendario.sincronizar(tenant_id, True)
 
+    # Spec 005a: la prueba trae los límites y la lista de herramientas de su plan
+    # (RF-10, RF-9) y sin tope de números. Tras confirmar; nunca propaga un error.
+    await numeros_reevaluacion.reevaluar_tras_cambio(tenant_id, "cambio_de_plan")
+
     return expiracion
 
 
@@ -319,3 +323,7 @@ async def revocar_prueba(
             },
             conn=conn,
         )
+
+    # Spec 005a, RF-11 caso 3: una prueba cancelada se reevalúa en el acto, en la
+    # misma petición, sin esperar al trabajo periódico (que queda de red de seguridad).
+    await numeros_reevaluacion.reevaluar_tras_cambio(tenant_id, "fin_de_prueba", forzar=True)

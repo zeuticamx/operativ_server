@@ -58,12 +58,67 @@ _COLUMNAS = """
     agente_ia_activo, gestion_vendedores_activo,
     herramientas_activo, crm_campo_activo, calendario_activo, activo, orden,
     stripe_price_id, modelos_permitidos, historial_maximo,
+    max_numeros_whatsapp,
     created_at AS creado_en, updated_at AS actualizado_en
 """
 
+# Familias del catálogo base de herramientas del agente (P5, sql/57).
+_FAMILIAS_BASE = ("calendario", "sql_lectura", "http", "google_sheets", "google_docs")
+_OTRAS_FAMILIAS = ("sql_lectura", "http", "google_sheets", "google_docs")
 
-def _out(f) -> PlanGerenciaOut:
-    return PlanGerenciaOut(**dict(f))
+
+def _cupo_no_valido() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={
+            "codigo": "cupo_no_valido",
+            "mensaje": "El cupo va en números enteros: null no cambia, 0 quita el tope y un entero mayor o igual que 1 lo fija.",
+        },
+    )
+
+
+def _normalizar_cupo(valor: int | float | None) -> int | None:
+    """None = sin tope; 0 = sin tope; entero >= 1 = tope. El resto es 400."""
+    if valor is None:
+        return None
+    if isinstance(valor, bool):
+        raise _cupo_no_valido()
+    if isinstance(valor, int):
+        entero = valor
+    elif isinstance(valor, float):
+        if not valor.is_integer():
+            raise _cupo_no_valido()
+        entero = int(valor)
+    else:
+        raise _cupo_no_valido()
+    if entero == 0:
+        return None
+    if entero >= 1:
+        return entero
+    raise _cupo_no_valido()
+
+
+def _lista_desde_flags(herramientas_activo: bool, calendario_activo: bool) -> list[str]:
+    lista = [f for f in _FAMILIAS_BASE if (f == "calendario" and calendario_activo) or (f != "calendario" and herramientas_activo)]
+    return lista
+
+
+def _flags_desde_lista(lista: list[str]) -> tuple[bool, bool]:
+    conjunto = set(lista)
+    return (any(f in conjunto for f in _OTRAS_FAMILIAS), "calendario" in conjunto)
+
+
+async def _leer_herramientas(conn, nombre: str) -> list[str]:
+    filas = await conn.fetch(
+        "SELECT familia FROM plan_herramientas WHERE plan_nombre = $1 ORDER BY familia", nombre
+    )
+    return [f["familia"] for f in filas]
+
+
+def _out(f, herramientas: list[str] | None = None) -> PlanGerenciaOut:
+    datos = dict(f)
+    datos["herramientas_plan"] = sorted(herramientas) if herramientas is not None else []
+    return PlanGerenciaOut(**datos)
 
 
 @router.get("", response_model=list[PlanGerenciaOut])
@@ -74,8 +129,14 @@ async def listar_planes():
     hoy. Gerencia necesita ver los apagados también, para poder
     reactivarlos o confirmar que de verdad están fuera.
     """
+    from session import fetch_all as _fetch_all
+
     filas = await fetch_all(f"SELECT {_COLUMNAS} FROM planes ORDER BY orden, precio_monthly")
-    return [_out(f) for f in filas]
+    listas = await _fetch_all("SELECT plan_nombre, familia FROM plan_herramientas ORDER BY familia")
+    por_plan: dict[str, list[str]] = {}
+    for r in listas:
+        por_plan.setdefault(r["plan_nombre"], []).append(r["familia"])
+    return [_out(f, por_plan.get(dict(f)["nombre"], [])) for f in filas]
 
 
 @router.get("/modelos-agente")
@@ -91,11 +152,25 @@ async def modelos_agente():
     }
 
 
+@router.get("/familias-herramientas")
+async def familias_herramientas():
+    """Catálogo base de familias de herramientas del agente (P5), para el panel."""
+    return {"familias": list(_FAMILIAS_BASE)}
+
+
 @router.post("", response_model=PlanGerenciaOut, status_code=status.HTTP_201_CREATED)
 async def crear_plan(
     datos: PlanCrearIn,
     gerente: UsuarioActual = Depends(gerencia_plataforma_actual),
 ):
+    cupo = _normalizar_cupo(datos.max_numeros_whatsapp)
+    if datos.herramientas_plan is None:
+        lista = _lista_desde_flags(datos.herramientas_activo, datos.calendario_activo)
+        herramientas_activo = datos.herramientas_activo
+        calendario_activo = datos.calendario_activo
+    else:
+        lista = sorted(set(datos.herramientas_plan))
+        herramientas_activo, calendario_activo = _flags_desde_lista(lista)
     async with transaccion() as conn:
         try:
             await conn.execute(
@@ -106,9 +181,9 @@ async def crear_plan(
                      agente_ia_activo, gestion_vendedores_activo,
                      herramientas_activo, crm_campo_activo, calendario_activo,
                      activo, orden, stripe_price_id, max_proveedores,
-                     modelos_permitidos, historial_maximo)
+                     modelos_permitidos, historial_maximo, max_numeros_whatsapp)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                        $17, $18)
+                        $17, $18, $19)
                 """,
                 datos.nombre,
                 datos.descripcion,
@@ -119,20 +194,28 @@ async def crear_plan(
                 datos.creditos_incluidos_mensual,
                 datos.agente_ia_activo,
                 datos.gestion_vendedores_activo,
-                datos.herramientas_activo,
+                herramientas_activo,
                 datos.crm_campo_activo,
-                datos.calendario_activo,
+                calendario_activo,
                 datos.activo,
                 datos.orden,
                 datos.stripe_price_id,
                 datos.max_proveedores,
                 datos.modelos_permitidos,
                 datos.historial_maximo,
+                cupo,
             )
         except asyncpg.UniqueViolationError:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Ya existe un plan con ese nombre",
+            )
+
+        for familia in lista:
+            await conn.execute(
+                "INSERT INTO plan_herramientas (plan_nombre, familia) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                datos.nombre,
+                familia,
             )
 
         await registrar_auditoria(
@@ -144,13 +227,15 @@ async def crear_plan(
                 "nombre": datos.nombre,
                 "precio_monthly": str(datos.precio_monthly),
                 "activo": datos.activo,
+                "max_numeros_whatsapp": cupo,
+                "herramientas_plan": lista,
             },
             conn=conn,
         )
 
         fila = await conn.fetchrow(f"SELECT {_COLUMNAS} FROM planes WHERE nombre = $1", datos.nombre)
 
-    return _out(fila)
+    return _out(fila, lista)
 
 
 @router.patch("/{nombre}", response_model=PlanGerenciaOut)
@@ -173,6 +258,28 @@ async def actualizar_plan(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Plan no encontrado",
             )
+        lista_anterior = await _leer_herramientas(conn, nombre)
+        # El cupo se valida antes de tocar nada: un 400 no cambia el plan.
+        nuevo_cupo = (
+            anterior["max_numeros_whatsapp"]
+            if datos.max_numeros_whatsapp is None
+            else _normalizar_cupo(datos.max_numeros_whatsapp)
+        )
+        if datos.herramientas_plan is None:
+            nueva_lista = lista_anterior
+            herramientas_activo = (
+                anterior["herramientas_activo"]
+                if datos.herramientas_activo is None
+                else datos.herramientas_activo
+            )
+            calendario_activo = (
+                anterior["calendario_activo"]
+                if datos.calendario_activo is None
+                else datos.calendario_activo
+            )
+        else:
+            nueva_lista = sorted(set(datos.herramientas_plan))
+            herramientas_activo, calendario_activo = _flags_desde_lista(nueva_lista)
 
         # None = no tocar ese campo (ver el docstring de PlanActualizarIn).
         nuevo = {
@@ -209,10 +316,13 @@ async def actualizar_plan(
                 if datos.gestion_vendedores_activo is None
                 else datos.gestion_vendedores_activo
             ),
-            **{
-                col: anterior[col] if getattr(datos, col) is None else getattr(datos, col)
-                for col in ("herramientas_activo", "crm_campo_activo", "calendario_activo")
-            },
+            "herramientas_activo": herramientas_activo,
+            "crm_campo_activo": (
+                anterior["crm_campo_activo"]
+                if datos.crm_campo_activo is None
+                else datos.crm_campo_activo
+            ),
+            "calendario_activo": calendario_activo,
             # None = no tocar; [] / 0 = quitar el límite (ver PlanActualizarIn).
             "modelos_permitidos": (
                 anterior["modelos_permitidos"]
@@ -224,6 +334,7 @@ async def actualizar_plan(
                 if datos.historial_maximo is None
                 else (datos.historial_maximo or None)
             ),
+            "max_numeros_whatsapp": nuevo_cupo,
             "activo": anterior["activo"] if datos.activo is None else datos.activo,
             "orden": anterior["orden"] if datos.orden is None else datos.orden,
             # None = no tocar; "" = borrarlo (ver PlanActualizarIn).
@@ -261,6 +372,7 @@ async def actualizar_plan(
                 max_proveedores = $16,
                 modelos_permitidos = $17,
                 historial_maximo = $18,
+                max_numeros_whatsapp = $19,
                 updated_at = NOW()
             WHERE nombre = $1
             """,
@@ -282,7 +394,17 @@ async def actualizar_plan(
             nuevo["max_proveedores"],
             nuevo["modelos_permitidos"],
             nuevo["historial_maximo"],
+            nuevo["max_numeros_whatsapp"],
         )
+
+        if datos.herramientas_plan is not None and set(nueva_lista) != set(lista_anterior):
+            await conn.execute("DELETE FROM plan_herramientas WHERE plan_nombre = $1", nombre)
+            for familia in nueva_lista:
+                await conn.execute(
+                    "INSERT INTO plan_herramientas (plan_nombre, familia) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    nombre,
+                    familia,
+                )
 
         cambios = datos.model_dump(exclude_none=True)
         await registrar_auditoria(
@@ -303,7 +425,57 @@ async def actualizar_plan(
             },
             conn=conn,
         )
+        if anterior["max_numeros_whatsapp"] != nuevo["max_numeros_whatsapp"]:
+            await registrar_auditoria(
+                actor_email=gerente.email,
+                actor_portal_user_id=gerente.id,
+                accion="cupo_cambiado",
+                tenant_id=None,
+                detalle={
+                    "nombre": nombre,
+                    "anterior": anterior["max_numeros_whatsapp"],
+                    "nuevo": nuevo["max_numeros_whatsapp"],
+                },
+                conn=conn,
+            )
+        if str(anterior["precio_monthly"]) != str(nuevo["precio_monthly"]):
+            await registrar_auditoria(
+                actor_email=gerente.email,
+                actor_portal_user_id=gerente.id,
+                accion="precio_del_plan_cambiado",
+                tenant_id=None,
+                detalle={
+                    "nombre": nombre,
+                    "anterior": str(anterior["precio_monthly"]),
+                    "nuevo": str(nuevo["precio_monthly"]),
+                },
+                conn=conn,
+            )
+        if set(nueva_lista) != set(lista_anterior):
+            await registrar_auditoria(
+                actor_email=gerente.email,
+                actor_portal_user_id=gerente.id,
+                accion="herramientas_del_plan_cambiadas",
+                tenant_id=None,
+                detalle={
+                    "nombre": nombre,
+                    "anteriores": sorted(lista_anterior),
+                    "nuevas": sorted(nueva_lista),
+                },
+                conn=conn,
+            )
+        activos = await conn.fetchval("SELECT COUNT(*) FROM planes WHERE activo")
+        if not activos:
+            await registrar_auditoria(
+                actor_email=gerente.email,
+                actor_portal_user_id=gerente.id,
+                accion="plan_sin_tope_por_falta_de_plan_activo",
+                tenant_id=None,
+                detalle={"nombre": nombre},
+                conn=conn,
+            )
 
         fila = await conn.fetchrow(f"SELECT {_COLUMNAS} FROM planes WHERE nombre = $1", nombre)
+        lista_final = await _leer_herramientas(conn, nombre)
 
-    return _out(fila)
+    return _out(fila, lista_final)

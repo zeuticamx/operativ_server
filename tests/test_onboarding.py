@@ -20,6 +20,7 @@ import pytest
 from routers.auth import _crear_cuenta
 from security import crear_access_token, hash_password
 from services.acceso_soporte import ruta_sensible
+from services.herramientas_calendario import definiciones
 from services.onboarding import (
     DIAS_PRUEBA,
     OTORGADA_POR,
@@ -316,7 +317,17 @@ async def test_aplicar_cuenta_nueva(http_client, cuenta_nueva):
 
     # El calendario quedó encendido y con las herramientas del agente.
     assert await fetch_value("SELECT calendario_activo FROM tenant_servicios WHERE tenant_id = $1", tid)
-    assert await fetch_value("SELECT COUNT(*) FROM tenant_tools WHERE tenant_id = $1", tid) == 7
+    # Están las del catálogo completo: `_encender` inserta la fila de todas, y
+    # la compuerta de HISTORIAL_CITAS_N8N_PUBLICADO solo decide si quedan
+    # activas, no si existen. Se deriva de `definiciones()` en vez de escribir
+    # el número porque ya se quedó viejo una vez: el catálogo pasó de 7 a 9
+    # herramientas y esta aserción siguió esperando 7.
+    catalogo = len(definiciones())
+    assert catalogo, "el catálogo de herramientas de calendario no puede estar vacío"
+    assert (
+        await fetch_value("SELECT COUNT(*) FROM tenant_tools WHERE tenant_id = $1", tid)
+        == catalogo
+    )
 
     assert await fetch_value(
         "SELECT COUNT(*) FROM gerencia_auditoria WHERE tenant_id = $1 AND accion = 'prueba_onboarding'", tid

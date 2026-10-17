@@ -1,5 +1,6 @@
 """
-Tests del proxy de mensajes entrantes de NeuroAPI hacia n8n.
+Tests del proxy de mensajes entrantes de NeuroAPI hacia n8n o hacia el
+agente en código (services/entrada_mensajes.py).
 
 Lo que importa si falla:
 
@@ -9,8 +10,12 @@ Lo que importa si falla:
   3. si n8n no lo recibe, se responde error para que NeuroAPI reintente y
      el mensaje no se pierda
   4. los eventos de vinculación siguen yendo por su camino, no a n8n
+  5. con AGENTE_EN_CODIGO encendida, el mismo mensaje va al propio backend
+     (routers/agente_webhook.py) y NO a n8n. Esto estuvo roto: la bandera
+     solo apagaba /canales/entrada, pero WhatsApp por NeuroAPI —el canal con
+     más tráfico real— seguía yendo a n8n sin que nada la mirara.
 
-n8n no se llama nunca: se simula httpx.AsyncClient.
+Ni n8n ni el agente se llaman de verdad: se simula httpx.AsyncClient.
 """
 
 import hashlib
@@ -91,11 +96,13 @@ def n8n(monkeypatch):
     return responder
 
 
-async def _linea_whatsapp(tenant_id, phone_number_id: str) -> None:
+async def _linea_whatsapp(tenant_id, phone_number_id: str, estado: str = "activo") -> None:
+    """Número vinculado en agentes_canal (spec 005a T6: la atribución ya no lee channel_credentials)."""
     await execute(
-        "SELECT set_channel_credentials($1, 'whatsapp', NULL, $2, NULL, NULL)",
+        "INSERT INTO agentes_canal (tenant_id, phone_number_id, estado) VALUES ($1, $2, $3)",
         tenant_id,
         phone_number_id,
+        estado,
     )
 
 
@@ -160,19 +167,35 @@ async def test_un_numero_ajeno_no_se_reenvia(http_client, db, n8n):
 
 
 @pytest.mark.asyncio
-async def test_una_linea_desactivada_no_se_reenvia(http_client, tenant_y_usuario, n8n):
+async def test_una_linea_pausada_se_sigue_atribuyendo(
+    http_client, tenant_y_usuario, n8n
+):
+    """Pausado guarda sus mensajes (no responde por otro camino): se reenvía igual."""
     tenant_id = tenant_y_usuario["tenant_id"]
-    await _linea_whatsapp(tenant_id, "5215544444444")
-    await execute(
-        "UPDATE channel_credentials SET is_active = false "
-        "WHERE tenant_id = $1 AND channel_type = 'whatsapp'",
-        tenant_id,
-    )
+    await _linea_whatsapp(tenant_id, "5215544444444", estado="pausado")
 
     respuesta, _ = await _post_firmado(http_client, mensaje_meta("5215544444444"))
 
     assert respuesta.status_code == 200
-    assert _ClienteFalso.llamadas == []
+    assert len(_ClienteFalso.llamadas) == 1
+    assert _ClienteFalso.llamadas[0]["headers"]["X-Tenant-Id"] == str(tenant_id)
+
+
+@pytest.mark.asyncio
+async def test_un_numero_desvinculado_resuelve_a_su_ultimo_dueno(
+    http_client, tenant_y_usuario, n8n
+):
+    tenant_id = tenant_y_usuario["tenant_id"]
+    await _linea_whatsapp(tenant_id, "5215599999990")
+    await execute(
+        "UPDATE agentes_canal SET estado = 'desvinculado', desvinculado_en = NOW() "
+        "WHERE tenant_id = $1 AND phone_number_id = $2",
+        tenant_id,
+        "5215599999990",
+    )
+
+    assert await entrada_mensajes.tenant_por_numero("5215599999990") == tenant_id
+    assert await entrada_mensajes.tenant_por_numero("000000000000") is None
 
 
 @pytest.mark.asyncio
@@ -219,6 +242,57 @@ async def test_sin_destino_configurado_se_pide_reintento(
 
     assert respuesta.status_code == 503
     assert _ClienteFalso.llamadas == []
+
+
+# ============================================================
+# AGENTE_EN_CODIGO: a dónde se reenvía
+# ============================================================
+def test_destino_es_n8n_con_el_agente_apagado(monkeypatch):
+    monkeypatch.setattr(settings, "AGENTE_EN_CODIGO", False)
+    monkeypatch.setattr(settings, "N8N_WEBHOOK_ENTRADA_URL", DESTINO)
+
+    assert entrada_mensajes.destino_para(None) == DESTINO
+
+
+def test_destino_es_el_propio_backend_con_el_agente_encendido(monkeypatch):
+    """
+    El caso que faltaba. Antes de este arreglo `destino_para` no miraba
+    `AGENTE_EN_CODIGO` en absoluto: devolvía n8n siempre, encendida o no.
+    """
+    monkeypatch.setattr(settings, "AGENTE_EN_CODIGO", True)
+    monkeypatch.setattr(settings, "N8N_WEBHOOK_ENTRADA_URL", DESTINO)
+    monkeypatch.setattr(settings, "BASE_URL_BACKEND", "https://api.ejemplo.com")
+
+    assert entrada_mensajes.destino_para(None) == "https://api.ejemplo.com/api/canales/entrada"
+
+
+@pytest.mark.asyncio
+async def test_con_el_agente_encendido_el_mensaje_no_va_a_n8n(
+    http_client, tenant_y_usuario, n8n, monkeypatch
+):
+    """
+    Integración completa: un mensaje real de NeuroAPI, con la bandera
+    encendida, tiene que llegar a `/api/canales/entrada` y no al webhook de
+    n8n — aunque `N8N_WEBHOOK_ENTRADA_URL` siga configurada (coexistencia
+    durante la migración: la URL de n8n puede quedarse puesta sin que eso
+    reabra el camino viejo).
+    """
+    tenant_id = tenant_y_usuario["tenant_id"]
+    await _linea_whatsapp(tenant_id, "5215588888888")
+    monkeypatch.setattr(settings, "AGENTE_EN_CODIGO", True)
+
+    respuesta, cuerpo = await _post_firmado(http_client, mensaje_meta("5215588888888"))
+
+    assert respuesta.status_code == 200
+    assert len(_ClienteFalso.llamadas) == 1
+    llamada = _ClienteFalso.llamadas[0]
+    assert llamada["url"] == f"{settings.BASE_URL_BACKEND}/api/canales/entrada"
+    assert llamada["url"] != DESTINO
+    # Las cabeceras no cambian: el agente valida el mismo X-Internal-Token
+    # + X-Tenant-Id que validaba n8n.
+    assert llamada["content"] == cuerpo
+    assert llamada["headers"]["X-Tenant-Id"] == str(tenant_id)
+    assert llamada["headers"]["X-Internal-Token"] == TOKEN
 
 
 @pytest.mark.asyncio

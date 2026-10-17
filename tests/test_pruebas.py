@@ -22,6 +22,7 @@ from jobs.pagos_background import job_pausar_suscripciones_vencidas
 from security import crear_access_token, hash_password
 from services.acceso_pagos import acceso_pagos
 from services.acceso_plan import acceso_plan
+from services.herramientas_calendario import CON_COMPUERTA, definiciones
 from services.pagos import activar_suscripcion
 from services.pruebas import calcular_expiracion, sumar_meses
 from session import execute, fetch_one, fetch_value
@@ -432,9 +433,9 @@ async def _calendario_encendido(tenant_id) -> bool:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("compuerta_abierta, esperadas", [(False, 6), (True, 7)])
+@pytest.mark.parametrize("compuerta_abierta", [False, True])
 async def test_una_prueba_con_calendario_deja_el_modulo_encendido(
-    monkeypatch, http_client, gerente, tenant_y_usuario, auth, compuerta_abierta, esperadas
+    monkeypatch, http_client, gerente, tenant_y_usuario, auth, compuerta_abierta
 ):
     """Sin el interruptor el agente recibe 409 aunque el plan incluya calendario."""
     monkeypatch.setattr(settings, "HISTORIAL_CITAS_N8N_PUBLICADO", compuerta_abierta)
@@ -449,6 +450,14 @@ async def test_una_prueba_con_calendario_deja_el_modulo_encendido(
     ruta = f"/api/tenants/{tenant_id}/calendario/proveedores"
     assert (await http_client.get(ruta, headers=auth)).status_code == 200
     # Y el agente ya tiene sus herramientas para consultar y reservar.
+    # Con la compuerta abierta quedan activas todas; cerrada, todas menos las
+    # de CON_COMPUERTA. Derivado del catálogo a propósito: con los números
+    # escritos a mano, el caso abierto se quedó esperando 7 cuando el catálogo
+    # ya tenía 9, y el cerrado siguió pasando por casualidad (7-1 y 9-3 dan 6).
+    assert definiciones(), "el catálogo de herramientas de calendario está vacío"
+    assert CON_COMPUERTA, "sin herramientas con compuerta este test no prueba nada"
+    esperadas = len(definiciones()) - (0 if compuerta_abierta else len(CON_COMPUERTA))
+
     herramientas = await fetch_value(
         "SELECT COUNT(*) FROM tenant_tools WHERE tenant_id = $1 AND is_enabled", tenant_id
     )

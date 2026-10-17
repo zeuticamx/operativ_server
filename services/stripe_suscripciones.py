@@ -51,6 +51,7 @@ import asyncpg
 from fastapi import HTTPException, status
 
 from config import settings
+from services import numeros_reevaluacion
 from services.notificaciones_gerencia import EventoSuscripcion
 from services.pagos import activar_suscripcion
 from services.stripe_pagos import de_unidad_minima
@@ -447,6 +448,10 @@ async def procesar_factura_pagada(obj: dict[str, Any]) -> EventoSuscripcion | No
             "SELECT fecha_renovacion FROM tenant_subscriptions WHERE tenant_id = $1", tenant_id
         )
 
+    # Spec 005a, RF-11 casos 1 y 6: el alta o el cambio de plan se reevalúa ya
+    # confirmado (una renovación sin cambios no encuentra nada que hacer).
+    await numeros_reevaluacion.reevaluar_tras_cambio(tenant_id)
+
     return EventoSuscripcion(
         tipo="alta" if es_alta else "renovacion",
         tenant_id=tenant_id,
@@ -663,6 +668,11 @@ async def procesar_suscripcion_eliminada(obj: dict[str, Any]) -> EventoSuscripci
         return None
 
     vence = fila["fecha_renovacion"]
+    if fila["estado"] != "activa":
+        # Spec 005a, RF-11 caso 2: pausada de inmediato = sin suscripción vigente
+        # desde ya, se reevalúa el cupo en el acto. Con días pagados por delante
+        # sigue vigente y lo hace el trabajo de números al vencer.
+        await numeros_reevaluacion.reevaluar_tras_cambio(fila["tenant_id"], "fin_de_suscripcion", forzar=True)
     if fila["estado"] == "activa":
         accion = f"Le quedan días pagados: sigue vigente hasta el {vence:%d/%m/%Y} y después se pausa automáticamente."
     else:

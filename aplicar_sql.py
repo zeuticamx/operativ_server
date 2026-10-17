@@ -33,6 +33,30 @@ TABLAS = [
     ("channel_credentials", "n8n"),
     ("tenant_channels", "n8n"),
     ("tenant_agent_config", "n8n"),
+    # Las escribe el envío del agente (services/agente/envio.py). Igual que
+    # las funciones de abajo, nacieron del lado de n8n y vivieron solo en la
+    # base; ya están versionadas en sql/54_agente_envio_tablas.sql. Sin
+    # `delivery_errors` no se cae nada: se pierden los diagnósticos de envío
+    # en silencio, así que conviene verla listada.
+    ("delivery_errors", "n8n"),
+    ("tenant_templates", "n8n"),
+    # Del backend, no de n8n: la lista de bajas que cierra el hallazgo 1
+    # (sql/55_agente_bajas.sql). Sin ella, `bajas.esta_de_baja` falla cerrado
+    # y NINGUNA plantilla de reapertura sale, así que conviene verla listada.
+    ("agente_bajas", "portal"),
+    # Varios números de WhatsApp por negocio (spec 005a, sql/56 a 59). Sin
+    # `agentes_canal` el código nuevo no sabe a qué negocio atribuir un mensaje
+    # de WhatsApp, así que conviene verlas listadas.
+    ("agentes_canal", "portal"),
+    ("config_referencia_negocio", "portal"),
+    ("agente_canal_herramientas", "portal"),
+    ("social_herramientas", "portal"),
+    ("numeros_bitacora", "portal"),
+    ("intentos_alta_ajena", "portal"),
+    ("plan_herramientas", "portal"),
+    ("numeros_reevaluacion_cola", "portal"),
+    ("numeros_despliegue", "portal"),
+    ("numeros_recortes_pendientes", "portal"),
     ("portal_users", "portal"),
     ("meta_connections", "portal"),
     ("email_verifications", "portal"),
@@ -57,6 +81,23 @@ TABLAS = [
 FUNCIONES = [
     ("resuelve_tenant", "n8n"),
     ("set_channel_credentials", "n8n"),
+    # Las usa el agente en código (services/agente/). Se crearon del lado de
+    # n8n y durante un tiempo vivieron solo en la base; ya están versionadas:
+    # resuelve_tenant y dentro_de_ventana_24h en sql/52_agente_funciones.sql,
+    # obtiene_app_secret en sql/53, que además retira su clave de cifrado de
+    # ejemplo — leer ese archivo entero antes de aplicarlo.
+    ("obtiene_app_secret", "n8n"),
+    ("dentro_de_ventana_24h", "n8n"),
+    # Spec 005a (sql/56 a 59): reglas efectivas del negocio y resolución de
+    # números. `resuelve_tenant` (arriba) cambia en 58: busca en agentes_canal.
+    ("configuracion_incompleta", "portal"),
+    ("familia_de_herramienta", "portal"),
+    ("situacion_comercial", "portal"),
+    ("plan_mas_bajo_activo", "portal"),
+    ("limites_efectivos", "portal"),
+    ("recortar_agente_a_plan", "portal"),
+    ("resuelve_numero", "portal"),
+    ("numeros_encolar_reevaluacion", "portal"),
     ("set_meta_connection", "portal"),
     ("get_meta_connection", "portal"),
     ("distancia_metros", "portal"),

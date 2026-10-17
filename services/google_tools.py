@@ -111,6 +111,64 @@ def validar_doc(document_id: str) -> dict:
     return {"titulo": data.get("title", "(sin título)")}
 
 
+def _texto_de_contenido(elementos: list[dict]) -> str:
+    """
+    Aplana el cuerpo de un documento de Docs a texto.
+
+    La API no devuelve el texto de corrido: el cuerpo es una lista de
+    elementos estructurales y el texto vive dentro de los `textRun` de cada
+    párrafo. Las tablas y el índice anidan más elementos, así que se recorre
+    en profundidad.
+
+    Recursiva y sin red, para poder probarla con una respuesta de ejemplo.
+    """
+    partes: list[str] = []
+
+    for elemento in elementos or []:
+        if "paragraph" in elemento:
+            for trozo in elemento["paragraph"].get("elements", []):
+                # Un párrafo también puede traer saltos de página, imágenes o
+                # menciones: nada de eso aporta texto y se ignora.
+                texto = (trozo.get("textRun") or {}).get("content")
+                if texto:
+                    partes.append(texto)
+
+        elif "table" in elemento:
+            for fila in elemento["table"].get("tableRows", []):
+                celdas = [
+                    _texto_de_contenido(celda.get("content", [])).strip()
+                    for celda in fila.get("tableCells", [])
+                ]
+                # Mismo formato que una hoja de cálculo, para que el modelo
+                # lea las dos cosas igual.
+                partes.append(" | ".join(celdas) + "\n")
+
+        elif "tableOfContents" in elemento:
+            partes.append(
+                _texto_de_contenido(elemento["tableOfContents"].get("content", []))
+            )
+
+        # `sectionBreak` y demás no aportan texto.
+
+    return "".join(partes)
+
+
+def leer_documento(document_id: str) -> str:
+    """
+    El texto del documento, ya aplanado.
+
+    Lo usa la herramienta `google_docs` del agente. `validar_doc` solo pide el
+    título (es para dar de alta la herramienta desde el portal); esta trae el
+    cuerpo.
+    """
+    try:
+        data = _docs_service().documents().get(documentId=document_id, fields="body").execute()
+    except HttpError as e:
+        raise _traducir_error(e, "documento")
+
+    return _texto_de_contenido((data.get("body") or {}).get("content", [])).strip()
+
+
 def leer_rango(spreadsheet_id: str, rango: str) -> list[list[str]]:
     try:
         data = (

@@ -24,6 +24,7 @@ otro reactiva por pago aprobado.
 
 import logging
 
+from services import numeros_reevaluacion
 from services.creditos import expirar_creditos_plan
 from services.notificaciones_gerencia import EventoSuscripcion, notificar_evento_suscripcion
 from session import fetch_all, transaccion
@@ -38,7 +39,7 @@ _PAUSAR_VENCIDAS = """
      WHERE estado = 'activa'
        AND fecha_renovacion IS NOT NULL
        AND fecha_renovacion < NOW()
-    RETURNING tenant_id, plan, fecha_renovacion, cancela_al_vencer,
+    RETURNING tenant_id, plan, origen, fecha_renovacion, cancela_al_vencer,
               intentos_fallidos, stripe_customer_id, stripe_subscription_id
 """
 
@@ -86,6 +87,15 @@ async def job_pausar_suscripciones_vencidas() -> None:
                 )
         except Exception:  # noqa: BLE001 - un tenant no puede frenar al resto
             log.exception("No se pudieron expirar los créditos del plan de %s", fila["tenant_id"])
+
+        # Spec 005a, RF-11 casos 2 y 3: sin suscripción vigente desde ya, se
+        # reevalúa el cupo en el acto (el trabajo de números suele haberlo hecho al
+        # vencer; esto cubre lo que se le adelantó). Nunca propaga un error.
+        await numeros_reevaluacion.reevaluar_tras_cambio(
+            fila["tenant_id"],
+            "fin_de_prueba" if fila["origen"] == "prueba" else "fin_de_suscripcion",
+            forzar=True,
+        )
 
         evento = _evento_de_pausa(fila)
         if evento is not None:

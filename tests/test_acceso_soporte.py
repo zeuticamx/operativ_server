@@ -402,3 +402,144 @@ async def test_el_token_no_se_guarda_en_claro(http_client, gerente, negocio, cor
         negocio["tenant_id"],
     )
     assert guardado != token and token not in guardado
+
+
+# ------------------------------------------------------------
+# Varios números (spec 005a T5, RF-18, RF-19)
+# ------------------------------------------------------------
+async def _vincular_numero(http_client, headers) -> str:
+    from uuid import uuid4 as _uuid4
+
+    r = await http_client.post(
+        "/api/canales/whatsapp/conectar",
+        json={"phone_number_id": f"pn-{_uuid4().hex[:10]}"},
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+async def _con_plan(tenant_id) -> None:
+    await execute(
+        """
+        INSERT INTO tenant_subscriptions (tenant_id, plan, estado, precio_monthly)
+        VALUES ($1, 'enterprise', 'activa', 299.99)
+        ON CONFLICT (tenant_id) DO UPDATE SET plan = 'enterprise', estado = 'activa'
+        """,
+        tenant_id,
+    )
+
+
+async def _conceder(http_client, gerente, negocio, soporte) -> None:
+    sid = (await _solicitar(http_client, soporte)).json()["id"]
+    r = await _aprobar(http_client, negocio, sid)
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_soporte_lee_numeros_sin_concesion(http_client, gerente, negocio):
+    await _con_plan(negocio["tenant_id"])
+    soporte = await _ver_como(http_client, gerente, negocio["tenant_id"])
+    nid = await _vincular_numero(http_client, negocio["headers"])
+
+    assert (
+        await http_client.get("/api/canales/whatsapp/numeros", headers=soporte)
+    ).status_code == 200
+    assert (
+        await http_client.get(f"/api/agente/numeros/{nid}", headers=soporte)
+    ).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_soporte_sin_concesion_no_escribe_ni_en_numero_ajeno(
+    http_client, gerente, negocio
+):
+    """A9: el 403 de solo lectura va antes que el 404 de pertenencia."""
+    from uuid import uuid4 as _uuid4
+
+    await _con_plan(negocio["tenant_id"])
+    soporte = await _ver_como(http_client, gerente, negocio["tenant_id"])
+    nid = await _vincular_numero(http_client, negocio["headers"])
+
+    r = await http_client.post(
+        f"/api/canales/whatsapp/numeros/{nid}/pausar", headers=soporte
+    )
+    assert r.status_code == 403
+
+    r = await http_client.put(
+        f"/api/agente/numeros/{nid}",
+        json={"agent_name": "X"},
+        headers=soporte,
+    )
+    assert r.status_code == 403
+
+    tid_otro = _uuid4()
+    await execute("INSERT INTO tenants (id, name) VALUES ($1, 'Otro')", tid_otro)
+    try:
+        uid, _ = await _portal_user(tid_otro, "owner")
+        from security import crear_access_token as _token
+
+        await execute(
+            """
+            INSERT INTO tenant_subscriptions (tenant_id, plan, estado, precio_monthly)
+            VALUES ($1, 'enterprise', 'activa', 299.99)
+            """,
+            tid_otro,
+        )
+        otro = {"headers": _auth(_token(uid, tid_otro, "owner"))}
+        nid_ajeno = await _vincular_numero(http_client, otro["headers"])
+        r = await http_client.post(
+            f"/api/canales/whatsapp/numeros/{nid_ajeno}/pausar", headers=soporte
+        )
+        assert r.status_code == 403
+    finally:
+        await execute("DELETE FROM tenants WHERE id = $1", tid_otro)
+
+
+@pytest.mark.asyncio
+async def test_soporte_con_concesion_edita_config_y_herramientas(
+    http_client, gerente, negocio
+):
+    await _con_plan(negocio["tenant_id"])
+    soporte = await _ver_como(http_client, gerente, negocio["tenant_id"])
+    await _conceder(http_client, gerente, negocio, soporte)
+    nid = await _vincular_numero(http_client, negocio["headers"])
+
+    assert _paso(
+        await http_client.put(
+            f"/api/agente/numeros/{nid}",
+            json={"agent_name": "Agente", "system_prompt": "Ayuda general."},
+            headers=soporte,
+        )
+    )
+    assert _paso(
+        await http_client.put(
+            f"/api/herramientas/numeros/{nid}", json={"activar": []}, headers=soporte
+        )
+    )
+    assert _paso(
+        await http_client.put("/api/herramientas/social", json={"activar": []}, headers=soporte)
+    )
+
+
+@pytest.mark.asyncio
+async def test_soporte_con_concesion_no_toca_canales_ni_credenciales(
+    http_client, gerente, negocio
+):
+    await _con_plan(negocio["tenant_id"])
+    soporte = await _ver_como(http_client, gerente, negocio["tenant_id"])
+    await _conceder(http_client, gerente, negocio, soporte)
+    nid = await _vincular_numero(http_client, negocio["headers"])
+
+    for metodo, ruta, cuerpo in (
+        ("post", f"/api/canales/whatsapp/numeros/{nid}/pausar", None),
+        ("delete", f"/api/canales/whatsapp/numeros/{nid}", None),
+        ("put", "/api/canales/whatsapp/principal", {"numero_id": nid}),
+        (
+            "post",
+            "/api/herramientas/google-sheets",
+            {"url": "https://docs.google.com/spreadsheets/d/x", "display_name": "H"},
+        ),
+    ):
+        r = await http_client.request(metodo.upper(), ruta, json=cuerpo, headers=soporte)
+        assert r.status_code == 403, (metodo, ruta, r.text)
