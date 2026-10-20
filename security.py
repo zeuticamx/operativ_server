@@ -2,7 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import jwt
 from argon2 import PasswordHasher
@@ -99,9 +99,17 @@ def crear_token_impersonacion(
     return token, datetime.now(timezone.utc) + expira_en
 
 
-def crear_refresh_token(user_id: UUID) -> str:
+def crear_refresh_token(user_id: UUID, jti: UUID | None = None) -> str:
+    """
+    `jti` identifica la sesión de refresh en la tabla `refresh_sesiones`
+    (spec 006): es lo que permite rotarlo (de un solo uso) y revocarlo sin
+    esperar a su `exp`. Si no se pasa se genera uno nuevo — pero
+    routers.auth siempre lo pasa explícito, porque necesita el mismo valor
+    para el INSERT en la tabla y para el claim del token.
+    """
+    jti = jti or uuid4()
     return _crear_token(
-        {"sub": str(user_id), "type": "refresh"},
+        {"sub": str(user_id), "type": "refresh", "jti": str(jti)},
         timedelta(days=settings.REFRESH_TOKEN_DAYS),
     )
 

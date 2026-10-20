@@ -680,6 +680,44 @@ async def comprobar_alta_previa(
         lanzar_rechazo_alta(decision, ahora)
 
 
+async def coexistencia_permitida(
+    conn: asyncpg.Connection, tenant_id: UUID, *, ahora: Optional[datetime] = None
+) -> bool:
+    """El plan vigente del negocio incluye el modo coexistencia (`planes.coexistencia_activa`)."""
+    return bool(
+        await conn.fetchval("SELECT coexistencia_permitida($1, $2)", tenant_id, _ahora(ahora))
+    )
+
+
+async def exigir_coexistencia(conn: asyncpg.Connection, tenant_id: UUID) -> None:
+    """402 `coexistencia_no_incluida_en_plan` si el plan del negocio no la incluye."""
+    if not await coexistencia_permitida(conn, tenant_id):
+        raise error_http(
+            402,
+            "coexistencia_no_incluida_en_plan",
+            "Tu plan no incluye el modo coexistencia (WhatsApp Business app + API). "
+            "Mejora tu plan o conecta el número en modo exclusivo API.",
+        )
+
+
+async def marcar_modo_conexion(
+    conn: asyncpg.Connection, tenant_id: UUID, phone_number_id: str, connection_mode: str
+) -> None:
+    """Deja en el número vinculado (activo o pausado) el modo con el que se conectó."""
+    await conn.execute(
+        """
+        UPDATE agentes_canal
+           SET connection_mode = $3
+         WHERE tenant_id = $1 AND phone_number_id = $2
+           AND estado IN ('activo', 'pausado')
+           AND connection_mode IS DISTINCT FROM $3
+        """,
+        tenant_id,
+        phone_number_id,
+        connection_mode,
+    )
+
+
 @dataclass(frozen=True)
 class ResultadoProveedor:
     """Lo que pasó con un alta por el webhook (sin autor humano: SISTEMA)."""

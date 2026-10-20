@@ -125,11 +125,14 @@ def test_RF22_el_archivo_existe(numero: int) -> None:
 
 def test_RF22_56_es_la_siguiente_migracion_libre_y_no_hay_duplicadas() -> None:
     # La 54 y la 55 existen; la 56 a la 59 y la 61 son de esta spec y no se repiten (la 60 tiene su propio test).
+    # La 62 es de la spec 006 (refresh en cookie HttpOnly), ajena a esta.
+    # La 63 es de las plantillas de WhatsApp por negocio, ajena a esta.
     anteriores = {int(p.name.split("_")[0]) for p in DIR_SQL.glob("[0-9][0-9]_*.sql")}
     assert {54, 55} <= anteriores
     for numero in ARCHIVOS:
         assert len(list(DIR_SQL.glob(f"{numero}_*.sql"))) == 1
-    assert max(anteriores) == 61
+    # La 64 es del modo coexistencia de WhatsApp, ajena a esta.
+    assert max(anteriores) == 64
 
 
 @pytest.mark.parametrize("numero", sorted(ARCHIVOS))

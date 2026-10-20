@@ -178,7 +178,11 @@ async def test_si_al_gerente_lo_sacan_la_sesion_muere(http_client, gerente, nego
 @pytest.mark.asyncio
 async def test_el_token_de_ver_como_no_se_puede_refrescar(http_client, gerente, negocio):
     token = (await _impersonar(http_client, gerente, negocio["tenant_id"])).json()["access_token"]
-    r = await http_client.post("/api/auth/refresh", json={"refresh_token": token})
+    r = await http_client.post(
+        "/api/auth/refresh",
+        json={"refresh_token": token},
+        headers={"Origin": settings.FRONTEND_ORIGINS[0]},
+    )
     assert r.status_code == 401
 
 

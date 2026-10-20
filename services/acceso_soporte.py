@@ -66,6 +66,7 @@ RUTAS_SENSIBLES = (
     "/api/canales",  # tokens y credenciales de Meta/WhatsApp
     "/api/perfil",  # datos personales del dueño
     "/api/onboarding",  # aplicarlo otorga un plan de prueba: lo decide el dueño
+    "/api/plantillas-whatsapp",  # crear/borrar actúa sobre la WABA real en Meta
     # Responder solicitudes es del dueño de verdad: con esto una sesión de
     # ver-como no puede aprobarse a sí misma. Las dos rutas de soporte
     # (solicitar/cancelar) se permiten antes en deps._validar_impersonacion.

@@ -32,8 +32,10 @@ from fastapi import APIRouter, HTTPException, Request, status
 
 from config import settings
 from services import (
+    ecos_coexistencia,
     entrada_mensajes,
     neuroapi_connect,
+    plantillas_tenant,
     plantillas_whatsapp,
     respuesta_cuenta_global,
 )
@@ -107,6 +109,8 @@ async def webhook(request: Request) -> dict[str, bool]:
     if plantillas_whatsapp.es_evento_de_plantilla(evento):
         try:
             await plantillas_whatsapp.aplicar_evento_meta(evento)
+            # Plantillas propias de cada negocio (caché de /api/plantillas-whatsapp).
+            await plantillas_tenant.aplicar_evento_meta(evento)
         except Exception:
             # 200 igualmente: un reintento de NeuroAPI no arregla un fallo propio.
             log.exception("No se pudo aplicar el evento de estado de plantilla")
@@ -144,6 +148,14 @@ async def _reenviar_mensaje(cuerpo_crudo: bytes, evento: dict[str, Any], tipo_ev
             tipo_evento, _estructura(evento),
         )
         return
+
+    # Ecos de coexistencia: lo que una persona escribió desde la app móvil de
+    # WhatsApp Business. Se sincronizan (solo lectura) y NO van al agente; si
+    # el mismo evento trae además mensajes de clientes, esos siguen su camino.
+    if ecos_coexistencia.hay_ecos(evento):
+        await ecos_coexistencia.procesar_ecos(evento, phone_number_id)
+        if not ecos_coexistencia.hay_mensajes_de_clientes(evento):
+            return
 
     # Respuesta de un cliente a un aviso de cita en la cuenta global (spec 004,
     # D13): se contesta con el texto fijo y no llega al agente del tenant.
@@ -238,7 +250,7 @@ async def _procesar_conexion(
         UPDATE neuroapi_connect_sessions
            SET status = $2, detalle = $3, updated_at = NOW()
          WHERE session_id = $1
-        RETURNING tenant_id
+        RETURNING tenant_id, connection_mode
         """,
         str(session_id),
         estado,
@@ -252,7 +264,10 @@ async def _procesar_conexion(
     if estado == "completado":
         if phone_number_id:
             resultado = await _activar_whatsapp(
-                fila["tenant_id"], str(phone_number_id), telefono_visible=phone_number,
+                fila["tenant_id"],
+                str(phone_number_id),
+                telefono_visible=phone_number,
+                connection_mode=fila["connection_mode"],
             )
             await execute(
                 "UPDATE neuroapi_connect_sessions SET detalle = $2, updated_at = NOW() "
@@ -263,6 +278,7 @@ async def _procesar_conexion(
                         "resultado": resultado.resultado,
                         "codigo": resultado.codigo,
                         "phone_number_id": resultado.phone_number_id,
+                        "connection_mode": fila["connection_mode"],
                     }
                 ),
             )
@@ -278,13 +294,21 @@ async def _procesar_conexion(
 
 
 async def _activar_whatsapp(
-    tenant_id: Any, phone_number_id: str, telefono_visible: str | None = None
+    tenant_id: Any,
+    phone_number_id: str,
+    telefono_visible: str | None = None,
+    connection_mode: str = "standard",
 ):
     """
     Alta por el webhook (T6): un número libre se vincula; uno propio se ignora
     (sin duplicar ni reactivar); uno ajeno se rechaza sin revelar y cuenta
     para los intentos. Devuelve el resultado para dejarlo en la sesión
     (`GET .../neuroapi/estado`).
+
+    `connection_mode` es el que eligió el negocio al abrir la sesión: se
+    marca en el número recién vinculado y también en uno propio que se volvió
+    a conectar (p. ej. de solo API a coexistencia). En uno ajeno o rechazado
+    no se toca nada.
 
     `channel_credentials` solo guarda el PRIMER número (P2): es lo que lee
     `cuenta_global_wa` para los avisos. El alta de un segundo número no la
@@ -297,6 +321,8 @@ async def _activar_whatsapp(
         resultado = await numeros.vincular_desde_proveedor(
             conn, tenant_id, phone_number_id, telefono_visible=telefono_visible
         )
+        if resultado.resultado in ("vinculado", "propio"):
+            await numeros.marcar_modo_conexion(conn, tenant_id, phone_number_id, connection_mode)
 
     if resultado.resultado != "vinculado":
         return resultado

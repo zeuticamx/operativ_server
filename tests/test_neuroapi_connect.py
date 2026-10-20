@@ -693,6 +693,7 @@ async def test_estado_muestra_el_resultado_del_webhook(
     assert r.json() == {
         "session_id": "sess_estado",
         "estado": "completado",
+        "connection_mode": "standard",
         "resultado": "vinculado",
         "codigo": None,
         "phone_number_id": "5215570000001",

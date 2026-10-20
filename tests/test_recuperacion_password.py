@@ -15,7 +15,7 @@ import jwt
 import pytest
 
 from config import settings
-from security import crear_refresh_token, verify_password
+from security import verify_password
 from services import recuperacion_password as svc
 from session import execute, fetch_one
 
@@ -270,7 +270,11 @@ async def test_freno_de_reenvio_y_codigo_nuevo_anula_el_anterior(http_client, cu
 # ============================================================
 # Cierre de sesiones
 # ============================================================
-async def test_restablecer_cierra_las_sesiones_abiertas(http_client, cuenta, correos):
+async def test_restablecer_cierra_las_sesiones_abiertas(http_client, cuenta, correos, monkeypatch):
+    # httpx no reenvía una cookie `Secure` sobre un transporte sin TLS
+    # (ASGITransport habla `http://test`), igual que test_refresh_rotacion.py.
+    monkeypatch.setattr(settings, "COOKIE_SECURE", False)
+
     access_viejo = _token_viejo(cuenta["usuario_id"], cuenta["tenant_id"], "access")
     refresh_viejo = _token_viejo(cuenta["usuario_id"], cuenta["tenant_id"], "refresh")
     auth_viejo = {"Authorization": f"Bearer {access_viejo}"}
@@ -280,15 +284,20 @@ async def test_restablecer_cierra_las_sesiones_abiertas(http_client, cuenta, cor
     assert (await _restablecer(http_client, cuenta["email"], correos[0][1])).status_code == 204
 
     assert (await http_client.get("/api/auth/yo", headers=auth_viejo)).status_code == 401
-    r = await http_client.post("/api/auth/refresh", json={"refresh_token": refresh_viejo})
+    origen = {"Origin": settings.FRONTEND_ORIGINS[0]}
+    r = await http_client.post(
+        "/api/auth/refresh", json={"refresh_token": refresh_viejo}, headers=origen
+    )
     assert r.status_code == 401
 
-    # La sesión nueva, con la contraseña nueva, sí funciona.
+    # La sesión nueva, con la contraseña nueva, sí funciona. El login dejó
+    # la cookie op_refresh puesta en este mismo cliente (spec 006): el
+    # refresh de esa sesión real, con su fila en refresh_sesiones, sí sirve
+    # (a diferencia de un JWT fabricado a mano sin sesión detrás).
     login = await _login(http_client, cuenta["email"], NUEVA)
     assert login.status_code == 200
+    assert login.json()["refresh_token"] is None
     auth_nuevo = {"Authorization": f"Bearer {login.json()['access_token']}"}
     assert (await http_client.get("/api/auth/yo", headers=auth_nuevo)).status_code == 200
-    r = await http_client.post(
-        "/api/auth/refresh", json={"refresh_token": crear_refresh_token(cuenta["usuario_id"])}
-    )
+    r = await http_client.post("/api/auth/refresh", headers=origen)
     assert r.status_code == 200

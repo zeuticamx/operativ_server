@@ -303,7 +303,14 @@ async def _destino_permitido(url: str) -> str | None:
             ip = ipaddress.ip_address(info[4][0])
         except ValueError:
             continue
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
             return f"{host} resuelve a una dirección interna"
 
     return None
@@ -347,7 +354,8 @@ async def _http_generico(
         # texto que vuelve al modelo ni en el log (hallazgo 2).
         cabeceras[config["auth_header"]] = token
 
-    async with httpx.AsyncClient(timeout=TIMEOUT) as cliente:
+    # Sin seguir redirects: un 302 desde un dominio permitido saltaría la lista.
+    async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=False) as cliente:
         respuesta = await cliente.request(
             config.get("method") or "GET", url, headers=cabeceras
         )
@@ -462,7 +470,7 @@ async def _http_post_json(
     if token and config.get("auth_header"):
         cabeceras[config["auth_header"]] = token
 
-    async with httpx.AsyncClient(timeout=TIMEOUT) as cliente:
+    async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=False) as cliente:
         respuesta = await cliente.post(url, json=cuerpo, headers=cabeceras)
 
     if respuesta.status_code >= 400:

@@ -188,13 +188,24 @@ class GoogleLoginIn(BaseModel):
 
 
 class TokenOut(BaseModel):
+    """
+    `refresh_token` va `None` para el portal web (spec 006): el refresh
+    viaja en una cookie HttpOnly que esta respuesta ya dejó puesta
+    (`Set-Cookie`), no en el cuerpo. Solo la app móvil, que no puede usar
+    cookies de navegador, lo recibe aquí (`X-Cliente: movil`).
+    """
     access_token: str
-    refresh_token: str
+    refresh_token: str | None = None
     token_type: Literal["bearer"] = "bearer"
 
 
 class RefreshIn(BaseModel):
-    refresh_token: str
+    """
+    Body de /auth/refresh y /auth/logout. Opcional: el portal web no manda
+    nada (el refresh va en la cookie); solo la app móvil, o un cliente web
+    viejo mientras dure `REFRESH_BODY_LEGACY`, lo rellenan.
+    """
+    refresh_token: str | None = None
 
 
 class UsuarioOut(BaseModel):
@@ -301,6 +312,19 @@ class ConectarWhatsAppIn(BaseModel):
     phone_number_id: str = Field(min_length=1, max_length=100)
 
 
+ModoConexionWhatsApp = Literal["standard", "coexistence"]
+
+
+class IniciarNeuroApiConnectIn(BaseModel):
+    """
+    POST /api/canales/whatsapp/neuroapi/iniciar — cómo se quiere el número:
+    `standard` (solo API) o `coexistence` (app de WhatsApp Business + API).
+    El cuerpo es opcional: sin él, `standard`.
+    """
+
+    connection_mode: ModoConexionWhatsApp = "standard"
+
+
 class IniciarNeuroApiConnectOut(BaseModel):
     """POST /api/canales/whatsapp/neuroapi/iniciar — a dónde redirigir para el Embedded Signup."""
     connect_url: str
@@ -311,6 +335,7 @@ class EstadoNeuroApiConnectOut(BaseModel):
 
     session_id: str
     estado: str
+    connection_mode: ModoConexionWhatsApp = "standard"
     # Resultado de la vinculación: vinculado | propio | ajeno | rechazado.
     resultado: str | None = None
     # Código RF-2 cuando no se vinculó (p. ej. numero_no_encontrado).
@@ -328,6 +353,8 @@ class NumeroWhatsAppOut(BaseModel):
     phone_number_id: str
     telefono_visible: str | None = None
     bsp_provider: str = "neuroapi"
+    # standard = solo API · coexistence = también en la app móvil de WhatsApp Business.
+    connection_mode: ModoConexionWhatsApp = "standard"
     estado: str
     es_principal: bool = False
     es_linea_avisos: bool = False
@@ -350,6 +377,8 @@ class ListaNumerosOut(BaseModel):
     tope: int | None = None
     plazas_usadas: int = 0
     plazas_libres: int | None = None
+    # El plan vigente incluye el modo coexistencia (planes.coexistencia_activa).
+    coexistencia_permitida: bool = True
 
 
 class VincularNumeroIn(BaseModel):
@@ -2086,6 +2115,8 @@ class PlanGerenciaOut(BaseModel):
     # Cupo de números de WhatsApp (57_planes_cupo_herramientas.sql, spec 005a
     # RF-1). None = sin tope. En el panel, 0 lo quita.
     max_numeros_whatsapp: int | None = None
+    # El plan permite vincular números en modo coexistencia (app móvil + API).
+    coexistencia_activa: bool = False
     # Lista de herramientas del agente por familia (plan_herramientas, RF-9).
     # Vacía = ninguna.
     herramientas_plan: list[str] = Field(default_factory=list)
@@ -2154,6 +2185,7 @@ class PlanCrearIn(BaseModel):
     # Any para no recibir el 422 automático de Pydantic con un no entero:
     # el router lo valida y responde 400 `cupo_no_valido`.
     max_numeros_whatsapp: Any = None
+    coexistencia_activa: bool = False
     # Lista de herramientas del agente por familia (RF-9). None = se siembra
     # desde los flags; [] = ninguna.
     herramientas_plan: list[str] | None = None
@@ -2211,6 +2243,8 @@ class PlanActualizarIn(BaseModel):
     # Cupo de números (RF-1). null = no tocar; 0 = quitar el tope. Se declara
     # Any para validar a mano con 400 y no con el 422 de Pydantic.
     max_numeros_whatsapp: Any = None
+    # null = no tocar.
+    coexistencia_activa: bool | None = None
     # Lista de herramientas por familia (RF-9). null = no tocar; [] = ninguna.
     herramientas_plan: list[str] | None = None
 
@@ -3058,3 +3092,61 @@ class PlantillaWhatsappOut(BaseModel):
 class PlantillaWhatsappEstadoIn(BaseModel):
     estado: EstadoPlantillaWhatsapp
     nota: str | None = Field(default=None, max_length=500)
+
+
+# ------------------------------------------------------------
+# Plantillas de WhatsApp de cada negocio (API de plantillas de NeuroAPI)
+# ------------------------------------------------------------
+CategoriaPlantilla = Literal["UTILITY", "MARKETING", "AUTHENTICATION"]
+EstadoPlantillaMeta = Literal["PENDING", "APPROVED", "REJECTED", "PAUSED", "DISABLED"]
+
+
+class PlantillaBotonIn(BaseModel):
+    tipo: Literal["QUICK_REPLY", "URL", "PHONE_NUMBER"]
+    texto: str = Field(min_length=1, max_length=25)
+    url: str | None = Field(default=None, max_length=2000)
+    telefono: str | None = Field(default=None, max_length=20)
+
+
+class PlantillaCrearIn(BaseModel):
+    """Lo que manda el creador visual; el backend arma y valida los `components` de Meta."""
+
+    nombre: str = Field(min_length=1, max_length=512)
+    idioma: str = Field(default="es_MX", max_length=10)
+    categoria: CategoriaPlantilla
+    encabezado: str | None = Field(default=None, max_length=200)
+    ejemplo_encabezado: str | None = Field(default=None, max_length=200)
+    cuerpo: str = Field(min_length=1, max_length=2000)
+    ejemplos_cuerpo: list[str] = Field(default_factory=list, max_length=20)
+    pie: str | None = Field(default=None, max_length=200)
+    botones: list[PlantillaBotonIn] = Field(default_factory=list, max_length=10)
+
+
+class PlantillaTenantOut(BaseModel):
+    nombre: str
+    idioma: str
+    categoria: CategoriaPlantilla
+    estado: EstadoPlantillaMeta
+    motivo_rechazo: str | None = None
+    componentes: list[dict[str, Any]] = Field(default_factory=list)
+    # Cuántos valores pide el cuerpo al enviarla (mayor {{n}}); la UI arma el formulario con esto.
+    variables_cuerpo: int = 0
+    variable_encabezado: bool = False
+    actualizada_en: datetime
+    sincronizada_en: datetime | None = None
+
+
+class PlantillaPruebaIn(BaseModel):
+    """Envío de prueba de una plantilla APPROVED a un teléfono."""
+
+    telefono: str = Field(min_length=8, max_length=20)
+    valores_cuerpo: list[str] = Field(default_factory=list, max_length=20)
+    valor_encabezado: str | None = Field(default=None, max_length=200)
+
+    @field_validator("telefono")
+    @classmethod
+    def _solo_digitos(cls, v: str) -> str:
+        limpio = re.sub(r"[\s\-+()]", "", v)
+        if not re.fullmatch(r"\d{8,15}", limpio):
+            raise ValueError("Teléfono en formato internacional, ej. 593999999999")
+        return limpio

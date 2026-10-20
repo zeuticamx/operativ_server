@@ -535,6 +535,28 @@ async def test_una_caida_de_red_no_tumba_la_peticion(monkeypatch, contexto):
     assert r.texto == loop_agente.RESPUESTA_VACIA
 
 
+async def test_clave_rechazada_avisa_en_el_log(monkeypatch, contexto, caplog):
+    """Un 401 de Anthropic casi siempre es la clave: el log debe decirlo."""
+    respuesta_rechazada = SimpleNamespace(status_code=401, headers={}, request=None)
+
+    class ClaveRechazada:
+        def __init__(self):
+            self.messages = SimpleNamespace(create=self._create)
+
+        async def _create(self, **kwargs):
+            raise anthropic.AuthenticationError(
+                message="invalid x-api-key", response=respuesta_rechazada, body=None
+            )
+
+    monkeypatch.setattr(loop_agente, "_cliente", ClaveRechazada)
+
+    with caplog.at_level("ERROR", logger="operativai.agente.loop"):
+        r = await loop_agente.responder(contexto)
+
+    assert r.texto == loop_agente.RESPUESTA_VACIA
+    assert "ANTHROPIC_API_KEY" in caplog.text
+
+
 # ============================================================
 # 8. Caché del historial
 # ============================================================

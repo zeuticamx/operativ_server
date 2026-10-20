@@ -4,8 +4,9 @@ T8). Solo API, solo gerencia de plataforma (`gerencia_users`): un owner,
 superadmin, member, vendedor o proveedor de un negocio no las ve, y una sesión
 "ver como" tampoco (`gerencia_plataforma_actual` la rechaza con 403).
 
-NeuroAPI no tiene endpoint para crear ni consultar plantillas: se crean y
-aprueban a mano en Meta Business Manager. `reintentar` solo vuelve a
+Estas dos plantillas globales se crean y aprueban a mano en Meta Business
+Manager (las plantillas propias de cada negocio sí se administran por la API de
+NeuroAPI: routers/plantillas_whatsapp_tenant.py). `reintentar` solo vuelve a
 `pendiente_aprobacion` en nuestra BD; no llama a Meta ni a NeuroAPI. El estado
 también cambia por el evento `message_template_status_update` que llega al
 webhook de NeuroAPI; gana el último cambio.

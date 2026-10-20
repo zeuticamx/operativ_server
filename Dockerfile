@@ -11,6 +11,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Sin root: una ejecución de código en la app no da root dentro del contenedor.
+RUN useradd --system --uid 1001 --no-create-home app \
+    && chown -R app /app
+USER app
+
 EXPOSE 8000
 # main:socket_app y NO main:app: con `app` la capa Socket.IO (realtime.py)
 # no se monta, /socket.io/* cae en FastAPI (404) y el WebSocket de alertas

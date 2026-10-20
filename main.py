@@ -43,6 +43,7 @@ from routers import (
     pagos,
     pagos_stripe,
     plantillas_whatsapp,
+    plantillas_whatsapp_tenant,
     perfil,
     pipeline_config,
     reportes,
@@ -152,6 +153,7 @@ app.include_router(gerencia_operacion.router, prefix="/api")
 app.include_router(gerencia_planes.router, prefix="/api")
 app.include_router(gerencia_incidencias.router, prefix="/api")
 app.include_router(plantillas_whatsapp.router, prefix="/api")
+app.include_router(plantillas_whatsapp_tenant.router, prefix="/api")
 
 # Lo llama n8n con X-Internal-Token, no el frontend.
 app.include_router(eventos.router, prefix="/api")

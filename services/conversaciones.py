@@ -335,7 +335,10 @@ async def detalle(tenant_id: UUID, conversacion_id: UUID):
     mensajes = await fetch_all(
         """
         SELECT m.id, m.role, m.content, m.created_at,
-               COALESCE(pu.full_name, pu.email) AS enviado_por
+               COALESCE(
+                   pu.full_name, pu.email,
+                   CASE WHEN m.desde_app_movil THEN 'App móvil de WhatsApp Business' END
+               ) AS enviado_por
         FROM messages m
         LEFT JOIN portal_users pu ON pu.id = m.sender_portal_user_id
         WHERE m.conversation_id = $1
@@ -529,6 +532,9 @@ async def enviar_mensaje_humano(
     su propia respuesta.
     """
     canal, destinatario, cred = await _preparar_envio(tenant_id, conversacion_id)
+    # wamid del envío, cuando el proveedor lo devuelve: con él el eco que llega
+    # en modo coexistencia se reconoce como propio y no se duplica.
+    wamid: str | None = None
 
     if canal == "whatsapp" and cred["bsp_provider"] == "neuroapi":
         # El access_token de estas líneas es la API key de NeuroAPI, no un
@@ -542,7 +548,8 @@ async def enviar_mensaje_humano(
             phone_number_id=cred["phone_number_id"] or "",
         )
         try:
-            await proveedor.enviar_mensaje(destinatario, texto)
+            enviado = await proveedor.enviar_mensaje(destinatario, texto)
+            wamid = enviado.id_mensaje or None
         except whatsapp.ProveedorWhatsAppError as e:
             raise whatsapp.a_http(e)
     else:
@@ -552,16 +559,23 @@ async def enviar_mensaje_humano(
         except meta.MetaError as e:
             raise meta.a_http(e)
 
+    # Si el eco de coexistencia ganó la carrera y ya guardó este wamid, se le
+    # asigna el remitente del portal en vez de insertar un duplicado.
     fila = await fetch_one(
         """
-        INSERT INTO messages (conversation_id, tenant_id, role, content, sender_portal_user_id)
-        VALUES ($1, $2, 'human', $3, $4)
+        INSERT INTO messages
+            (conversation_id, tenant_id, role, content, sender_portal_user_id, channel_msg_id)
+        VALUES ($1, $2, 'human', $3, $4, $5)
+        ON CONFLICT (conversation_id, channel_msg_id) WHERE channel_msg_id IS NOT NULL
+        DO UPDATE SET sender_portal_user_id = EXCLUDED.sender_portal_user_id,
+                      desde_app_movil = false
         RETURNING id, role, content, created_at
         """,
         conversacion_id,
         tenant_id,
         texto,
         sender_portal_user_id,
+        wamid,
     )
     await execute(
         "UPDATE conversations SET last_message_at = NOW() WHERE id = $1",

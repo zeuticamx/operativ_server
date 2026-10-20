@@ -58,7 +58,7 @@ _COLUMNAS = """
     agente_ia_activo, gestion_vendedores_activo,
     herramientas_activo, crm_campo_activo, calendario_activo, activo, orden,
     stripe_price_id, modelos_permitidos, historial_maximo,
-    max_numeros_whatsapp,
+    max_numeros_whatsapp, coexistencia_activa,
     created_at AS creado_en, updated_at AS actualizado_en
 """
 
@@ -181,9 +181,10 @@ async def crear_plan(
                      agente_ia_activo, gestion_vendedores_activo,
                      herramientas_activo, crm_campo_activo, calendario_activo,
                      activo, orden, stripe_price_id, max_proveedores,
-                     modelos_permitidos, historial_maximo, max_numeros_whatsapp)
+                     modelos_permitidos, historial_maximo, max_numeros_whatsapp,
+                     coexistencia_activa)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                        $17, $18, $19)
+                        $17, $18, $19, $20)
                 """,
                 datos.nombre,
                 datos.descripcion,
@@ -204,6 +205,7 @@ async def crear_plan(
                 datos.modelos_permitidos,
                 datos.historial_maximo,
                 cupo,
+                datos.coexistencia_activa,
             )
         except asyncpg.UniqueViolationError:
             raise HTTPException(
@@ -228,6 +230,7 @@ async def crear_plan(
                 "precio_monthly": str(datos.precio_monthly),
                 "activo": datos.activo,
                 "max_numeros_whatsapp": cupo,
+                "coexistencia_activa": datos.coexistencia_activa,
                 "herramientas_plan": lista,
             },
             conn=conn,
@@ -335,6 +338,11 @@ async def actualizar_plan(
                 else (datos.historial_maximo or None)
             ),
             "max_numeros_whatsapp": nuevo_cupo,
+            "coexistencia_activa": (
+                anterior["coexistencia_activa"]
+                if datos.coexistencia_activa is None
+                else datos.coexistencia_activa
+            ),
             "activo": anterior["activo"] if datos.activo is None else datos.activo,
             "orden": anterior["orden"] if datos.orden is None else datos.orden,
             # None = no tocar; "" = borrarlo (ver PlanActualizarIn).
@@ -373,6 +381,7 @@ async def actualizar_plan(
                 modelos_permitidos = $17,
                 historial_maximo = $18,
                 max_numeros_whatsapp = $19,
+                coexistencia_activa = $20,
                 updated_at = NOW()
             WHERE nombre = $1
             """,
@@ -395,6 +404,7 @@ async def actualizar_plan(
             nuevo["modelos_permitidos"],
             nuevo["historial_maximo"],
             nuevo["max_numeros_whatsapp"],
+            nuevo["coexistencia_activa"],
         )
 
         if datos.herramientas_plan is not None and set(nueva_lista) != set(lista_anterior):
@@ -435,6 +445,19 @@ async def actualizar_plan(
                     "nombre": nombre,
                     "anterior": anterior["max_numeros_whatsapp"],
                     "nuevo": nuevo["max_numeros_whatsapp"],
+                },
+                conn=conn,
+            )
+        if anterior["coexistencia_activa"] != nuevo["coexistencia_activa"]:
+            await registrar_auditoria(
+                actor_email=gerente.email,
+                actor_portal_user_id=gerente.id,
+                accion="coexistencia_del_plan_cambiada",
+                tenant_id=None,
+                detalle={
+                    "nombre": nombre,
+                    "anterior": anterior["coexistencia_activa"],
+                    "nuevo": nuevo["coexistencia_activa"],
                 },
                 conn=conn,
             )

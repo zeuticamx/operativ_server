@@ -36,6 +36,7 @@ from schemas import (
     ConectarWhatsAppIn,
     ElegirPrincipalIn,
     EstadoNeuroApiConnectOut,
+    IniciarNeuroApiConnectIn,
     IniciarNeuroApiConnectOut,
     ListaNumerosOut,
     NumeroWhatsAppOut,
@@ -277,6 +278,7 @@ def _numero_out(fila, herramientas: list[str] | None = None) -> NumeroWhatsAppOu
         agente_activo=bool(fila["agente_activo"]),
         configuracion_incompleta=incompleta,
         herramientas=herramientas or [],
+        connection_mode=(fila["connection_mode"] if "connection_mode" in fila else None) or "standard",
     )
 
 
@@ -285,11 +287,13 @@ async def listar_numeros(tenant_id: UUID = Depends(tenant_actual)):
     """Números vinculados con plazas del cupo (RF-18: vendedor y proveedor reciben 403)."""
     async with conexion() as conn:
         lista = await numeros.listar(conn, tenant_id)
+        coexistencia = await numeros.coexistencia_permitida(conn, tenant_id)
     return ListaNumerosOut(
         numeros=[_numero_out(f) for f in lista.numeros],
         tope=lista.tope,
         plazas_usadas=lista.plazas_usadas,
         plazas_libres=lista.plazas_libres,
+        coexistencia_permitida=coexistencia,
     )
 
 
@@ -382,6 +386,7 @@ async def conectar_whatsapp(
 # ============================================================
 @router.post("/whatsapp/neuroapi/iniciar", response_model=IniciarNeuroApiConnectOut)
 async def iniciar_neuroapi_connect(
+    datos_entrada: IniciarNeuroApiConnectIn | None = None,
     tenant_id: UUID = Depends(tenant_actual),
     _: UsuarioActual = Depends(gerencia_actual),
 ):
@@ -391,7 +396,14 @@ async def iniciar_neuroapi_connect(
     Business (Embedded Signup de Meta, mediado por NeuroAPI). El resultado
     real de la vinculación llega después, por el webhook de
     /whatsapp/neuroapi/webhook — acá solo se abre el trámite.
+
+    `connection_mode` (cuerpo opcional, por defecto `standard`) dice si el
+    número queda solo para la API o también en la app de WhatsApp Business
+    (`coexistence`). La coexistencia depende del plan: 402
+    `coexistencia_no_incluida_en_plan` si el vigente no la incluye.
     """
+    modo = datos_entrada.connection_mode if datos_entrada else "standard"
+
     if not settings.neuroapi_connect_configurado:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -402,8 +414,10 @@ async def iniciar_neuroapi_connect(
     # se abre el trámite (el resultado final se consulta en .../neuroapi/estado).
     async with conexion() as conn:
         await numeros.comprobar_alta_previa(conn, tenant_id)
+        if modo == "coexistence":
+            await numeros.exigir_coexistencia(conn, tenant_id)
 
-    datos = await neuroapi_connect.crear_connect_session(tenant_id)
+    datos = await neuroapi_connect.crear_connect_session(tenant_id, modo)
     connect_url = datos.get("url") or datos.get("connect_url")
     session_id = datos.get("session_id") or datos.get("id")
     if not connect_url or not session_id:
@@ -416,10 +430,15 @@ async def iniciar_neuroapi_connect(
             detail="NeuroAPI no devolvió una sesión válida",
         )
 
+    # `status` arranca en su valor por defecto, 'pendiente': el resultado real
+    # lo escribe el webhook. La fila no se puede guardar antes de la llamada a
+    # NeuroAPI porque `session_id` solo se conoce con su respuesta.
     await execute(
-        "INSERT INTO neuroapi_connect_sessions (tenant_id, session_id) VALUES ($1, $2)",
+        "INSERT INTO neuroapi_connect_sessions (tenant_id, session_id, connection_mode) "
+        "VALUES ($1, $2, $3)",
         tenant_id,
         session_id,
+        modo,
     )
 
     return IniciarNeuroApiConnectOut(connect_url=connect_url)
@@ -432,7 +451,7 @@ async def estado_neuroapi_connect(
 ):
     """Resultado del alta por NeuroAPI: estado de la sesión y código RF-2 si falló."""
     fila = await fetch_one(
-        "SELECT session_id, status, detalle FROM neuroapi_connect_sessions "
+        "SELECT session_id, status, detalle, connection_mode FROM neuroapi_connect_sessions "
         "WHERE session_id = $1 AND tenant_id = $2",
         session_id,
         tenant_id,
@@ -454,6 +473,7 @@ async def estado_neuroapi_connect(
     return EstadoNeuroApiConnectOut(
         session_id=fila["session_id"],
         estado=fila["status"],
+        connection_mode=fila["connection_mode"],
         resultado=resultado,
         codigo=codigo,
         phone_number_id=phone_number_id,

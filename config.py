@@ -23,6 +23,29 @@ class Settings:
     ACCESS_TOKEN_MINUTES: int = int(os.getenv("ACCESS_TOKEN_MINUTES", "60"))
     REFRESH_TOKEN_DAYS: int = int(os.getenv("REFRESH_TOKEN_DAYS", "30"))
 
+    # ---- Refresh token en cookie HttpOnly (spec 006) ----
+    # El portal y la API viven en dominios distintos, así que la cookie
+    # necesita SameSite=None (y por lo tanto Secure) para viajar en la
+    # petición cross-site a /api/auth/refresh. En local sobre HTTP plano no
+    # hay forma de poner Secure=true y que el navegador la acepte: ahí se
+    # baja COOKIE_SECURE a false (o se usa `npm run dev:https`).
+    COOKIE_REFRESH_NOMBRE: str = os.getenv("COOKIE_REFRESH_NOMBRE", "op_refresh")
+    COOKIE_SECURE: bool = os.getenv("COOKIE_SECURE", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    COOKIE_SAMESITE: str = os.getenv("COOKIE_SAMESITE", "none").strip().lower()
+    # Ventana de migración: con true, /auth/refresh y /auth/logout todavía
+    # aceptan el refresh_token en el body aunque la petición no sea de la
+    # app móvil (cliente viejo con el token en localStorage). Apagar una vez
+    # que el frontend nuevo (sin ese localStorage) esté desplegado.
+    REFRESH_BODY_LEGACY: bool = os.getenv("REFRESH_BODY_LEGACY", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
     # ---- Endpoint interno para n8n ----
     # /api/eventos/* lo llama n8n, que no tiene sesión de portal y por lo
     # tanto no puede mandar el JWT de portal_users. Se autentica con este
@@ -113,7 +136,9 @@ class Settings:
     # Clave de la API de Anthropic para el agente. Sin esto el bucle del
     # modelo no arranca (el resto del flujo sí: guardar el mensaje, avisar
     # al vendedor, escalar a humano).
-    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+    # .strip(): un espacio o salto de línea pegado en el panel de despliegue
+    # hace que Anthropic responda 401 en cada mensaje.
+    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "").strip()
     # Tope de tokens de salida por llamada al modelo. Cuenta el razonamiento
     # además del texto visible: en los modelos actuales el pensamiento viene
     # activado por defecto, así que un tope ajustado a la respuesta corta la

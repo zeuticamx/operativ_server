@@ -259,6 +259,39 @@ async def test_la_actualizacion_queda_en_la_bitacora(http_client, gerente, nombr
     assert asiento["detalle"]["cambios"]["precio_monthly"] == "10.00"
 
 
+@pytest.mark.asyncio
+async def test_gerencia_asigna_la_coexistencia_al_plan(http_client, gerente, nombre_plan):
+    # Por defecto un plan nuevo no la incluye.
+    r = await _crear(http_client, gerente["headers"], nombre=nombre_plan)
+    assert r.json()["coexistencia_activa"] is False
+
+    url = f"/api/gerencia/planes/{nombre_plan}"
+    r = await http_client.patch(url, json={"coexistencia_activa": True}, headers=gerente["headers"])
+    assert r.status_code == 200
+    assert r.json()["coexistencia_activa"] is True
+
+    # Un PATCH sin el campo no la toca.
+    r = await http_client.patch(url, json={"descripcion": "otra"}, headers=gerente["headers"])
+    assert r.json()["coexistencia_activa"] is True
+
+    r = await http_client.patch(url, json={"coexistencia_activa": False}, headers=gerente["headers"])
+    assert r.json()["coexistencia_activa"] is False
+
+    asientos = await fetch_one(
+        "SELECT COUNT(*) AS n FROM gerencia_auditoria "
+        "WHERE accion = 'coexistencia_del_plan_cambiada' AND detalle->>'nombre' = $1",
+        nombre_plan,
+    )
+    assert asientos["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_crear_un_plan_con_coexistencia(http_client, gerente, nombre_plan):
+    r = await _crear(http_client, gerente["headers"], nombre=nombre_plan, coexistencia_activa=True)
+    assert r.status_code == 201
+    assert r.json()["coexistencia_activa"] is True
+
+
 # ------------------------------------------------------------
 # 4. Lo que ve un tenant contratando no se rompe
 # ------------------------------------------------------------

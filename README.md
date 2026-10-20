@@ -106,11 +106,63 @@ POST   /api/auth/reenviar-codigo   Código nuevo para un alta pendiente
 POST   /api/auth/recuperar/solicitar    Código de recuperación al correo (siempre 202)
 POST   /api/auth/recuperar/restablecer  Código + contraseña nueva (204; cierra sesiones)
 POST   /api/auth/login
-POST   /api/auth/refresh
+POST   /api/auth/refresh           Cookie (web) o body (app móvil) → TokenOut, rota la sesión
+POST   /api/auth/logout            Cierra la sesión de refresh actual (siempre 204)
 GET    /api/auth/yo
 POST   /api/auth/invitacion/revisar     A qué negocio y con qué rol invita un enlace
 POST   /api/auth/invitacion/aceptar     Enlace + contraseña → crea la cuenta (TokenOut)
 ```
+
+### Sesión y refresh token (spec 006, `sql/62_refresh_sesiones.sql`)
+
+El refresh token del portal web no va en el cuerpo de la respuesta ni se
+guarda en `localStorage`: viaja en una cookie HttpOnly
+(`COOKIE_REFRESH_NOMBRE`, por defecto `op_refresh`), puesta por
+`/auth/login`, `/verificar`, `/google` e `/invitacion/aceptar`
+(`routers.auth._emitir_sesion`). `TokenOut.refresh_token` sale `null` para
+el portal.
+
+| Atributo | Valor | Por qué |
+|---|---|---|
+| `HttpOnly` | sí | JS (y un XSS) no puede leerlo |
+| `Secure` | `COOKIE_SECURE` (default `true`) | en local sobre HTTP plano (sin `dev:https`) hay que bajarlo a `false`, si no el navegador descarta la cookie |
+| `SameSite` | `COOKIE_SAMESITE` (default `none`) | portal y API en dominios distintos: `Lax` no viajaría en la petición cross-site a `/auth/refresh` |
+| `Path` | `/api/auth` | no sale en ninguna otra petición |
+| `Max-Age` | `REFRESH_TOKEN_DAYS` días | igual que antes |
+
+**App móvil** (fuera de este repo, no puede usar cookies de navegador):
+manda `X-Cliente: movil` y sigue recibiendo/mandando el refresh en el
+cuerpo, sin cookie ni Origin.
+
+**Despliegue con portal y API en dominios distintos.** La cookie de
+terceros la bloquean Safari y algunos Chrome, y el refresco fallaría sin
+aviso. Para evitarlo el portal puede hacer de proxy: construir el frontend
+con el build arg `NEXT_PUBLIC_API_PROXY=true` (más `NEXT_PUBLIC_API_URL`
+apuntando al backend). Entonces el navegador llama a `/api/*` en el origen
+del portal, `next.config.ts` lo reenvía al backend y la cookie es de primera
+parte. En el backend: `COOKIE_SAMESITE=lax`, `COOKIE_SECURE=true` y el
+origen del portal en `FRONTEND_ORIGINS` (el navegador lo manda como `Origin`
+en cada POST). Los sockets (`/socket.io`) siguen yendo directo al backend,
+así que `FRONTEND_ORIGINS` y el CSP del portal los siguen necesitando.
+
+**CSRF.** Con `SameSite=None` la cookie viaja en cualquier petición
+cross-site, así que `/auth/refresh` y `/auth/logout` exigen `Origin` en
+`FRONTEND_ORIGINS` (403 si falta o no está en la lista); la app móvil
+queda exenta porque no manda Origin ni usa la cookie.
+
+**Rotación y reuso.** Cada refresh es de un solo uso: `refresh_sesiones`
+(una fila por sesión/dispositivo) lo marca `usado_en` al canjearlo por uno
+nuevo. Reusar uno ya canjeado es 401; si pasaron más de 30 segundos
+(`_REUSO_GRACIA_SEGUNDOS`, la carrera normal de dos pestañas refrescando
+casi a la vez) se revocan **todas** las sesiones del usuario — la señal de
+que alguien más también lo tenía. Un refresh emitido antes de esta spec
+(sin `jti`) se rechaza una vez; el siguiente login ya deja uno rotable.
+
+**Migración.** `REFRESH_BODY_LEGACY` (default `true`) deja que un cliente
+web viejo, con el refresh todavía en su `localStorage`, lo siga mandando en
+el body de `/auth/refresh`; apagarla una vez desplegado el frontend nuevo
+(`frontend/lib/auth.ts` ya no lo guarda ahí, solo lo reenvía una vez si lo
+encuentra y lo borra).
 
 ### Roles dentro de un negocio
 
@@ -296,7 +348,9 @@ el usuario lo pone el portal con su propia cuenta regresiva.
 NOW()`; `deps.usuario_actual` y `/auth/refresh` rechazan (401) los tokens
 con `iat` anterior. Sin esto una sesión robada sobrevivía 30 días al cambio
 (refresh token). `iat` va en segundos enteros: un token emitido en el mismo
-segundo del cambio sigue valiendo.
+segundo del cambio sigue valiendo. Además borra las filas de
+`refresh_sesiones` del usuario (spec 006): ya no podrían canjearse de
+todos modos, pero así no quedan ocupando la tabla hasta su `expira_en`.
 
 ### Aceptación de Términos y Condiciones
 
@@ -2049,3 +2103,29 @@ Se puede desarrollar y probar todo hoy con las páginas propias.
   `"proveedor": "neuroapi"` y el portal le pide al negocio que retire el
   acceso de la app en su Meta Business Manager, que es lo que la desvincula
   del todo.
+
+## Plantillas de WhatsApp del negocio
+
+Cada negocio crea, consulta y elimina sus plantillas por la API de plantillas de NeuroAPI
+(`/messaging/templates`, scope `whatsapp_cloud_api`), con la `x-api-key` de su línea activa
+(`bsp_provider='neuroapi'`; cae a `NEUROAPI_API_KEY`). No confundir con las dos plantillas **globales** de
+avisos de cita (`/api/gerencia/plantillas-whatsapp`, spec 004), que no se tocan.
+
+| Endpoint | Rol | Notas |
+|---|---|---|
+| `GET /api/plantillas-whatsapp?categoria=&estado=&sincronizar=` | `negocio_actual` | Lee la caché; `sincronizar=true` la refresca desde NeuroAPI |
+| `GET /api/plantillas-whatsapp/{nombre}` | `negocio_actual` | Detalle para la vista previa |
+| `POST /api/plantillas-whatsapp` | `gerencia_actual` | Valida (slug, `{{n}}` consecutivas, largos) antes de llamar a Meta; queda `PENDING` |
+| `DELETE /api/plantillas-whatsapp/{nombre}?confirmar=true` | `gerencia_actual` | Permanente en Meta; sin `confirmar` es 400 |
+| `POST /api/plantillas-whatsapp/{nombre}/prueba` | `gerencia_actual` | Solo `APPROVED`; `template.components[].parameters` |
+
+- Tabla `plantillas_whatsapp_tenant` (`sql/63`): **caché**, la fuente de verdad es Meta. Una plantilla de otro
+  negocio es 404. `/api/plantillas-whatsapp` está en `RUTAS_SENSIBLES` (en "ver como" solo se lee).
+- Errores de NeuroAPI: 400 → 422 con el motivo de Meta; 403 → 502 `scope_whatsapp_cloud_api_faltante`;
+  404 → 404; 429 → 429; el resto → 502.
+- Webhook: `message_template_status_update` se aplica también a esta caché
+  (`plantillas_tenant.aplicar_evento_meta`). El evento no trae tenant: se resuelve por `meta_template_id`,
+  luego `waba_id` y, si no, solo cuando el nombre es de un único negocio; con homónimos se ignora.
+- Código: `services/neuroapi_plantillas.py`, `services/plantillas_reglas.py` (puras),
+  `services/plantillas_tenant.py`, `routers/plantillas_whatsapp_tenant.py`; tests en
+  `tests/test_plantillas_tenant.py`. Frontend: `/plantillas` y `/plantillas/nueva`.

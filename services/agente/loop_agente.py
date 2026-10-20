@@ -196,6 +196,14 @@ async def responder(contexto: ContextoMensaje) -> Respuesta:
             "La API respondió %s para la conversación %s",
             e.status_code, contexto.conversation_id,
         )
+        if e.status_code in (401, 403):
+            # Casi siempre es la clave: revocada, de otro proyecto, o con
+            # comillas o espacios pegados en el panel de despliegue.
+            log.error(
+                "Anthropic rechazó ANTHROPIC_API_KEY (%s): revisa que la clave sea "
+                "vigente y no tenga comillas ni espacios en el panel de despliegue.",
+                e.status_code,
+            )
         respuesta.texto = RESPUESTA_VACIA
     except anthropic.APIConnectionError:
         log.error("Sin conexión con la API para la conversación %s", contexto.conversation_id)

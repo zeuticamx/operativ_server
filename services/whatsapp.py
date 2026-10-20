@@ -441,6 +441,23 @@ class NeuroApiProvider(ProveedorWhatsApp):
         data = await self._post(cuerpo)
         return self._a_resultado(data)
 
+    async def enviar_plantilla_con_componentes(
+        self,
+        destinatario: str,
+        plantilla: str,
+        idioma: str,
+        componentes: list[dict[str, Any]],
+    ) -> ResultadoEnvio:
+        """
+        Como `enviar_plantilla`, pero con `template.components[]` ya armado
+        (header/body con sus `parameters`), para las plantillas de cada negocio.
+        """
+        template: dict[str, Any] = {"name": plantilla, "language": {"code": idioma}}
+        if componentes:
+            template["components"] = componentes
+        data = await self._post({"to": destinatario, "type": "template", "template": template})
+        return self._a_resultado(data)
+
     def verificar_webhook(self, cuerpo_crudo: bytes, headers: dict[str, str]) -> bool:
         """
         Firma esperada: cabecera `X-Hub-Signature-256: sha256=<hex>`, HMAC

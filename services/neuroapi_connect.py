@@ -30,13 +30,22 @@ log = logging.getLogger("operativai.canales.neuroapi_connect")
 TIMEOUT = httpx.Timeout(15.0)
 
 
-async def crear_connect_session(tenant_id: UUID) -> dict[str, Any]:
+async def crear_connect_session(
+    tenant_id: UUID, connection_mode: str = "standard"
+) -> dict[str, Any]:
     """
     Crea la sesión en NeuroAPI y devuelve su JSON crudo.
+
+    `connection_mode` ('standard' | 'coexistence') NO viaja a NeuroAPI: el
+    payload es el mismo en los dos modos. Lo guarda el router junto al
+    `session_id` y el webhook lo copia al número al completarse la sesión.
 
     Lanza 502 si NeuroAPI rechaza o no contesta: quien llama no tiene nada
     que limpiar todavía (no se guardó ninguna fila hasta tener la sesión).
     """
+    log.info(
+        "Creando Connect Session de NeuroAPI (tenant=%s, modo=%s)", tenant_id, connection_mode
+    )
     payload = {
         "service_type": "whatsapp_cloud_api",
         "return_url": f"{settings.BASE_URL_FRONTEND}/canales?whatsapp_neuroapi=retorno",

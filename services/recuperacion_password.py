@@ -206,4 +206,11 @@ async def _aplicar_cambio(user_id: UUID, code_hash: str, password_nueva: str) ->
                 password_hash,
             )
 
+            # Limpieza de las filas de refresh_sesiones (spec 006): ya no
+            # podrían canjearse (el chequeo de arriba las rechaza igual),
+            # pero sin esto quedarían en la tabla hasta su `expira_en`.
+            await conn.execute(
+                "DELETE FROM refresh_sesiones WHERE user_id = $1", user_id
+            )
+
     log.info("Contraseña restablecida para el usuario %s", user_id)

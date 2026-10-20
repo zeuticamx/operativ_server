@@ -3,16 +3,24 @@
 import math
 import secrets
 from datetime import datetime, timedelta, timezone
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import asyncpg
 import jwt
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Request,
+    Response,
+    status,
+)
 
 from config import settings
 from services.correo import ErrorEnvioCorreo, enviar_codigo_verificacion
 from services.google_login import TokenGoogleInvalido, verificar_credential
-from services import invitaciones, onboarding, recuperacion_password
+from services import invitaciones, limite_login, onboarding, recuperacion_password
 from services.onboarding import PROMPT_INICIAL
 from routers.perfil import version_foto
 from deps import ROLES_GERENCIA, UsuarioActual, usuario_actual
@@ -45,6 +53,129 @@ from schemas import (
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+# ============================================================
+# SESIÓN: cookie de refresh, rotación y CSRF (spec 006)
+# ============================================================
+# El refresh token del portal web ya no viaja en el cuerpo de la respuesta
+# ni se guarda en localStorage: va en una cookie HttpOnly, de un solo uso
+# (cada /auth/refresh lo canjea por uno nuevo y apaga el anterior en
+# `refresh_sesiones`, sql/62). La app móvil (fuera de este repo) no puede
+# usar cookies de navegador y sigue recibiendo/mandando el refresh en el
+# cuerpo — se identifica con la cabecera `X-Cliente: movil`.
+#
+# Reusar un refresh ya canjeado es la señal de que alguien más lo tiene
+# (robo) salvo que sea la carrera normal de dos pestañas refrescando casi
+# al mismo tiempo; `_REUSO_GRACIA_SEGUNDOS` separa ambos casos (ver
+# `refresh` más abajo).
+_REUSO_GRACIA_SEGUNDOS = 30
+
+
+def _es_movil(request: Request) -> bool:
+    return request.headers.get("X-Cliente") == "movil"
+
+
+def _verificar_origen(request: Request) -> None:
+    """
+    CSRF de /auth/refresh y /auth/logout: con SameSite=None (dominios
+    distintos, spec 006 D1) la cookie viaja en cualquier petición
+    cross-site, así que sin esto cualquier sitio podría canjear o cerrar la
+    sesión de quien tenga el portal abierto. La app móvil no manda Origin
+    ni usa la cookie: queda exenta.
+    """
+    if _es_movil(request):
+        return
+    origen = request.headers.get("origin")
+    if origen is None or origen not in settings.FRONTEND_ORIGINS:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Origen no permitido")
+
+
+def _fijar_refresh(response: Response, token: str) -> None:
+    response.set_cookie(
+        key=settings.COOKIE_REFRESH_NOMBRE,
+        value=token,
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.COOKIE_SAMESITE,
+        path="/api/auth",
+        max_age=settings.REFRESH_TOKEN_DAYS * 86400,
+    )
+
+
+def _borrar_refresh(response: Response) -> None:
+    response.delete_cookie(
+        key=settings.COOKIE_REFRESH_NOMBRE,
+        path="/api/auth",
+        samesite=settings.COOKIE_SAMESITE,
+        secure=settings.COOKIE_SECURE,
+    )
+
+
+def _borrar_refresh_si_web(request: Request, response: Response) -> None:
+    """La app móvil no tiene cookie que borrar: solo el portal la usa."""
+    if not _es_movil(request):
+        _borrar_refresh(response)
+
+
+def _refresh_de_peticion(request: Request, datos: RefreshIn | None) -> str | None:
+    """
+    De dónde sale el refresh token según quien llama:
+      - app móvil (`X-Cliente: movil`): del cuerpo, nunca hay cookie.
+      - portal web: de la cookie `op_refresh`; mientras
+        `REFRESH_BODY_LEGACY` siga encendida (ventana de migración de un
+        cliente viejo que todavía lo trae de su localStorage) también se
+        acepta del cuerpo.
+    """
+    if _es_movil(request):
+        return datos.refresh_token if datos else None
+    if settings.REFRESH_BODY_LEGACY and datos and datos.refresh_token:
+        return datos.refresh_token
+    return request.cookies.get(settings.COOKIE_REFRESH_NOMBRE)
+
+
+async def _emitir_sesion(
+    request: Request,
+    response: Response,
+    user_id: UUID,
+    tenant_id: UUID | None,
+    role: str,
+    conn: asyncpg.Connection | None = None,
+) -> TokenOut:
+    """
+    Access token nuevo + una sesión de refresh nueva: una fila en
+    `refresh_sesiones` (de un solo uso, ver `refresh` más abajo) y, según
+    el cliente, el refresh en la cookie HttpOnly o en el cuerpo.
+
+    `conn` es opcional: cuando quien llama ya abrió una transacción (alta
+    de cuenta, invitación aceptada) se reutiliza, así un fallo posterior en
+    esa misma transacción también deshace esta fila; login y refresh no
+    tienen una transacción propia y usan el pool.
+    """
+    ejecutar = conn.execute if conn is not None else execute
+
+    # Limpieza oportunista, igual que email_verifications en /registro: no
+    # hace falta un cron aparte para que la tabla no crezca con sesiones
+    # vencidas hace tiempo.
+    await ejecutar("DELETE FROM refresh_sesiones WHERE expira_en < NOW()")
+
+    jti = uuid4()
+    expira_en = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_DAYS)
+    await ejecutar(
+        "INSERT INTO refresh_sesiones (jti, user_id, expira_en) VALUES ($1, $2, $3)",
+        jti,
+        user_id,
+        expira_en,
+    )
+
+    access = crear_access_token(user_id, tenant_id, role)
+    refresh = crear_refresh_token(user_id, jti)
+
+    if _es_movil(request):
+        return TokenOut(access_token=access, refresh_token=refresh)
+
+    _fijar_refresh(response, refresh)
+    return TokenOut(access_token=access, refresh_token=None)
 
 
 # ============================================================
@@ -281,7 +412,7 @@ async def registro(datos: RegistroIn):
 
 
 @router.post("/verificar", response_model=TokenOut, status_code=201)
-async def verificar(datos: VerificarCodigoIn):
+async def verificar(datos: VerificarCodigoIn, request: Request, response: Response):
     """Paso 2: comprueba el código y crea la cuenta."""
     email = datos.email.lower()
 
@@ -343,6 +474,9 @@ async def verificar(datos: VerificarCodigoIn):
                 await conn.execute(
                     "DELETE FROM email_verifications WHERE email = $1", email
                 )
+                token = await _emitir_sesion(
+                    request, response, user_id, tenant_id, "owner", conn=conn
+                )
     except asyncpg.UniqueViolationError:
         # Alguien registró ese correo entre el /registro y el /verificar.
         # Lo atrapa el UNIQUE de portal_users.email, no una comprobación
@@ -353,10 +487,7 @@ async def verificar(datos: VerificarCodigoIn):
             detail="Ya existe una cuenta con ese correo",
         )
 
-    return TokenOut(
-        access_token=crear_access_token(user_id, tenant_id, "owner"),
-        refresh_token=crear_refresh_token(user_id),
-    )
+    return token
 
 
 @router.post(
@@ -414,7 +545,19 @@ async def reenviar_codigo(datos: ReenviarCodigoIn):
 
 
 @router.post("/login", response_model=TokenOut)
-async def login(datos: LoginIn):
+async def login(datos: LoginIn, request: Request, response: Response):
+    # Tope de fallos por correo y por IP (services/limite_login.py). Va antes
+    # de tocar la BD o gastar un hash. Detrás del proxy la IP es la de éste
+    # salvo que uvicorn corra con --proxy-headers/--forwarded-allow-ips.
+    ip = request.client.host if request.client else None
+    espera = limite_login.segundos_de_espera(datos.email, ip)
+    if espera:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Demasiados intentos fallidos. Vuelve a intentarlo más tarde.",
+            headers={"Retry-After": str(espera)},
+        )
+
     fila = await fetch_one(
         """
         SELECT id, tenant_id, password_hash, role, is_active,
@@ -430,16 +573,19 @@ async def login(datos: LoginIn):
     # midiendo qué respuesta llega.
     if fila is None:
         hash_password(datos.password)  # gasta el tiempo igual
+        limite_login.registrar_fallo(datos.email, ip)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Correo o contraseña incorrectos",
         )
 
     if not verify_password(datos.password, fila["password_hash"]):
+        limite_login.registrar_fallo(datos.email, ip)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Correo o contraseña incorrectos",
         )
+    limite_login.limpiar_correo(datos.email)
 
     if not fila["is_active"]:
         raise HTTPException(
@@ -469,16 +615,11 @@ async def login(datos: LoginIn):
         fila["id"],
     )
 
-    return TokenOut(
-        access_token=crear_access_token(
-            fila["id"], fila["tenant_id"], fila["role"]
-        ),
-        refresh_token=crear_refresh_token(fila["id"]),
-    )
+    return await _emitir_sesion(request, response, fila["id"], fila["tenant_id"], fila["role"])
 
 
 @router.post("/google", response_model=TokenOut)
-async def login_google(datos: GoogleLoginIn):
+async def login_google(datos: GoogleLoginIn, request: Request, response: Response):
     """
     Login/alta con Google, alternativa opcional al correo+contraseña de
     arriba — no lo reemplaza, ambos caminos conviven.
@@ -599,52 +740,143 @@ async def login_google(datos: GoogleLoginIn):
         fila["id"],
     )
 
-    return TokenOut(
-        access_token=crear_access_token(
-            fila["id"], fila["tenant_id"], fila["role"]
-        ),
-        refresh_token=crear_refresh_token(fila["id"]),
-    )
+    return await _emitir_sesion(request, response, fila["id"], fila["tenant_id"], fila["role"])
 
 
 @router.post("/refresh", response_model=TokenOut)
-async def refresh(datos: RefreshIn):
-    try:
-        payload = decodificar_token(datos.refresh_token, "refresh")
-    except jwt.PyJWTError:
+async def refresh(request: Request, response: Response, datos: RefreshIn = RefreshIn()):
+    """
+    Canjea el refresh vigente por uno nuevo (rotación, spec 006): el que
+    llega queda marcado `usado_en` y deja de servir, aunque no haya
+    vencido. Reusarlo después es la señal de que alguien más lo tiene —
+    salvo la carrera normal de dos pestañas refrescando casi a la vez
+    (`_REUSO_GRACIA_SEGUNDOS`); fuera de esa ventana se revocan TODAS las
+    sesiones del usuario.
+    """
+    _verificar_origen(request)
+
+    token = _refresh_de_peticion(request, datos)
+    if token is None:
+        _borrar_refresh_si_web(request, response)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Refresh token inválido o expirado",
         )
 
-    fila = await fetch_one(
-        """
-        SELECT id, tenant_id, role, is_active, credenciales_cambiadas_en
-        FROM portal_users WHERE id = $1
-        """,
-        UUID(payload["sub"]),
-    )
-
-    if fila is None or not fila["is_active"]:
+    try:
+        payload = decodificar_token(token, "refresh")
+    except jwt.PyJWTError:
+        _borrar_refresh_si_web(request, response)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Usuario no encontrado o inactivo",
+            detail="Refresh token inválido o expirado",
         )
 
-    # Un refresh token de antes de un cambio de contraseña ya no renueva
-    # nada: sin esto, una sesión robada sobreviviría 30 días al cambio.
-    if emitido_antes_de(payload, fila["credenciales_cambiadas_en"]):
+    jti = payload.get("jti")
+    if not jti:
+        # Token emitido antes de spec 006: no tiene sesión que rastrear ni
+        # se puede rotar. Se rechaza una vez; el siguiente login ya deja
+        # uno con jti.
+        _borrar_refresh_si_web(request, response)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="La sesión ya no es válida. Inicia sesión de nuevo.",
+            detail="Refresh token inválido o expirado",
         )
 
-    return TokenOut(
-        access_token=crear_access_token(
-            fila["id"], fila["tenant_id"], fila["role"]
-        ),
-        refresh_token=crear_refresh_token(fila["id"]),
-    )
+    error: str | None = None
+    token_salida: TokenOut | None = None
+
+    async with get_pool().acquire() as conn:
+        async with conn.transaction():
+            fila = await conn.fetchrow(
+                """
+                SELECT user_id, expira_en, usado_en
+                FROM refresh_sesiones WHERE jti = $1 FOR UPDATE
+                """,
+                UUID(jti),
+            )
+
+            if fila is None:
+                error = "sin_sesion"
+            elif fila["usado_en"] is not None:
+                # Ya se canjeó. Dentro del margen de gracia puede ser la
+                # carrera normal de dos pestañas refrescando casi a la vez;
+                # fuera de él, se trata como refresh robado y usado dos
+                # veces: se cierran todas las sesiones del usuario.
+                en_gracia = (
+                    datetime.now(timezone.utc) - fila["usado_en"]
+                ) < timedelta(seconds=_REUSO_GRACIA_SEGUNDOS)
+                if not en_gracia:
+                    await conn.execute(
+                        "DELETE FROM refresh_sesiones WHERE user_id = $1",
+                        fila["user_id"],
+                    )
+                error = "reusado"
+            elif fila["expira_en"] < datetime.now(timezone.utc):
+                error = "vencido"
+            else:
+                usuario = await conn.fetchrow(
+                    """
+                    SELECT id, tenant_id, role, is_active, credenciales_cambiadas_en
+                    FROM portal_users WHERE id = $1
+                    """,
+                    fila["user_id"],
+                )
+                if usuario is None or not usuario["is_active"]:
+                    error = "usuario_invalido"
+                elif emitido_antes_de(payload, usuario["credenciales_cambiadas_en"]):
+                    # Un cambio de contraseña invalida también el refresh
+                    # (además de la limpieza de sql/32 sobre la propia
+                    # tabla): sin esto una sesión robada sobreviviría al
+                    # cambio hasta que expirara su JWT.
+                    error = "credenciales_cambiadas"
+                else:
+                    await conn.execute(
+                        "UPDATE refresh_sesiones SET usado_en = NOW() WHERE jti = $1",
+                        UUID(jti),
+                    )
+                    token_salida = await _emitir_sesion(
+                        request,
+                        response,
+                        usuario["id"],
+                        usuario["tenant_id"],
+                        usuario["role"],
+                        conn=conn,
+                    )
+
+    if error is not None:
+        _borrar_refresh_si_web(request, response)
+        detalle = (
+            "La sesión ya no es válida. Inicia sesión de nuevo."
+            if error == "credenciales_cambiadas"
+            else "Refresh token inválido o expirado"
+        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=detalle)
+
+    assert token_salida is not None
+    return token_salida
+
+
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+async def logout(request: Request, response: Response, datos: RefreshIn = RefreshIn()):
+    """
+    Cierra la sesión de refresh actual (spec 006). Siempre 204, exista o no
+    la cookie/sesión: no distingue "ya estaba cerrada" de "se cerró ahora",
+    para no filtrar ese estado a quien no tenga una cookie válida.
+    """
+    _verificar_origen(request)
+
+    token = _refresh_de_peticion(request, datos)
+    if token:
+        try:
+            payload = decodificar_token(token, "refresh")
+        except jwt.PyJWTError:
+            payload = None
+        jti = payload.get("jti") if payload else None
+        if jti:
+            await execute("DELETE FROM refresh_sesiones WHERE jti = $1", UUID(jti))
+
+    _borrar_refresh_si_web(request, response)
 
 
 # ============================================================
@@ -721,7 +953,9 @@ async def revisar_invitacion(datos: InvitacionTokenIn):
 
 
 @router.post("/invitacion/aceptar", response_model=TokenOut, status_code=201)
-async def aceptar_invitacion(datos: AceptarInvitacionIn):
+async def aceptar_invitacion(
+    datos: AceptarInvitacionIn, request: Request, response: Response
+):
     """
     Crea la cuenta del invitado con la contraseña que eligió y lo deja con
     sesión iniciada. El correo no se vuelve a verificar: llegar con el enlace
@@ -738,6 +972,9 @@ async def aceptar_invitacion(datos: AceptarInvitacionIn):
                 cuenta = await invitaciones.aceptar(
                     conn, datos.token, pwd_hash, settings.TERMINOS_VERSION
                 )
+                token = await _emitir_sesion(
+                    request, response, cuenta.id, cuenta.tenant_id, cuenta.role, conn=conn
+                )
     except invitaciones.InvitacionInvalida:
         raise _invitacion_invalida()
     except invitaciones.CorreoYaRegistrado:
@@ -751,10 +988,7 @@ async def aceptar_invitacion(datos: AceptarInvitacionIn):
             detail="Tu ficha de vendedor ya no está disponible. Pídele al negocio que te invite de nuevo.",
         )
 
-    return TokenOut(
-        access_token=crear_access_token(cuenta.id, cuenta.tenant_id, cuenta.role),
-        refresh_token=crear_refresh_token(cuenta.id),
-    )
+    return token
 
 
 @router.get("/yo", response_model=UsuarioOut)
