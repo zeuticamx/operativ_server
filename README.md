@@ -1765,6 +1765,7 @@ El 404 de alta ajena revela que el número está tomado: riesgo residual aceptad
 | `DELETE /api/canales/whatsapp/numeros/{id}` | `gerencia_actual` | 204; 403 línea de avisos; 404 |
 | `PUT /api/canales/whatsapp/principal` | `gerencia_actual` | 200; 409 `numero_no_activo`; 409 `configuracion_incompleta`; 403 línea de avisos; 404 |
 | `DELETE /api/canales/whatsapp` | `gerencia_actual` | 409 `usar_numeros` |
+| `PUT /api/canales/whatsapp/avisos` | `gerencia_actual` | Solo el negocio de `AVISOS_CUENTA_GLOBAL_TENANT_ID` (403 `linea_avisos_no_disponible`); mueve la marca de línea de avisos a otro número activo suyo; 404 ajeno, 409 `numero_no_activo` / `linea_avisos_sin_credencial`, 402 si la anterior ya no cabe en el cupo. `GET .../numeros` devuelve `puede_elegir_avisos` |
 | `GET/PUT /api/agente/numeros/{id}` | lectura `negocio_actual`, escritura `gerencia_actual` | 400 `temperatura_fuera_de_rango` (0 y 1 se aceptan); 402 `modelo_no_incluido_en_plan` / `historial_excede_plan`; 404; member lee sin credenciales y no edita (403) |
 | `GET/PUT /api/herramientas/numeros/{id}` y `/api/herramientas/social` | lectura `negocio_actual`, escritura `gerencia_actual` | 402 `herramienta_no_incluida_en_plan`; 404 |
 | `GET /api/conversaciones/ocultas[/{id}]` | `gerencia_actual` | Solo lectura; 404 si no es del negocio |
@@ -1772,7 +1773,7 @@ El 404 de alta ajena revela que el número está tomado: riesgo residual aceptad
 | `POST/PATCH /api/gerencia/planes` | `gerencia_plataforma_actual` | Añade `max_numeros_whatsapp` y `herramientas_plan`; 400 `cupo_no_valido` |
 
 Códigos 403: sin código propio para rol sin permiso o sesión de soporte sin
-concesión; `linea_avisos_gestionada_por_plataforma` para la línea de avisos.
+concesión; `linea_avisos_gestionada_por_plataforma` solo al intentar hacer principal la línea de avisos (que por lo demás se configura, prueba, pausa y desvincula como cualquier número).
 Precedencia: primero el permiso del rol y del tipo de acción (403), después la
 pertenencia (404, idéntico para número ajeno, ajeno pausado e inexistente).
 

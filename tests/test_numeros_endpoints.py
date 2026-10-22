@@ -364,7 +364,7 @@ async def test_404_identico_para_ajeno_activo_pausado_e_inexistente(
 
 
 @pytest.mark.asyncio
-async def test_linea_de_avisos_no_se_pausa_ni_desvincula_ni_elige(
+async def test_linea_de_avisos_se_pausa_y_desvincula_pero_no_se_elige_principal(
     http_client, tenant_y_usuario, headers_autenticado
 ):
     r, _ = await _conectar(http_client, headers_autenticado)
@@ -373,23 +373,25 @@ async def test_linea_de_avisos_no_se_pausa_ni_desvincula_ni_elige(
         "UPDATE agentes_canal SET es_linea_avisos = true WHERE id = $1", numero_id
     )
 
-    r = await http_client.post(
-        f"/api/canales/whatsapp/numeros/{numero_id}/pausar", headers=headers_autenticado
-    )
-    assert r.status_code == 403
-    assert r.json()["detail"]["codigo"] == "linea_avisos_gestionada_por_plataforma"
-
-    r = await http_client.delete(
-        f"/api/canales/whatsapp/numeros/{numero_id}", headers=headers_autenticado
-    )
-    assert r.status_code == 403
-
+    # Principal sigue vetado: el CHECK de sql/56 no deja que lo sea.
     r = await http_client.put(
         "/api/canales/whatsapp/principal",
         json={"numero_id": numero_id},
         headers=headers_autenticado,
     )
     assert r.status_code == 403
+
+    r = await http_client.post(
+        f"/api/canales/whatsapp/numeros/{numero_id}/pausar", headers=headers_autenticado
+    )
+    assert r.status_code == 200
+    assert r.json()["numero"]["estado"] == "pausado"
+    assert r.json()["sin_numero_activo"] is False
+
+    r = await http_client.delete(
+        f"/api/canales/whatsapp/numeros/{numero_id}", headers=headers_autenticado
+    )
+    assert r.status_code == 204
 
 
 # ------------------------------------------------------------

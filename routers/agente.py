@@ -224,10 +224,9 @@ async def probar(
     exigir_dentro_del_plan(limites, modelo, datos.history_window)
 
     if numero_id is not None:
+        # 404 si no es del negocio. La línea de avisos se prueba como cualquier otra.
         async with conexion() as conn:
-            fila = await numeros.numero_del_negocio(conn, tenant_id, numero_id)
-        if fila["es_linea_avisos"]:
-            raise numeros.error_http(409, "linea_avisos_gestionada_por_plataforma")
+            await numeros.numero_del_negocio(conn, tenant_id, numero_id)
 
     turnos = [t.model_dump() for t in datos.mensajes]
     try:

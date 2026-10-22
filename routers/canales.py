@@ -301,6 +301,7 @@ async def listar_numeros(tenant_id: UUID = Depends(tenant_actual)):
         plazas_usadas=lista.plazas_usadas,
         plazas_libres=lista.plazas_libres,
         coexistencia_permitida=coexistencia,
+        puede_elegir_avisos=numeros.tenant_de_avisos() == tenant_id,
     )
 
 
@@ -356,6 +357,25 @@ async def elegir_principal(
 ):
     async with conexion() as conn:
         fila = await numeros.elegir_principal(
+            conn, tenant_id, datos.numero_id, Autor.gerencia(usuario.id, usuario.email)
+        )
+        herramientas = await herramientas_plan.herramientas_de_numero(conn, tenant_id, datos.numero_id)
+    return _numero_out(fila, herramientas)
+
+
+@router.put("/whatsapp/avisos", response_model=NumeroWhatsAppOut)
+async def elegir_linea_avisos(
+    datos: ElegirPrincipalIn,
+    tenant_id: UUID = Depends(tenant_actual),
+    usuario: UsuarioActual = Depends(gerencia_actual),
+):
+    """
+    Cambia cuál de los números vinculados y activos del negocio que aloja los
+    avisos de la plataforma es la línea de avisos. 403 `linea_avisos_no_disponible`
+    en cualquier otro negocio.
+    """
+    async with conexion() as conn:
+        fila = await numeros.elegir_linea_avisos(
             conn, tenant_id, datos.numero_id, Autor.gerencia(usuario.id, usuario.email)
         )
         herramientas = await herramientas_plan.herramientas_de_numero(conn, tenant_id, datos.numero_id)
@@ -535,20 +555,25 @@ async def iniciar_instagram_neuroapi(
 
 
 @router.get("/instagram/neuroapi/estado", response_model=EstadoInstagramNeuroApiOut)
-async def estado_instagram_neuroapi(tenant_id: UUID = Depends(tenant_actual)):
+async def estado_instagram_neuroapi(
+    session_id: str | None = Query(None, min_length=1, max_length=200),
+    tenant_id: UUID = Depends(tenant_actual),
+):
     """
-    La última sesión de Instagram del negocio. El portal la consulta al
-    volver de Meta (no conoce el session_id: NeuroAPI no lo devuelve en el
-    retorno). 404 si el negocio nunca abrió una.
+    Una sesión de Instagram del negocio. Con `session_id` (NeuroAPI lo agrega
+    al retorno: `?status=success&session_id=…`) esa sesión; sin él, la última.
+    404 si no existe, no es de este negocio o el negocio nunca abrió una.
     """
     fila = await fetch_one(
         """
         SELECT session_id, status, detalle FROM neuroapi_connect_sessions
          WHERE tenant_id = $1 AND canal = 'instagram'
+           AND ($2::text IS NULL OR session_id = $2)
          ORDER BY created_at DESC
          LIMIT 1
         """,
         tenant_id,
+        session_id,
     )
     if fila is None:
         raise HTTPException(

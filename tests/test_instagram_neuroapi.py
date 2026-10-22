@@ -231,6 +231,25 @@ async def test_estado_sin_sesiones_de_instagram_es_404(http_client, tenant_y_usu
 
 
 @pytest.mark.asyncio
+async def test_estado_con_session_id_consulta_esa_sesion_y_no_la_de_otro_negocio(
+    http_client, tenant_y_usuario, otro_tenant, configurado
+):
+    tenant_id = tenant_y_usuario["tenant_id"]
+    await _sesion(tenant_id, "sess_vieja")
+    await _sesion(tenant_id, "sess_nueva")
+    await _sesion(otro_tenant, "sess_de_otro")
+    headers = {"Authorization": f"Bearer {tenant_y_usuario['token']}"}
+    url = "/api/canales/instagram/neuroapi/estado"
+
+    assert (await http_client.get(url, headers=headers)).json()["session_id"] == "sess_nueva"
+    r = await http_client.get(url, params={"session_id": "sess_vieja"}, headers=headers)
+    assert r.json()["session_id"] == "sess_vieja"
+    # Una sesión ajena es 404, igual que una inexistente.
+    r = await http_client.get(url, params={"session_id": "sess_de_otro"}, headers=headers)
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_instagram_connected_sobre_una_sesion_de_whatsapp_no_activa_instagram(
     http_client, tenant_y_usuario, configurado
 ):

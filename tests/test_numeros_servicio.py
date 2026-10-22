@@ -72,7 +72,7 @@ AUT = Autor.gerencia(uuid4(), "owner@t3.test")
 # Bitácora del negocio (RF-21; A58, A59)
 # ------------------------------------------------------------
 def test_RF21_los_motivos_de_bitacora_son_los_del_contrato() -> None:
-    assert numeros_bitacora.MOTIVOS == MOTIVOS_BITACORA
+    assert numeros_bitacora.MOTIVOS == MOTIVOS_BITACORA | {"cambio_de_linea_avisos"}
 
 
 def test_RF21_el_autor_es_gerencia_plataforma_o_sistema() -> None:
@@ -732,15 +732,23 @@ async def test_A44_pausar_un_numero_ya_pausado_no_cambia_nada(bds) -> None:
 
 
 @requiere_bd
-async def test_A74_la_gerencia_no_puede_pausar_desvincular_ni_elegir_principal_la_linea_de_avisos(bds) -> None:
+async def test_A74_la_linea_de_avisos_se_pausa_y_desvincula_pero_nunca_es_principal(bds) -> None:
     c = bds
     t = await _negocio(c)
     linea = await _numero(c, t, "pn-avisos", avisos=True)
-    await _http(numeros_whatsapp.pausar_manual(c, t, linea, AUT), 403, "linea_avisos_gestionada_por_plataforma")
-    await _http(numeros_whatsapp.desvincular(c, t, linea, AUT), 403, "linea_avisos_gestionada_por_plataforma")
+    # Sigue sin poder ser el principal (CHECK de sql/56).
     await _http(numeros_whatsapp.elegir_principal(c, t, linea, AUT), 403, "linea_avisos_gestionada_por_plataforma")
     fila = await _fila(c, linea)
     assert fila["estado"] == "activo" and fila["es_linea_avisos"] is True and fila["es_principal"] is False
+
+    # Pausar la línea de avisos no deja al negocio "sin número activo": no cuenta como tal.
+    r = await numeros_whatsapp.pausar_manual(c, t, linea, AUT)
+    assert r.numero["estado"] == "pausado" and r.sin_numero_activo is False
+    # Reactivarla no pide plaza del cupo.
+    assert (await numeros_whatsapp.reactivar(c, t, linea, AUT))["estado"] == "activo"
+
+    await numeros_whatsapp.desvincular(c, t, linea, AUT)
+    assert (await _fila(c, linea))["estado"] == "desvinculado"
 
 
 # ------------------------------------------------------------
@@ -985,6 +993,69 @@ async def test_P11_una_marca_vieja_se_quita_cuando_cambia_el_numero_de_la_linea(
     assert (await _fila(c, vieja))["es_linea_avisos"] is False
     assert (await _fila(c, nueva))["es_linea_avisos"] is True
     assert await _principal(c, t) == vieja  # ya sin marca, es un número como los demás
+
+
+@requiere_bd
+async def test_P11_la_gerencia_cambia_la_linea_de_avisos_a_otro_numero_y_la_eleccion_sobrevive(bds, monkeypatch) -> None:
+    from config import settings
+
+    c = bds
+    t = await _negocio(c, tope=9)
+    monkeypatch.setattr(settings, "AVISOS_CUENTA_GLOBAL_TENANT_ID", str(t))
+    await _credencial_whatsapp(c, t, "pn-vieja")
+    vieja = await _numero(c, t, "pn-vieja", avisos=True, dias=9)
+    nueva = await _numero(c, t, "pn-nueva", principal=True, nombre="Nueva", prompt="Nueva.", dias=2)
+
+    fila = await numeros_whatsapp.elegir_linea_avisos(c, t, nueva, AUT)
+    assert fila["es_linea_avisos"] is True and fila["es_principal"] is False
+    assert (await _fila(c, vieja))["es_linea_avisos"] is False
+    # La anterior vuelve a ser un número normal: la regla única la hace principal.
+    assert await _principal(c, t) == vieja
+    assert len(await _bitacora(c, t, "cambio_de_linea_avisos")) == 1
+    # Persistida: un reinicio (sincronizar) no la devuelve a la anterior.
+    assert await c.fetchval("SELECT phone_number_id FROM channel_credentials WHERE tenant_id = $1", t) == "pn-nueva"
+    assert await numeros_whatsapp.sincronizar_linea_avisos(c, t) == nueva
+    # Elegir la que ya es la línea no cambia nada ni anota.
+    await numeros_whatsapp.elegir_linea_avisos(c, t, nueva, AUT)
+    assert len(await _bitacora(c, t, "cambio_de_linea_avisos")) == 1
+
+
+@requiere_bd
+async def test_P11_el_cambio_de_linea_de_avisos_tiene_sus_limites(bds, monkeypatch) -> None:
+    from config import settings
+
+    c = bds
+    t = await _negocio(c)
+    otro = await _negocio(c)
+    ajeno = await _numero(c, otro, "pn-ajeno")
+    pausado = await _numero(c, t, "pn-pausado", estado="pausado")
+    sin_cred = await _numero(c, t, "pn-sin-credencial")
+
+    # Un negocio que no aloja los avisos no puede elegir línea.
+    monkeypatch.setattr(settings, "AVISOS_CUENTA_GLOBAL_TENANT_ID", "")
+    await _http(numeros_whatsapp.elegir_linea_avisos(c, t, sin_cred, AUT), 403, "linea_avisos_no_disponible")
+
+    monkeypatch.setattr(settings, "AVISOS_CUENTA_GLOBAL_TENANT_ID", str(t))
+    await _http(numeros_whatsapp.elegir_linea_avisos(c, t, ajeno, AUT), 404, "numero_no_encontrado")
+    await _http(numeros_whatsapp.elegir_linea_avisos(c, t, pausado, AUT), 409, "numero_no_activo")
+    await _http(numeros_whatsapp.elegir_linea_avisos(c, t, sin_cred, AUT), 409, "linea_avisos_sin_credencial")
+    assert await _bitacora(c, t, "cambio_de_linea_avisos") == []
+
+
+@requiere_bd
+async def test_P11_si_la_linea_anterior_ya_no_cabe_en_el_cupo_no_se_cambia(bds, monkeypatch) -> None:
+    from config import settings
+
+    c = bds
+    t = await _negocio(c, tope=1)
+    monkeypatch.setattr(settings, "AVISOS_CUENTA_GLOBAL_TENANT_ID", str(t))
+    await _credencial_whatsapp(c, t, "pn-avisos")
+    vieja = await _numero(c, t, "pn-avisos", avisos=True)
+    await _numero(c, t, "pn-uno", principal=True)  # ocupa la única plaza
+    nueva = await _numero(c, t, "pn-dos", estado="pausado")
+    await c.execute("UPDATE agentes_canal SET estado = 'activo', pausado_en = NULL WHERE id = $1", nueva)  # plaza 2 de 1
+    await _http(numeros_whatsapp.elegir_linea_avisos(c, t, nueva, AUT), 402, "cupo_numeros_whatsapp")
+    assert (await _fila(c, vieja))["es_linea_avisos"] is True
 
 
 @requiere_bd

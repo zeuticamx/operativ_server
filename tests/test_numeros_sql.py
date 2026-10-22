@@ -54,6 +54,7 @@ ARCHIVOS = {
     58: "58_numeros_limites_y_resolucion.sql",
     59: "59_numeros_reevaluacion.sql",
     61: "61_numeros_recortes_pendientes.sql",
+    70: "70_cambio_de_linea_avisos.sql",
 }
 
 ARCHIVO_ALERTAS = "60_alertas_numeros.sql"
@@ -69,6 +70,9 @@ MOTIVOS_BITACORA = {
     "herramienta_activada", "herramienta_desactivada", "prompt_cambiado",
     "agente_encendido", "agente_apagado",
 }
+
+# Motivos que agregó la migración 70 (cambio de la línea de avisos) a la lista de 56.
+MOTIVOS_BITACORA_70 = {"cambio_de_linea_avisos"}
 
 # Motivos con los que los triggers de 59 encolan (RF-11, siete casos).
 MOTIVOS_COLA = {
@@ -141,11 +145,13 @@ def test_RF22_56_es_la_siguiente_migracion_libre_y_no_hay_duplicadas() -> None:
     assert 68 in anteriores
     # La 69 es Instagram Direct vía NeuroAPI (canal de la Connect Session), ajena a esta.
     assert 69 in anteriores
+    # La 70 es el cambio de la línea de avisos (motivo nuevo de la bitácora).
+    assert 70 in anteriores
     # Desde la 54 (las anteriores tienen números repetidos históricos) no hay duplicados ni huecos.
     recientes = [int(p.name.split("_")[0]) for p in DIR_SQL.glob("[0-9][0-9]_*.sql") if int(p.name.split("_")[0]) >= 54]
     assert len(recientes) == len(set(recientes))
     assert set(recientes) == set(range(54, max(recientes) + 1))
-    assert max(anteriores) == 69
+    assert max(anteriores) == 70
 
 
 @pytest.mark.parametrize("numero", sorted(ARCHIVOS))

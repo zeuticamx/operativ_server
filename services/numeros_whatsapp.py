@@ -77,6 +77,8 @@ _MENSAJES = {
     "configuracion_incompleta": "El número tiene la configuración incompleta: falta el nombre del agente o sus instrucciones.",
     "temperatura_fuera_de_rango": "La temperatura debe estar entre 0 y 1.",
     "numero_no_valido": "El identificador del número no es válido.",
+    "linea_avisos_no_disponible": "Este negocio no aloja la línea de avisos de la plataforma.",
+    "linea_avisos_sin_credencial": "El negocio no tiene la cuenta de WhatsApp de avisos conectada.",
 }
 
 
@@ -402,6 +404,74 @@ def tenant_de_avisos() -> Optional[UUID]:
         return UUID(valor)
     except ValueError:
         return None
+
+
+async def elegir_linea_avisos(
+    conn: asyncpg.Connection, tenant_id: UUID, numero_id: UUID, autor: Autor
+) -> asyncpg.Record:
+    """
+    La gerencia del negocio que aloja los avisos elige cuál de sus números ya
+    vinculados hace de línea de avisos. Errores: 403 `linea_avisos_no_disponible`
+    (el negocio no es el de `AVISOS_CUENTA_GLOBAL_TENANT_ID`), 404 si el número no es
+    suyo, 409 `numero_no_activo` si está pausado, 409 `linea_avisos_sin_credencial` si
+    el negocio no tiene su fila de WhatsApp en `channel_credentials`, y 402
+    `cupo_numeros_whatsapp` si la línea que deja de serlo ya no cabe en el cupo (cuenta
+    desde ese momento como un número más).
+
+    La elección se guarda donde `sincronizar_linea_avisos` la lee,
+    `channel_credentials.phone_number_id`, para que sobreviva a un reinicio y a cada
+    alta nueva del negocio. El nuevo deja de ser principal (la línea de avisos no puede
+    serlo, CHECK de sql/56) y la regla única reasigna el principal; el anterior vuelve a
+    ser un número normal y puede serlo. Elegir la que ya es la línea no cambia nada.
+    """
+    if tenant_de_avisos() != tenant_id:
+        raise error_http(403, "linea_avisos_no_disponible")
+    ahora = _ahora(None)
+    async with conn.transaction():
+        await _bloquear_negocio(conn, tenant_id)
+        numero = await numero_del_negocio(conn, tenant_id, numero_id, bloquear=True)
+        if numero["es_linea_avisos"]:
+            return numero
+        if numero["estado"] != "activo":
+            raise error_http(409, "numero_no_activo")
+
+        actualizadas = await conn.fetchval(
+            """
+            WITH c AS (
+                UPDATE channel_credentials SET phone_number_id = $2, updated_at = NOW()
+                WHERE tenant_id = $1 AND channel_type = 'whatsapp' RETURNING 1
+            ) SELECT COUNT(*) FROM c
+            """,
+            tenant_id,
+            numero["phone_number_id"],
+        )
+        if not actualizadas:
+            raise error_http(409, "linea_avisos_sin_credencial")
+
+        anterior = await conn.fetchval(
+            "UPDATE agentes_canal SET es_linea_avisos = false, updated_at = NOW() "
+            "WHERE tenant_id = $1 AND es_linea_avisos RETURNING id",
+            tenant_id,
+        )
+        await conn.execute(
+            "UPDATE agentes_canal SET es_principal = false, es_linea_avisos = true, updated_at = NOW() WHERE id = $1",
+            numero_id,
+        )
+
+        reglas = await reglas_del_negocio(conn, tenant_id, ahora)
+        if reglas.tope is not None and _plazas(await _vinculados(conn, tenant_id)) > reglas.tope:
+            raise error_http(402, "cupo_numeros_whatsapp")
+
+        principal = await aplicar_regla_principal(
+            conn, tenant_id, autor, principal_previo=numero_id if numero["es_principal"] else None
+        )
+        if principal is None and numero["es_principal"]:
+            await conn.execute("DELETE FROM config_referencia_negocio WHERE tenant_id = $1", tenant_id)
+        await registrar(
+            conn, tenant_id, numero_id, "cambio_de_linea_avisos", autor,
+            {"anterior": str(anterior) if anterior else None},
+        )
+        return await conn.fetchrow("SELECT * FROM agentes_canal WHERE id = $1", numero_id)
 
 
 async def sincronizar_linea_avisos(
@@ -886,15 +956,14 @@ async def pausar_manual(
     """
     RF-15, D5: pausa a mano un número activo. Libera la plaza, anota `pausa_manual` y
     NO genera aviso. Se permite pausar el último activo. 404 si no es del negocio;
-    403 `linea_avisos_gestionada_por_plataforma` si es la línea de avisos. Si ya
-    estaba pausado no hace nada. Si era el principal, lo sustituye la regla única.
+    La línea de avisos de la plataforma también se pausa: sigue siendo un agente más
+    del negocio. Si ya estaba pausado no hace nada. Si era el principal, lo sustituye
+    la regla única.
     """
     ahora = _ahora(ahora)
     async with conn.transaction():
         await _bloquear_negocio(conn, tenant_id)
         numero = await numero_del_negocio(conn, tenant_id, numero_id, bloquear=True)
-        if numero["es_linea_avisos"]:
-            raise error_http(403, "linea_avisos_gestionada_por_plataforma")
         if numero["estado"] == "activo":
             await conn.execute(
                 """
@@ -912,7 +981,8 @@ async def pausar_manual(
             )
         fila = await conn.fetchrow("SELECT * FROM agentes_canal WHERE id = $1", numero_id)
         quedan = _plazas(await _vinculados(conn, tenant_id))
-    return ResultadoPausa(fila, quedan == 0)
+    # Pausar la línea de avisos no deja al negocio sin número: no cuenta como activo.
+    return ResultadoPausa(fila, quedan == 0 and not numero["es_linea_avisos"])
 
 
 async def reactivar(
@@ -975,9 +1045,8 @@ async def desvincular(
     RF-14: la plaza queda libre y la pertenencia termina. Las conversaciones del
     número quedan ocultas y asignadas a la cuenta owner creadora del negocio (o su
     relevo, D23; `conversaciones_ocultas`). Anota `desvinculacion`; NO genera aviso
-    (la pidió la gerencia). 404 si no es del negocio; 403
-    `linea_avisos_gestionada_por_plataforma` si es la línea de avisos. Si era el
-    principal, lo sustituye la regla única. Devuelve cuántas conversaciones ocultó.
+    (la pidió la gerencia). 404 si no es del negocio. La línea de avisos también se
+    desvincula. Si era el principal, lo sustituye la regla única. Devuelve cuántas conversaciones ocultó.
     No toca `channel_credentials` (T6). El número puede vincularse de nuevo; sus
     conversaciones viejas no reaparecen.
     """
@@ -985,8 +1054,6 @@ async def desvincular(
     async with conn.transaction():
         await _bloquear_negocio(conn, tenant_id)
         numero = await numero_del_negocio(conn, tenant_id, numero_id, bloquear=True)
-        if numero["es_linea_avisos"]:
-            raise error_http(403, "linea_avisos_gestionada_por_plataforma")
         await conn.execute(
             """
             UPDATE agentes_canal

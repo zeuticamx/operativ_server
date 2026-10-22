@@ -44,6 +44,7 @@ MOTIVOS: frozenset[str] = frozenset(
         "prompt_cambiado",
         "agente_encendido",
         "agente_apagado",
+        "cambio_de_linea_avisos",
     }
 )
 

@@ -434,6 +434,9 @@ class ListaNumerosOut(BaseModel):
     plazas_libres: int | None = None
     # El plan vigente incluye el modo coexistencia (planes.coexistencia_activa).
     coexistencia_permitida: bool = True
+    # Este negocio aloja la línea de avisos de la plataforma: puede elegir cuál de
+    # sus números lo es (PUT /api/canales/whatsapp/avisos).
+    puede_elegir_avisos: bool = False
 
 
 class VincularNumeroIn(BaseModel):
