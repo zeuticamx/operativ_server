@@ -101,6 +101,9 @@ FUNCIONES = [
     ("set_meta_connection", "portal"),
     ("get_meta_connection", "portal"),
     ("distancia_metros", "portal"),
+    # Instagram Direct vía NeuroAPI (sql/69). Sin ella, `instagram.connected`
+    # deja la sesión completada pero el canal sin credenciales.
+    ("set_instagram_neuroapi", "portal"),
 ]
 
 

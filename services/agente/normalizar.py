@@ -27,6 +27,24 @@ def _descartar(motivo: str) -> MensajeNormalizado:
     return MensajeNormalizado(procesar=False, motivo=motivo)
 
 
+def aplanar_entradas(cuerpo: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Las `entry` del sobre. En Instagram y Messenger, NeuroAPI a veces las
+    manda anidadas (`entry[].entry[].messaging[]`): se aplanan a la forma de
+    Meta (`entry[].messaging[]`) para que el resto del parser no distinga.
+    """
+    planas: list[dict[str, Any]] = []
+    for entrada in cuerpo.get("entry") or []:
+        if not isinstance(entrada, dict):
+            continue
+        anidadas = [e for e in entrada.get("entry") or [] if isinstance(e, dict)]
+        if anidadas and cuerpo.get("object") in ("instagram", "page"):
+            planas.extend(anidadas)
+        else:
+            planas.append(entrada)
+    return planas
+
+
 def dividir_sobre(cuerpo: dict[str, Any]) -> list[dict[str, Any]]:
     """
     Parte un sobre de Meta que agrupa varios eventos en un sobre por evento.
@@ -40,10 +58,7 @@ def dividir_sobre(cuerpo: dict[str, Any]) -> list[dict[str, Any]]:
     objeto = cuerpo.get("object")
     sobres: list[dict[str, Any]] = []
 
-    for entry in cuerpo.get("entry") or []:
-        if not isinstance(entry, dict):
-            continue
-
+    for entry in aplanar_entradas(cuerpo):
         if objeto == "whatsapp_business_account":
             for cambio in entry.get("changes") or []:
                 if not isinstance(cambio, dict):
@@ -95,10 +110,10 @@ def normalizar(
     if not objeto:
         return _descartar("Payload sin campo object")
 
-    entradas = cuerpo.get("entry") or []
+    entradas = aplanar_entradas(cuerpo)
     if not entradas:
         return _descartar("Payload sin entry")
-    entry = entradas[0] or {}
+    entry = entradas[0]
 
     if objeto == "whatsapp_business_account":
         return _whatsapp(entry, tenant_id)
@@ -276,26 +291,50 @@ def _contenido_messenger(mensaje: dict[str, Any]) -> tuple[str, str, str | None]
     return "[Mensaje sin contenido reconocible]", "unsupported", None
 
 
+def _media_id_instagram(mensaje: dict[str, Any]) -> str | None:
+    """
+    Id del primer adjunto, para bajarlo por el proxy de NeuroAPI
+    (`/neuroapi/instagram/media/:mediaId`). El formato de NeuroAPI no está
+    documentado: se acepta el id en el adjunto o en su `payload`. La URL de
+    CDN de Meta que trae `payload.url` no se descarga nunca (SSRF).
+    """
+    adjuntos = mensaje.get("attachments") or []
+    adjunto = adjuntos[0] if adjuntos and isinstance(adjuntos[0], dict) else {}
+    payload = adjunto.get("payload") if isinstance(adjunto.get("payload"), dict) else {}
+    for valor in (
+        adjunto.get("media_id"),
+        adjunto.get("id"),
+        payload.get("media_id"),
+        payload.get("attachment_id"),
+        payload.get("id"),
+    ):
+        if valor not in (None, ""):
+            return str(valor)
+    return None
+
+
 def _instagram(entry: dict[str, Any], tenant_id: UUID | None) -> MensajeNormalizado:
     msg, motivo = _mensajeria_meta(entry)
     if msg is None:
         return _descartar(f"Instagram: {motivo}")
 
-    contenido, tipo, media_url = _contenido_messenger(msg.get("message") or {})
+    mensaje = msg.get("message") or {}
+    contenido, tipo, media_url = _contenido_messenger(mensaje)
 
     return MensajeNormalizado(
         procesar=True,
         tenant_id=tenant_id,
         canal="instagram",
         usuario_id=(msg.get("sender") or {}).get("id"),
-        mensaje_id=(msg.get("message") or {}).get("mid"),
+        mensaje_id=mensaje.get("mid"),
         contenido=contenido,
         tipo=tipo,
+        media_id=_media_id_instagram(mensaje),
         media_url=media_url,
         # `entry.id` en Instagram es el id de la CUENTA, no el page_id: el
         # envío va contra la página vinculada, que se lee de
         # channel_credentials. Mezclarlos hacía fallar la respuesta.
-        ig_account_id=entry.get("id"),
+        ig_account_id=entry.get("id") or (msg.get("recipient") or {}).get("id"),
     )
 
 

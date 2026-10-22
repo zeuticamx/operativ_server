@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from config import settings
 from services.acceso_pagos import acceso_pagos
 from services.asignacion import asignar_vendedor_automatico
 from deps import llamada_interna
@@ -57,6 +58,8 @@ from schemas import (
     ConsumirCreditoOut,
     ConversacionTransferidaIn,
     ConversacionTransferidaOut,
+    CrearCobroConnectEventoIn,
+    CrearCobroConnectEventoOut,
     CrearReservaEventoIn,
     CrearReservaEventoOut,
     HistorialCitasAgenteOut,
@@ -76,6 +79,7 @@ from schemas import (
 )
 from services import adjuntos as adjuntos_svc
 from services import conversaciones as conversaciones_svc
+from services.stripe_connect import CuentaNoConectada, crear_payment_link_cobro
 from session import fetch_one, transaccion
 
 log = logging.getLogger("operativai.eventos")
@@ -667,6 +671,41 @@ async def calendario_reagendar_reserva(datos: ReagendarReservaEventoIn):
         reserva=ReservaOut(**vars(nueva)),
         reserva_anterior_id=anterior.id,
         cancelacion_tardia=anterior.cancelacion_tardia,
+    )
+
+
+@router.post("/pagos/connect/crear-cobro", response_model=CrearCobroConnectEventoOut)
+async def pagos_connect_crear_cobro(datos: CrearCobroConnectEventoIn) -> CrearCobroConnectEventoOut:
+    """
+    Herramienta del agente `generar_cobro_connect` (services/herramientas_pagos_connect.py):
+    genera un link de pago de Stripe sobre la cuenta conectada del tenant.
+
+    A diferencia de historial/reagendar, esta tool no deduce quién es el
+    cliente — solo de qué tenant es la conversación — así que no hereda su
+    candado por conversation_id. "Cuenta no conectada" o el apagador
+    STRIPE_CONNECT_ACTIVO NO son un error HTTP: son un estado de negocio
+    real que el agente debe poder explicarle al cliente en texto.
+    """
+    if not settings.STRIPE_CONNECT_ACTIVO:
+        return CrearCobroConnectEventoOut(ok=False, razon="connect_inactivo")
+
+    try:
+        fila, duplicado = await crear_payment_link_cobro(
+            datos.tenant_id,
+            datos.descripcion,
+            datos.monto,
+            conversation_id=datos.conversation_id,
+            idempotency_key=datos.idempotency_key,
+        )
+    except CuentaNoConectada:
+        return CrearCobroConnectEventoOut(ok=False, razon="cuenta_no_conectada")
+
+    return CrearCobroConnectEventoOut(
+        ok=True,
+        url_cobro=fila["url_cobro"],
+        monto=fila["monto"],
+        moneda=fila["moneda"],
+        duplicado=duplicado,
     )
 
 

@@ -169,11 +169,44 @@ async def descargar_media(url: str) -> bytes:
     partes = urlparse(url)
     if partes.scheme != "https" or (partes.hostname or "").lower() != host_permitido():
         raise AdjuntoInvalido(422, "La URL del archivo no es de un origen permitido.")
+    return await _descargar(url, {})
 
+
+# Ids de media de Instagram: solo lo que puede ir en un segmento de ruta sin
+# escapar. Llega en un webhook, así que no se le deja meter "/" ni "..".
+_MEDIA_ID_INSTAGRAM = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
+
+
+async def descargar_media_instagram(media_id: str) -> bytes:
+    """
+    Baja un adjunto de Instagram por el proxy de NeuroAPI
+    (`GET /neuroapi/instagram/media/{media_id}`, con NEUROAPI_INSTA_KEY).
+
+    Nunca se descarga la URL de CDN de Meta que pueda traer el webhook: el
+    único origen es el host de NeuroAPI, igual que en WhatsApp.
+    """
+    if not _MEDIA_ID_INSTAGRAM.match(media_id or "") or media_id.strip(".") == "":
+        raise AdjuntoInvalido(422, "El identificador del archivo no es válido.")
+    if not settings.NEUROAPI_INSTA_KEY:
+        raise AdjuntoInvalido(503, "NEUROAPI_INSTA_KEY sin configurar.")
+    url = f"{settings.NEUROAPI_API_BASE_URL}/neuroapi/instagram/media/{quote(media_id, safe='')}"
+    return await _descargar(url, {"x-api-key": settings.NEUROAPI_INSTA_KEY})
+
+
+def nombre_por_contenido(contenido: bytes, base: str) -> str | None:
+    """`base` con la extensión del tipo detectado, o None si no es un tipo admitido."""
+    mime = _mime_por_firma(contenido)
+    if mime is None:
+        return None
+    return f"{base}{TIPOS[mime][1][0]}"
+
+
+async def _descargar(url: str, cabeceras: dict[str, str]) -> bytes:
+    """GET sin seguir redirecciones, cortando al pasar el tope absoluto."""
     tope = tope_absoluto()
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=False) as cliente:
-            async with cliente.stream("GET", url) as r:
+            async with cliente.stream("GET", url, headers=cabeceras) as r:
                 if r.status_code != 200:
                     raise AdjuntoInvalido(502, f"No se pudo descargar el archivo ({r.status_code}).")
                 trozos: list[bytes] = []

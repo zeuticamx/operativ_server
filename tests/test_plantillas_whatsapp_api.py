@@ -20,7 +20,8 @@ from config import settings
 from deps import UsuarioActual, usuario_actual
 from main import app
 from services import avisos_cita as ac
-from services import contexto_agente, cuenta_global_wa
+from services import avisos_cita_envio, contexto_agente
+from services.avisos_cita_envio import ResultadoEnvioTenant
 from services import plantillas_whatsapp as pw
 
 RUTA = "/api/gerencia/plantillas-whatsapp"
@@ -179,9 +180,12 @@ async def test_reintentar_nombre_desconocido_da_404(bd):
 
 
 # ------------------------------------------------------------
-# A25: pausar la plantilla frena los recordatorios de cualquier negocio
+# Spec 007 (D1): la plantilla global ya no gobierna los avisos de los negocios.
+# Antes (spec 004, A25) pausarla frenaba los recordatorios de cualquier negocio.
 # ------------------------------------------------------------
-async def test_tras_pausar_un_recordatorio_nuevo_queda_omitido(bd, monkeypatch: pytest.MonkeyPatch):
+async def test_pausar_la_plantilla_global_ya_no_frena_el_recordatorio_del_negocio(
+    bd, monkeypatch: pytest.MonkeyPatch
+):
     monkeypatch.setattr(settings, "AVISOS_CITA_WHATSAPP_ACTIVOS", True)
     avisos: dict[UUID, dict[str, Any]] = {}
     envios: list[Any] = []
@@ -216,11 +220,12 @@ async def test_tras_pausar_un_recordatorio_nuevo_queda_omitido(bd, monkeypatch: 
     async def datos(tenant_id: UUID, reserva_id: UUID):
         return dict(reserva)
 
-    async def leer_estado(nombre: str) -> str:
-        return bd.filas[nombre]["estado"]
+    async def estado_aviso(tenant_id: UUID, tipo: str, **kw: Any) -> ac.EstadoAviso:
+        return ac.EstadoAviso(True, "recordatorio_cita", "APPROVED", True)  # plantilla propia del negocio
 
-    async def enviar(*a: Any) -> None:
+    async def enviar(*a: Any, **k: Any) -> ResultadoEnvioTenant:
         envios.append(a)
+        return ResultadoEnvioTenant(True, None, "wamid.1")
 
     async def servicios(tenant_id: UUID):
         return SimpleNamespace(zona_horaria="America/Mexico_City")
@@ -240,8 +245,8 @@ async def test_tras_pausar_un_recordatorio_nuevo_queda_omitido(bd, monkeypatch: 
     ]:
         monkeypatch.setattr(ac, nombre_fn, fn)
     monkeypatch.setattr(contexto_agente, "conversacion_whatsapp_del_cliente", conversacion)
-    monkeypatch.setattr(pw, "obtener_estado", leer_estado)
-    monkeypatch.setattr(cuenta_global_wa, "enviar_plantilla", enviar)
+    monkeypatch.setattr(ac, "_estado_aviso", estado_aviso)
+    monkeypatch.setattr(avisos_cita_envio, "enviar_plantilla_tenant", enviar)
 
     r = await _llamar("PATCH", f"{RUTA}/recordatorio_cita", json={"estado": "pausada"})
     assert r.status_code == 200
@@ -249,5 +254,5 @@ async def test_tras_pausar_un_recordatorio_nuevo_queda_omitido(bd, monkeypatch: 
     await ac.procesar_recordatorios()
 
     [aviso] = avisos.values()
-    assert (aviso["estado"], aviso["motivo"]) == ("omitido", "plantilla_no_aprobada")
-    assert envios == []
+    assert bd.filas[pw.PLANTILLA_RECORDATORIO]["estado"] == "pausada"  # la global sí quedó pausada
+    assert aviso["estado"] == "enviado" and len(envios) == 1  # y el negocio envía con la suya

@@ -16,6 +16,7 @@ import re
 from typing import Any
 from uuid import UUID
 
+from config import settings
 from services.gerencia import registrar_auditoria
 from session import execute, fetch_all, fetch_one, transaccion
 
@@ -354,14 +355,58 @@ def traducir_evento_meta(evento: Any) -> list[tuple[str, str]]:
     return resultado
 
 
-async def aplicar_evento_meta(evento: Any) -> list[tuple[str, str]]:
+def evento_es_de_cuenta_global(
+    evento: Any, waba_global: str | None, meta_ids_globales: Any
+) -> bool:
     """
-    Aplica los cambios de estado de un evento de Meta. Devuelve los
-    `(nombre, estado_nuevo)` que de verdad cambiaron. `actualizada_por` queda
-    NULL, nota `webhook NeuroAPI` y fila de auditoría con actor de sistema.
+    Pura (spec 007, hallazgo 1). True si algún `message_template_status_update` del sobre
+    es de la cuenta global: su `entry[].id` (WABA) es `waba_global`, o su
+    `message_template_id` está en `meta_ids_globales`. Sin WABA ni ids de la cuenta no se
+    puede afirmar que sea global: False (un evento de un negocio con el mismo nombre de
+    plantilla nunca debe mover el estado global).
     """
+    waba = str(waba_global or "").strip()
+    ids = {str(i) for i in (meta_ids_globales or ())}
+    if not isinstance(evento, dict) or not isinstance(evento.get("entry"), list):
+        return False
+    for entrada in evento["entry"]:
+        if not isinstance(entrada, dict) or not isinstance(entrada.get("changes"), list):
+            continue
+        entrada_global = bool(waba) and str(entrada.get("id") or "") == waba
+        for cambio in entrada["changes"]:
+            if not isinstance(cambio, dict) or cambio.get("field") != CAMPO_ESTADO_PLANTILLA:
+                continue
+            valor = cambio.get("value")
+            meta_id = str(valor.get("message_template_id") or "") if isinstance(valor, dict) else ""
+            if entrada_global or (meta_id and meta_id in ids):
+                return True
+    return False
+
+
+async def aplicar_evento_meta(
+    evento: Any,
+    *,
+    waba_global: str | None = None,
+    meta_ids_globales: Any = (),
+) -> list[tuple[str, str]]:
+    """
+    Aplica los cambios de estado de un evento de Meta SOLO si son de la cuenta global
+    (`evento_es_de_cuenta_global`; el WABA sale de `AVISOS_CUENTA_GLOBAL_WABA_ID` si no se
+    pasa). Cada `entry` se evalúa por separado: un sobre con varios WABA aplica solo el
+    global. Devuelve los `(nombre, estado_nuevo)` que de verdad cambiaron.
+    `actualizada_por` queda NULL, nota `webhook NeuroAPI` y fila de auditoría con actor de sistema.
+    """
+    waba = waba_global if waba_global is not None else settings.AVISOS_CUENTA_GLOBAL_WABA_ID
+    entradas = evento.get("entry") if isinstance(evento, dict) else None
+    propias: list[Any] = []
+    for entrada in entradas if isinstance(entradas, list) else []:
+        if evento_es_de_cuenta_global({"entry": [entrada]}, waba, meta_ids_globales):
+            propias.append(entrada)
+    if not propias:
+        log.info("Evento de estado de plantilla ajeno a la cuenta global: ignorado por el handler global")
+        return []
     aplicados: list[tuple[str, str]] = []
-    for nombre, nuevo in traducir_evento_meta(evento):
+    for nombre, nuevo in traducir_evento_meta({"entry": propias}):
         if await obtener_estado(nombre) == nuevo:
             continue
         anterior = await cambiar_estado(

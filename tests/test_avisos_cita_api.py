@@ -26,7 +26,8 @@ from main import app
 from routers import calendario as router_calendario
 from services import avisos_cita as ac
 from services import calendario as svc_calendario
-from services import contexto_agente, cuenta_global_wa, plantillas_whatsapp
+from services import avisos_cita_envio, contexto_agente
+from services.avisos_cita_envio import ResultadoEnvioTenant
 
 TENANT = uuid4()
 OTRO_TENANT = uuid4()
@@ -63,7 +64,8 @@ class _Mundo:
         self.reservas: dict[UUID, svc_calendario.Reserva] = {}
         self.datos_aviso: dict[UUID, dict[str, Any]] = {}
         self.conversacion: UUID | None = uuid4()
-        self.plantilla_aprobada = True
+        self.plantilla_estado: str | None = "APPROVED"  # caché de la plantilla del tenant
+        self.habilitado = True  # calendario activo y función encendida
         self.avisos: dict[UUID, dict[str, Any]] = {}
         self.envios: list[tuple[str, str, list[str]]] = []
         self.eventos: list[dict[str, Any]] = []
@@ -148,8 +150,9 @@ def mundo(monkeypatch: pytest.MonkeyPatch) -> _Mundo:
     async def conversacion(tenant_id: UUID, user_id: UUID | None):
         return m.conversacion
 
-    async def esta_aprobada(nombre: str) -> bool:
-        return m.plantilla_aprobada
+    async def estado_aviso(tenant_id: UUID, tipo: str, **kw: Any) -> ac.EstadoAviso:
+        nombre = "recordatorio_cita" if tipo == "recordatorio" else "notificacion_cancelacion"
+        return ac.EstadoAviso(m.habilitado, nombre, m.plantilla_estado, True)
 
     async def servicios(tenant_id: UUID):
         return SimpleNamespace(zona_horaria="America/Mexico_City")
@@ -180,10 +183,13 @@ def mundo(monkeypatch: pytest.MonkeyPatch) -> _Mundo:
                  telefono_destino=telefono_destino if estado == "enviado" else None)
         return True
 
-    async def enviar_plantilla(destinatario: str, plantilla: str, parametros: list[str]) -> None:
+    async def enviar_plantilla(tenant_id: UUID, destinatario: str, plantilla: str,
+                               parametros: list[dict[str, Any]], **kw: Any) -> ResultadoEnvioTenant:
         if m.fallar_envio:
             raise RuntimeError("proveedor caído")
-        m.envios.append((destinatario, plantilla, parametros))
+        valores = [p["text"] for p in parametros[0]["parameters"]]  # solo cuerpo
+        m.envios.append((destinatario, plantilla, valores))
+        return ResultadoEnvioTenant(True, None, "wamid.1")
 
     async def registrar_evento(**kw: Any) -> bool:
         if kw["conversation_id"] is None:
@@ -203,8 +209,8 @@ def mundo(monkeypatch: pytest.MonkeyPatch) -> _Mundo:
     monkeypatch.setattr(ac, "avisar_gerencia_cancelacion", avisar_gerencia_cancelacion)
     monkeypatch.setattr(contexto_agente, "conversacion_whatsapp_del_cliente", conversacion)
     monkeypatch.setattr(contexto_agente, "registrar_evento", registrar_evento)
-    monkeypatch.setattr(plantillas_whatsapp, "esta_aprobada", esta_aprobada)
-    monkeypatch.setattr(cuenta_global_wa, "enviar_plantilla", enviar_plantilla)
+    monkeypatch.setattr(ac, "_estado_aviso", estado_aviso)
+    monkeypatch.setattr(avisos_cita_envio, "enviar_plantilla_tenant", enviar_plantilla)
 
     async def listar(tenant_id: UUID, reserva_id: UUID) -> list[dict]:
         return [dict(a) for a in m.avisos.values()
@@ -328,7 +334,7 @@ async def test_bandera_apagada_omite_sin_aviso_a_gerencia(mundo, monkeypatch):
 
 
 async def test_plantilla_no_aprobada_omite_y_avisa_a_gerencia(mundo):
-    mundo.plantilla_aprobada = False
+    mundo.plantilla_estado = "REJECTED"
     reserva_id = mundo.nueva_reserva()
 
     await _cancelar(mundo, reserva_id)
@@ -337,6 +343,25 @@ async def test_plantilla_no_aprobada_omite_y_avisa_a_gerencia(mundo):
     [aviso] = mundo.del_tipo()
     assert aviso["motivo"] == "plantilla_no_aprobada"
     assert mundo.gerencia == [(reserva_id, "plantilla_no_aprobada")]
+
+
+async def test_funcion_apagada_no_envia_ni_registra_ni_avisa(mundo):
+    mundo.habilitado = False  # D7: función apagada, calendario inactivo u oferta pendiente
+    reserva_id = mundo.nueva_reserva()
+
+    r = await _cancelar(mundo, reserva_id)
+
+    assert r.status_code == 200 and mundo.reservas[reserva_id].estado == "cancelada"
+    assert mundo.envios == [] and mundo.avisos == {} and mundo.gerencia == []
+
+
+async def test_plantilla_pending_espera_sin_registro_ni_alerta(mundo):
+    mundo.plantilla_estado = "PENDING"
+    reserva_id = mundo.nueva_reserva()
+
+    await _cancelar(mundo, reserva_id)
+
+    assert mundo.envios == [] and mundo.avisos == {} and mundo.gerencia == []
 
 
 async def test_servicio_sin_nombre_usa_el_respaldo_en_la_plantilla(mundo):

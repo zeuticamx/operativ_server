@@ -131,8 +131,21 @@ def test_RF22_56_es_la_siguiente_migracion_libre_y_no_hay_duplicadas() -> None:
     assert {54, 55} <= anteriores
     for numero in ARCHIVOS:
         assert len(list(DIR_SQL.glob(f"{numero}_*.sql"))) == 1
-    # La 64 es del modo coexistencia de WhatsApp, ajena a esta.
-    assert max(anteriores) == 64
+    # La 64 es del modo coexistencia de WhatsApp y la 65 de los avisos de cita por negocio (spec 007), ajenas a esta.
+    assert {64, 65} <= anteriores
+    # La 66 es Stripe Connect (cobros propios de cada negocio), ajena a esta.
+    assert 66 in anteriores
+    # La 67 es la vista de gerencia a las conversaciones de un número (revocable por el dueño), ajena a esta.
+    assert 67 in anteriores
+    # La 68 es el cupo diario del modo "Probar agente" (tester del agente), ajena a esta.
+    assert 68 in anteriores
+    # La 69 es Instagram Direct vía NeuroAPI (canal de la Connect Session), ajena a esta.
+    assert 69 in anteriores
+    # Desde la 54 (las anteriores tienen números repetidos históricos) no hay duplicados ni huecos.
+    recientes = [int(p.name.split("_")[0]) for p in DIR_SQL.glob("[0-9][0-9]_*.sql") if int(p.name.split("_")[0]) >= 54]
+    assert len(recientes) == len(set(recientes))
+    assert set(recientes) == set(range(54, max(recientes) + 1))
+    assert max(anteriores) == 69
 
 
 @pytest.mark.parametrize("numero", sorted(ARCHIVOS))

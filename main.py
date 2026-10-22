@@ -8,7 +8,6 @@ Arranque local:
 encima de la app de FastAPI, y uvicorn tiene que arrancar esa capa de afuera
 para que /socket.io/* llegue a python-socketio en vez de a FastAPI.
 """
-
 from contextlib import asynccontextmanager
 
 import socketio
@@ -31,6 +30,8 @@ from routers import (
     dispositivos,
     equipo,
     acceso_soporte,
+    avisos_cita_config,
+    vista_gerencia,
     eventos,
     gerencia,
     gerencia_operacion,
@@ -41,6 +42,7 @@ from routers import (
     media,
     onboarding,
     pagos,
+    pagos_connect,
     pagos_stripe,
     plantillas_whatsapp,
     plantillas_whatsapp_tenant,
@@ -130,6 +132,8 @@ app.include_router(dispositivos.router, prefix="/api")
 #   Mercado Pago -> /api/pagos/webhook  (503 mientras no sea el proveedor)
 app.include_router(pagos.router, prefix="/api")
 app.include_router(pagos_stripe.router, prefix="/api")
+# Cobros propios de cada negocio (Stripe Connect) — ver routers/pagos_connect.py.
+app.include_router(pagos_connect.router, prefix="/api")
 
 # CRM de campo: cartera, visitas con geocerca, seguimientos y reportes.
 # Convive con el embudo de chat de arriba; comparten la tabla vendedores.
@@ -154,6 +158,8 @@ app.include_router(gerencia_planes.router, prefix="/api")
 app.include_router(gerencia_incidencias.router, prefix="/api")
 app.include_router(plantillas_whatsapp.router, prefix="/api")
 app.include_router(plantillas_whatsapp_tenant.router, prefix="/api")
+app.include_router(avisos_cita_config.router, prefix="/api")
+app.include_router(vista_gerencia.router, prefix="/api")
 
 # Lo llama n8n con X-Internal-Token, no el frontend.
 app.include_router(eventos.router, prefix="/api")

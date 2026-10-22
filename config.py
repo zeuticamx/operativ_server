@@ -78,6 +78,11 @@ class Settings:
         "sí",
     )
 
+    # ---- Vista de gerencia a las conversaciones de un número ----
+    # phone_number_id de Meta (agentes_canal.phone_number_id) cuyas conversaciones
+    # abre /gerencia/conversaciones a todo gerencia_users. Vacío = función apagada.
+    GERENCIA_NUMERO_PHONE_NUMBER_ID: str = os.getenv("GERENCIA_NUMERO_PHONE_NUMBER_ID", "").strip()
+
     # ---- Avisos de citas por WhatsApp desde la cuenta global (spec 004) ----
     # Se leen en tiempo de petición/pasada (no se copian a constantes de
     # módulo) para que los tests puedan cambiarlas con monkeypatch.
@@ -104,6 +109,10 @@ class Settings:
     # global". No es un secreto: la clave y el phone_number_id se leen de su
     # fila de channel_credentials (services/cuenta_global_wa.py).
     AVISOS_CUENTA_GLOBAL_TENANT_ID: str = os.getenv("AVISOS_CUENTA_GLOBAL_TENANT_ID", "").strip()
+    # WABA de Meta de la cuenta global (spec 007, T6): el handler global de estado de
+    # plantillas solo aplica los eventos de ESTE WABA; los de los negocios van a su caché.
+    # Vacío = no se aplica ningún evento al estado global (lo seguro).
+    AVISOS_CUENTA_GLOBAL_WABA_ID: str = os.getenv("AVISOS_CUENTA_GLOBAL_WABA_ID", "").strip()
     # Cada cuántos minutos corre el job de recordatorios, y cuánto tiempo sin
     # latido hace que una ejecución se dé por muerta.
     AVISOS_CITA_REVISION_MINUTOS: int = int(os.getenv("AVISOS_CITA_REVISION_MINUTOS", "5"))
@@ -222,6 +231,14 @@ class Settings:
     # para NeuroApiProvider.verificar_webhook (services/whatsapp.py), que hoy
     # no usa ningún router. Vacío = ese webhook rechaza todo.
     NEUROAPI_CONNECT_WEBHOOK_SECRET: str = os.getenv("NEUROAPI_CONNECT_WEBHOOK_SECRET", "")
+
+    # API key de NeuroAPI con el scope "instagram_api": la Connect Session de
+    # Instagram Direct, el envío (/neuroapi/instagram/send) y la descarga de
+    # media (/neuroapi/instagram/media/:id). Es otra key que la de WhatsApp,
+    # pero el webhook es el mismo y lo firma el mismo
+    # NEUROAPI_CONNECT_WEBHOOK_SECRET. Vacío = no se puede vincular Instagram
+    # por NeuroAPI (503) y las cuentas ya vinculadas no pueden descargar media.
+    NEUROAPI_INSTA_KEY: str = os.getenv("NEUROAPI_INSTA_KEY", "")
 
     # ---- Google (cuenta de servicio compartida, para Sheets/Docs) ----
     GOOGLE_SERVICE_ACCOUNT_JSON: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
@@ -372,6 +389,47 @@ class Settings:
     # Stripe espera el código de moneda en minúsculas (iso 4217).
     STRIPE_CURRENCY: str = os.getenv("STRIPE_CURRENCY", "mxn").strip().lower()
 
+    # ---- Stripe Connect ----
+    # Cobros que cada tenant hace a SUS propios clientes (no a OperativAI).
+    # Separado del bloque "Stripe" de arriba a propósito: ese es la
+    # facturación de la plataforma a los tenants; esto es la cuenta de
+    # Stripe que CADA tenant conecta para cobrarle a los suyos. Usa la
+    # misma STRIPE_SECRET_KEY: es la misma cuenta de plataforma la que crea
+    # las cuentas Express conectadas.
+    #
+    # Apagador maestro: en false, /api/pagos/connect/* responde 503 (los
+    # links ya generados siguen cobrables en Stripe, esto solo cierra la
+    # puerta a generar nuevos y a que el agente los ofrezca).
+    STRIPE_CONNECT_ACTIVO: bool = os.getenv("STRIPE_CONNECT_ACTIVO", "false").strip().lower() in (
+        "1", "true", "yes",
+    )
+
+    # Comisión de la plataforma sobre cada cobro de Connect, como
+    # application_fee_amount. Apagado por default: sin esto en true, no se
+    # manda application_fee_amount y el 100% del cobro es para el tenant
+    # (menos las comisiones de procesamiento propias de Stripe, que paga la
+    # cuenta conectada como siempre en un cargo directo).
+    STRIPE_CONNECT_APPLICATION_FEE_ACTIVO: bool = os.getenv(
+        "STRIPE_CONNECT_APPLICATION_FEE_ACTIVO", "false"
+    ).strip().lower() in ("1", "true", "yes")
+
+    # Porcentaje (admite decimales, ej. "2.5") que se queda la plataforma
+    # cuando el toggle de arriba está activo. Solo se lee si
+    # STRIPE_CONNECT_APPLICATION_FEE_ACTIVO es true; ver la propiedad
+    # stripe_connect_fee_bps más abajo para el valor ya validado.
+    STRIPE_CONNECT_APPLICATION_FEE_PERCENT: str = os.getenv(
+        "STRIPE_CONNECT_APPLICATION_FEE_PERCENT", "0"
+    ).strip()
+
+    # Secreto de firma del webhook de Connect (whsec_...). Es OTRO endpoint
+    # en el panel de Stripe, no una casilla sobre el de arriba: el parámetro
+    # `connect` de un webhook endpoint se fija al crearlo y no se le puede
+    # agregar después a uno que ya existe (confirmado en docs.stripe.com),
+    # así que apunta a la MISMA URL pero Stripe le da un secreto propio.
+    # routers/pagos_stripe.py prueba STRIPE_WEBHOOK_SECRET y, si no valida,
+    # este, antes de rechazar el evento con 401.
+    STRIPE_CONNECT_WEBHOOK_SECRET: str = os.getenv("STRIPE_CONNECT_WEBHOOK_SECRET", "")
+
     # ---- Mercado Pago (deshabilitado; ver PAYMENT_PROVIDER) ----
     MERCADOPAGO_ACCESS_TOKEN: str = os.getenv("MERCADOPAGO_ACCESS_TOKEN", "")
     # Pública a propósito: es la que el navegador usa si algún día se monta
@@ -487,6 +545,30 @@ class Settings:
         return bool(self.STRIPE_SECRET_KEY)
 
     @property
+    def stripe_connect_configurado(self) -> bool:
+        """Sin secret key no se puede crear una cuenta Express ni un Account Link."""
+        return bool(self.STRIPE_SECRET_KEY)
+
+    @property
+    def stripe_connect_fee_bps(self) -> int:
+        """
+        STRIPE_CONNECT_APPLICATION_FEE_PERCENT parseado a basis points
+        (2.5% -> 250), o 0 si el toggle está apagado o el valor no es un
+        número válido. Basis points y no el Decimal del porcentaje: así el
+        cálculo del application_fee_amount es una multiplicación entera
+        sobre centavos, sin arrastrar más Decimal del necesario.
+        """
+        if not self.STRIPE_CONNECT_APPLICATION_FEE_ACTIVO:
+            return 0
+        try:
+            porcentaje = Decimal(self.STRIPE_CONNECT_APPLICATION_FEE_PERCENT)
+        except InvalidOperation:
+            return 0
+        if porcentaje <= 0:
+            return 0
+        return int((porcentaje * 100).to_integral_value())
+
+    @property
     def kontesta_configurado(self) -> bool:
         """Sin API key no se puede autenticar ninguna llamada a Kontesta."""
         return bool(self.KONTESTA_API_KEY)
@@ -504,6 +586,11 @@ class Settings:
         de esa cuenta.
         """
         return bool(self.NEUROAPI_API_KEY)
+
+    @property
+    def instagram_neuroapi_configurado(self) -> bool:
+        """Vincular Instagram Direct por NeuroAPI: su key propia y el secreto del webhook."""
+        return bool(self.NEUROAPI_INSTA_KEY and self.NEUROAPI_CONNECT_WEBHOOK_SECRET)
 
     @property
     def moneda_cobro(self) -> str:
@@ -563,14 +650,14 @@ class Settings:
                 "de verificación se van a escribir en el log en vez de enviarse."
             )
 
-        # Los avisos de citas por WhatsApp salen de la línea de un tenant
-        # (cuenta global). Con la bandera activa y sin tenant, todo envío
-        # quedaría `fallido`; mejor verlo al arrancar.
-        if self.AVISOS_CITA_WHATSAPP_ACTIVOS and not self.AVISOS_CUENTA_GLOBAL_TENANT_ID:
+        # Los avisos de cita salen del número principal de cada negocio (spec 007):
+        # AVISOS_CITA_WHATSAPP_ACTIVOS ya no necesita la cuenta global. Solo la
+        # respuesta fija a un aviso (AVISOS_CUENTA_GLOBAL_RESPUESTA_ACTIVA) la sigue usando.
+        if self.AVISOS_CUENTA_GLOBAL_RESPUESTA_ACTIVA and not self.AVISOS_CUENTA_GLOBAL_TENANT_ID:
             logging.getLogger("operativai.config").warning(
-                "AVISOS_CITA_WHATSAPP_ACTIVOS está activa pero "
-                "AVISOS_CUENTA_GLOBAL_TENANT_ID está vacío: los avisos de "
-                "citas por WhatsApp van a quedar como fallidos."
+                "AVISOS_CUENTA_GLOBAL_RESPUESTA_ACTIVA está activa pero "
+                "AVISOS_CUENTA_GLOBAL_TENANT_ID está vacío: la respuesta fija a los "
+                "avisos no va a poder enviarse."
             )
 
         # Tampoco se exige: un tenant que solo usa el portal no necesita el
@@ -654,8 +741,21 @@ class Settings:
             logging.getLogger("operativai.config").warning(
                 "NEUROAPI_CONNECT_WEBHOOK_SECRET sin configurar: "
                 "/api/canales/whatsapp/neuroapi/webhook va a rechazar todo, "
-                "así que ninguna vinculación automática de WhatsApp se "
-                "completará."
+                "así que ninguna vinculación automática de WhatsApp ni de "
+                "Instagram se completará."
+            )
+        if not self.NEUROAPI_INSTA_KEY:
+            logging.getLogger("operativai.config").warning(
+                "NEUROAPI_INSTA_KEY sin configurar: no se puede vincular "
+                "Instagram Direct por NeuroAPI (503) ni descargar su media."
+            )
+        elif not self.AGENTE_EN_CODIGO:
+            # n8n envía Instagram por Graph con page_id; una cuenta vinculada
+            # por NeuroAPI no tiene page_id, así que solo la contesta el agente
+            # en código.
+            logging.getLogger("operativai.config").warning(
+                "AGENTE_EN_CODIGO apagada: las cuentas de Instagram vinculadas "
+                "por NeuroAPI reciben mensajes, pero n8n no puede contestarlas."
             )
 
         # Con el agente ya en código, n8n deja de recibir mensajes y esta

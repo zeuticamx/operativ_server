@@ -67,6 +67,20 @@ def _detalle_meta(cuerpo: str | None) -> str | None:
     return None
 
 
+SUBCODIGO_DUPLICADO = "2388023"  # Meta: la plantilla ya existe en ese idioma
+_MARCAS_DUPLICADO = ("already exists", "ya existe", "duplicate", str(SUBCODIGO_DUPLICADO))
+
+
+def es_duplicado(e: PlantillaApiError) -> bool:
+    """Meta/NeuroAPI contestó que el nombre (e idioma) ya existe: 409, o 400 con su marca."""
+    if e.status_code == 409:
+        return True
+    if e.status_code != 400 or not e.cuerpo:
+        return False
+    cuerpo = e.cuerpo.lower()
+    return any(m in cuerpo for m in _MARCAS_DUPLICADO)
+
+
 def a_http(e: PlantillaApiError) -> HTTPException:
     """400 de Meta -> 422 con su motivo; permisos/clave -> 502; el resto, según el caso."""
     if e.status_code == 400:
@@ -218,6 +232,29 @@ class NeuroApiTemplateService:
             },
         )
         return _una(data) or {}
+
+    async def crear_o_adoptar(
+        self, *, nombre: str, idioma: str, categoria: str, componentes: list[dict[str, Any]]
+    ) -> tuple[dict[str, Any], bool]:
+        """
+        Crea la plantilla; si Meta dice que ya existe (spec 007: duplicado -> adoptar)
+        devuelve la que ya hay. Resultado: (respuesta de Meta, `creada`). Con duplicado
+        y sin poder consultarla, la respuesta va vacía y `creada` es False. Cualquier
+        otro error se propaga tal cual.
+        """
+        try:
+            return await self.crear(
+                nombre=nombre, idioma=idioma, categoria=categoria, componentes=componentes
+            ), True
+        except PlantillaApiError as e:
+            if not es_duplicado(e):
+                raise
+        try:
+            return (await self.obtener(nombre)) or {}, False
+        except PlantillaApiError as e:
+            if e.status_code == 404:
+                return {}, False
+            raise
 
     async def eliminar(self, nombre: str) -> None:
         await self._pedir("DELETE", f"/{nombre}")

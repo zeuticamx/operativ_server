@@ -239,15 +239,38 @@ def test_banderas_por_defecto_apagadas():
     assert Settings.AVISOS_EJECUCION_VIVA_MINUTOS == 5
 
 
-def test_validate_avisa_si_la_bandera_esta_activa_sin_tenant(monkeypatch, caplog):
-    monkeypatch.setattr(settings, "AVISOS_CITA_WHATSAPP_ACTIVOS", True)
-    monkeypatch.setattr(settings, "AVISOS_CUENTA_GLOBAL_TENANT_ID", "")
+def _validar_con(monkeypatch, caplog, **banderas):
+    for nombre, valor in banderas.items():
+        monkeypatch.setattr(settings, nombre, valor)
     monkeypatch.setattr(settings, "JWT_SECRET", settings.JWT_SECRET or "x")
     monkeypatch.setattr(settings, "META_APP_ID", settings.META_APP_ID or "x")
     monkeypatch.setattr(settings, "META_APP_SECRET", settings.META_APP_SECRET or "x")
     with caplog.at_level("WARNING", logger="operativai.config"):
         settings.validate()
-    assert any("AVISOS_CUENTA_GLOBAL_TENANT_ID" in r.getMessage() for r in caplog.records)
+    return [r.getMessage() for r in caplog.records]
+
+
+def test_validate_ya_no_exige_la_cuenta_global_para_los_avisos_de_cita(monkeypatch, caplog):
+    # spec 007 (A3): los avisos salen del número principal de cada negocio.
+    mensajes = _validar_con(
+        monkeypatch,
+        caplog,
+        AVISOS_CITA_WHATSAPP_ACTIVOS=True,
+        AVISOS_CUENTA_GLOBAL_RESPUESTA_ACTIVA=False,
+        AVISOS_CUENTA_GLOBAL_TENANT_ID="",
+    )
+    assert not any("AVISOS_CUENTA_GLOBAL_TENANT_ID" in m for m in mensajes)
+
+
+def test_validate_avisa_si_la_respuesta_fija_esta_activa_sin_tenant(monkeypatch, caplog):
+    mensajes = _validar_con(
+        monkeypatch,
+        caplog,
+        AVISOS_CITA_WHATSAPP_ACTIVOS=False,
+        AVISOS_CUENTA_GLOBAL_RESPUESTA_ACTIVA=True,
+        AVISOS_CUENTA_GLOBAL_TENANT_ID="",
+    )
+    assert any("AVISOS_CUENTA_GLOBAL_TENANT_ID" in m for m in mensajes)
 
 
 # ============================================================
@@ -320,7 +343,7 @@ class _Mundo:
         async def _enviar_texto(destino: str, texto: str):
             mundo.envios.append((destino, texto))
 
-        async def _reenviar(cuerpo: bytes, tenant: Any, destino: str) -> None:
+        async def _reenviar(cuerpo: bytes, tenant: Any, destino: str, **_: Any) -> None:
             mundo.reenvios.append(tenant)
 
         async def _tenant_por_numero(pnid: str):

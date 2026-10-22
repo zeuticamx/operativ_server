@@ -265,6 +265,10 @@ class _Cache:
         async def borrar_local(tenant_id, nombre):
             c.filas.pop((tenant_id, nombre), None)
 
+        async def apagar_funcion(tenant_id, nombre):
+            return None  # T6: DELETE llama a reaccion_estado; aquí ninguna función de aviso está activa
+
+        mp.setattr(cache, "_apagar_funcion_bd", apagar_funcion)
         mp.setattr(cache, "obtener", obtener)
         mp.setattr(cache, "listar", listar)
         mp.setattr(cache, "guardar", guardar)

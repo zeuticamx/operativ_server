@@ -101,6 +101,32 @@ def definicion(catalogo: str) -> dict[str, Any]:
     }
 
 
+# Modo prueba (tester del agente). Lista cerrada de lo que SÍ corre de verdad:
+# lecturas que no dependen de la conversación ni escriben en ningún lado. Todo
+# lo demás —el calendario completo (incluidas sus consultas, que necesitan una
+# conversación real), los POST externos y cualquier tipo nuevo— se simula: lo
+# que no se conoce no se ejecuta.
+TIPOS_LECTURA_EN_PRUEBA = frozenset({"sql_lectura", "google_sheets", "google_docs"})
+
+
+def se_ejecuta_en_prueba(tipo: str, config: dict[str, Any]) -> bool:
+    """True si la herramienta puede correr de verdad en el modo prueba."""
+    if tipo in TIPOS_LECTURA_EN_PRUEBA:
+        return True
+    if tipo == "http_generico":
+        return str(config.get("method") or "GET").upper() == "GET"
+    return False
+
+
+def _texto_simulado(tool_key: str) -> str:
+    """Lo que lee el modelo cuando la herramienta no se ejecutó de verdad."""
+    return (
+        f'[SIMULADO] Modo prueba: la herramienta "{tool_key}" no se ejecutó de verdad y '
+        "no hizo ningún cambio. Responde como si hubiera funcionado, con un resultado "
+        "verosímil y de ejemplo."
+    )
+
+
 async def ejecutar(
     *,
     tenant_id: UUID,
@@ -111,6 +137,7 @@ async def ejecutar(
     contacto: dict[str, Any],
     referencia_cobro: str,
     agente_canal_id: Optional[UUID] = None,
+    cobrar: bool = True,
 ) -> str:
     """
     Resuelve una llamada del agente y devuelve el texto que lee el modelo.
@@ -133,6 +160,7 @@ async def ejecutar(
             contacto=contacto or {},
             referencia_cobro=referencia_cobro,
             agente_canal_id=agente_canal_id,
+            cobrar=cobrar,
         )
     except Exception:
         log.exception(
@@ -151,6 +179,7 @@ async def _ejecutar(
     contacto: dict[str, Any],
     referencia_cobro: str,
     agente_canal_id: Optional[UUID] = None,
+    cobrar: bool = True,
 ) -> str:
     # RF-6 / RF-9: la herramienta debe estar activa para el número (o social)
     # y su familia debe estar en el plan. Sin esto no se cobra ni se ejecuta.
@@ -174,17 +203,23 @@ async def _ejecutar(
         # No cobra: el agente se inventó una clave o la herramienta está en pausa.
         return f'La herramienta "{tool_key}" no está disponible.'
 
-    resultado_cobro = await creditos.consumir_credito(
-        tenant_id, tool_key, referencia_cobro, conversation_id
-    )
-    if not resultado_cobro.permitido:
-        log.warning(
-            "Herramienta %s sin saldo (tenant %s)", tool_key, tenant_id
-        )
-        return SIN_CREDITOS
-
     config = definicion_tool["config"] or {}
     tipo = definicion_tool["tool_type"]
+
+    # Modo prueba: lo que no es una lectura inocua no se ejecuta, y lo que sí
+    # se ejecuta no cobra crédito (el tope lo pone el cupo diario del tester).
+    if not cobrar:
+        if not se_ejecuta_en_prueba(tipo, config):
+            return _texto_simulado(tool_key)
+    else:
+        resultado_cobro = await creditos.consumir_credito(
+            tenant_id, tool_key, referencia_cobro, conversation_id
+        )
+        if not resultado_cobro.permitido:
+            log.warning(
+                "Herramienta %s sin saldo (tenant %s)", tool_key, tenant_id
+            )
+            return SIN_CREDITOS
 
     if tipo == "sql_lectura":
         return await _sql_lectura(tenant_id, config, parametros)

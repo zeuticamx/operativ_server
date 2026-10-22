@@ -61,6 +61,8 @@ class _Mundo:
 def mundo(monkeypatch: pytest.MonkeyPatch) -> _Mundo:
     m = _Mundo()
     monkeypatch.setattr(settings, "NEUROAPI_CONNECT_WEBHOOK_SECRET", SECRETO)
+    # T6: el handler global solo aplica eventos del WABA de la cuenta global (los de _estado()).
+    monkeypatch.setattr(settings, "AVISOS_CUENTA_GLOBAL_WABA_ID", "waba-1")
     monkeypatch.setattr(settings, "N8N_WEBHOOK_ENTRADA_URL", "http://n8n.invalid/entrada", raising=False)
 
     class _Conexion:
@@ -86,7 +88,7 @@ def mundo(monkeypatch: pytest.MonkeyPatch) -> _Mundo:
     async def tenant_por_numero(phone_number_id: str):
         return uuid4()
 
-    async def reenviar(cuerpo_crudo: bytes, tenant_id: Any, destino: str) -> None:
+    async def reenviar(cuerpo_crudo: bytes, tenant_id: Any, destino: str, **_: Any) -> None:
         m.reenvios.append(cuerpo_crudo)
 
     monkeypatch.setattr(pw, "transaccion", transaccion)

@@ -15,6 +15,12 @@ Al terminar el Embedded Signup, NeuroAPI dispara `whatsapp.connected` a la
 El parser acepta además variantes en snake_case, con los datos en la raíz o
 en `data`, y el sobre estándar de Meta (`entry[].changes[].value`).
 
+Instagram Direct usa esta misma URL y el mismo secreto: `instagram.connected`
+trae `data.accounts[]` (con `instagramAccountId`), y la sesión dice de qué
+canal es (`neuroapi_connect_sessions.canal`). Los DMs llegan con
+`object: "instagram"` y se enrutan por la cuenta receptora en vez de por
+phone_number_id.
+
 Una vez vinculada la cuenta, NeuroAPI manda a esta misma URL los mensajes
 entrantes. Para esos, el backend actúa de proxy (services/entrada_mensajes.py):
 la firma ya se validó aquí, se identifica el tenant por el número receptor y
@@ -45,7 +51,7 @@ router = APIRouter(prefix="/canales/whatsapp/neuroapi", tags=["canales"])
 
 log = logging.getLogger("operativai.canales.neuroapi_connect")
 
-EVENTOS_CONECTADO = {"whatsapp.connected"}
+EVENTOS_CONECTADO = {"whatsapp.connected", "instagram.connected"}
 
 # La tabla solo admite pendiente/completado/fallido (CHECK en
 # sql/24_neuroapi_connect_sessions.sql): cualquier otro valor hacía fallar el
@@ -107,17 +113,30 @@ async def webhook(request: Request) -> dict[str, bool]:
     # Estado de las plantillas de la cuenta global (spec 004): lo manda Meta
     # por NeuroAPI, ya con la firma verificada. No es un mensaje ni un alta.
     if plantillas_whatsapp.es_evento_de_plantilla(evento):
+        # 200 igualmente: un reintento de NeuroAPI no arregla un fallo propio. Cada
+        # handler va por separado para que un fallo del uno no deje sin aplicar el otro.
         try:
+            # Solo los eventos del WABA de la cuenta global (spec 007, hallazgo 1).
             await plantillas_whatsapp.aplicar_evento_meta(evento)
-            # Plantillas propias de cada negocio (caché de /api/plantillas-whatsapp).
+        except Exception:
+            log.exception("No se pudo aplicar el evento de estado de plantilla global")
+        try:
+            # Plantillas propias de cada negocio (caché de /api/plantillas-whatsapp);
+            # REJECTED/PAUSED/DISABLED apagan la función de aviso de cita y alertan.
             await plantillas_tenant.aplicar_evento_meta(evento)
         except Exception:
-            # 200 igualmente: un reintento de NeuroAPI no arregla un fallo propio.
-            log.exception("No se pudo aplicar el evento de estado de plantilla")
+            log.exception("No se pudo aplicar el evento de estado de plantilla de un negocio")
         return {"recibido": True}
 
     fuentes = _fuentes(evento)
     tipo_evento = str(_campo(fuentes, "event", "type") or "").strip().lower()
+
+    # Enrutado por `object`: un DM de Instagram Direct no trae phone_number_id
+    # y su tenant sale de la cuenta receptora. `whatsapp_business_account` (y
+    # lo que no traiga `object`) sigue el camino de siempre.
+    if evento.get("object") == "instagram" and not _es_evento_de_conexion(tipo_evento, fuentes):
+        await _reenviar_mensaje_instagram(cuerpo_crudo, evento)
+        return {"recibido": True}
 
     if not _es_evento_de_conexion(tipo_evento, fuentes):
         await _reenviar_mensaje(cuerpo_crudo, evento, tipo_evento)
@@ -175,6 +194,37 @@ async def _reenviar_mensaje(cuerpo_crudo: bytes, evento: dict[str, Any], tipo_ev
         )
         return
 
+    await _entregar(cuerpo_crudo, tenant_id, "whatsapp", phone_number_id)
+
+
+async def _reenviar_mensaje_instagram(cuerpo_crudo: bytes, evento: dict[str, Any]) -> None:
+    """
+    Un DM de Instagram Direct: el tenant sale de la cuenta que lo recibió
+    (`entry[].id`, o `recipient.id`), que es el `ig_user_id` guardado al
+    vincular. Los ecos (lo que manda el propio negocio) también se reenvían:
+    los descarta `normalizar` (`is_echo`), igual que con Meta directo.
+    """
+    ig_account_id = entrada_mensajes.extraer_ig_account_id(evento)
+    if not ig_account_id:
+        log.warning("Mensaje de Instagram de NeuroAPI sin cuenta receptora; %s", _estructura(evento))
+        return
+
+    tenant_id = await entrada_mensajes.tenant_por_cuenta_instagram(ig_account_id)
+    if tenant_id is None:
+        # Igual que en WhatsApp: una cuenta desconectada desde el portal sigue
+        # mandando hasta que el negocio retire el acceso en Meta.
+        log.warning(
+            "Mensaje de Instagram de NeuroAPI descartado: la cuenta …%s no tiene "
+            "tenant activo (desconectada o ajena)",
+            str(ig_account_id)[-4:],
+        )
+        return
+
+    await _entregar(cuerpo_crudo, tenant_id, "instagram", ig_account_id)
+
+
+async def _entregar(cuerpo_crudo: bytes, tenant_id: Any, canal: str, identificador: str) -> None:
+    """Reenvía al destino del tenant (n8n o el agente en código)."""
     destino = entrada_mensajes.destino_para(tenant_id)
     if not destino:
         # 503 y no 200: NeuroAPI reintenta y el mensaje no se pierde mientras
@@ -189,11 +239,11 @@ async def _reenviar_mensaje(cuerpo_crudo: bytes, evento: dict[str, Any], tipo_ev
         )
 
     try:
-        await entrada_mensajes.reenviar(cuerpo_crudo, tenant_id, destino)
+        await entrada_mensajes.reenviar(cuerpo_crudo, tenant_id, destino, canal=canal)
     except entrada_mensajes.ReenvioError as e:
         log.error(
-            "No se pudo reenviar el mensaje del tenant %s (número %s): %s",
-            tenant_id, phone_number_id, e,
+            "No se pudo reenviar el mensaje de %s del tenant %s (%s): %s",
+            canal, tenant_id, identificador, e,
         )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -250,7 +300,7 @@ async def _procesar_conexion(
         UPDATE neuroapi_connect_sessions
            SET status = $2, detalle = $3, updated_at = NOW()
          WHERE session_id = $1
-        RETURNING tenant_id, connection_mode
+        RETURNING tenant_id, connection_mode, canal
         """,
         str(session_id),
         estado,
@@ -259,6 +309,13 @@ async def _procesar_conexion(
     )
     if fila is None:
         log.warning("Evento de NeuroAPI Connect para una sesión que no es nuestra: %s", session_id)
+        return
+
+    # El canal lo dice la sesión que abrió el negocio, no el evento: un
+    # `instagram.connected` sobre una sesión de WhatsApp no activa nada.
+    if fila["canal"] == "instagram":
+        if estado == "completado":
+            await _completar_instagram(fila["tenant_id"], str(session_id), evento)
         return
 
     if estado == "completado":
@@ -354,6 +411,60 @@ async def _activar_whatsapp(
         tenant_id,
     )
     return resultado
+
+
+async def _completar_instagram(tenant_id: Any, session_id: str, evento: dict[str, Any]) -> None:
+    """
+    `instagram.connected`: vincula la primera cuenta de `data.accounts[]`
+    (formato observado, 2026-10-22: `instagramAccountId`, `username`) y deja
+    el resultado en la sesión, que es lo que lee `GET .../instagram/neuroapi/estado`.
+    """
+    from services import instagram_neuroapi
+    from session import conexion
+
+    cuentas = _cuentas_instagram(evento)
+    if len(cuentas) > 1:
+        log.warning(
+            "NeuroAPI Connect mandó %d cuentas de Instagram para la sesión %s; se usa la primera",
+            len(cuentas), session_id,
+        )
+    cuenta = cuentas[0] if cuentas else {}
+    ig_user_id = str(
+        cuenta.get("instagramAccountId") or cuenta.get("instagram_account_id") or ""
+    ).strip()
+    username = cuenta.get("username") or None
+
+    async with conexion() as conn:
+        resultado = await instagram_neuroapi.vincular_desde_proveedor(
+            conn, tenant_id, ig_user_id, username=username
+        )
+
+    # Un alta rechazada deja la sesión en 'fallido': el trámite terminó y
+    # el portal tiene que dejar de esperar. La cuenta propia ya vinculada no
+    # es un fallo: sigue conectada como estaba.
+    await execute(
+        "UPDATE neuroapi_connect_sessions SET status = $2, detalle = $3, updated_at = NOW() "
+        "WHERE session_id = $1",
+        session_id,
+        "completado" if resultado.resultado in ("vinculado", "propio") else "fallido",
+        json.dumps(
+            {
+                "resultado": resultado.resultado,
+                "codigo": resultado.codigo,
+                "username": resultado.username,
+            }
+        ),
+    )
+    log.warning(
+        "Instagram vía NeuroAPI Connect: tenant=%s sesión=%s resultado=%s codigo=%s",
+        tenant_id, session_id, resultado.resultado, resultado.codigo,
+    )
+
+
+def _cuentas_instagram(evento: dict[str, Any]) -> list[dict[str, Any]]:
+    datos = evento.get("data")
+    cuentas = datos.get("accounts") if isinstance(datos, dict) else None
+    return [c for c in cuentas or [] if isinstance(c, dict)]
 
 
 def _campo(fuentes: list[dict[str, Any]], *nombres: str) -> Any:

@@ -367,7 +367,7 @@ async def test_desconectar_en_bloque_ya_no_existe_usar_numeros(
     # la entrada del agente, T7).
     reenvios: list[tuple] = []
 
-    async def no_reenviar(cuerpo_crudo, tenant, destino):
+    async def no_reenviar(cuerpo_crudo, tenant, destino, **_):
         reenvios.append((tenant, destino))
 
     monkeypatch.setattr(entrada_mensajes, "reenviar", no_reenviar)

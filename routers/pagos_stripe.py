@@ -12,12 +12,19 @@ Es el único endpoint del módulo sin JWT: se autentica por el HMAC de la
 cabecera `Stripe-Signature`. Todo lo que entregue lo compró alguien, así
 que la firma es lo único que separa un cobro real de un regalo.
 
-Dos familias de eventos:
+Tres familias de eventos:
   - checkout.session.* / charge.refunded: el estado de la transacción que
     creó crear-pago (y, para créditos, la entrega).
   - invoice.* / customer.subscription.*: el ciclo de vida de la
     suscripción recurrente, en services/stripe_suscripciones.py. Esos
     además avisan a gerencia (services/notificaciones_gerencia.py).
+  - account.updated / checkout.session.completed de una cuenta CONECTADA
+    (Stripe Connect, evento["account"] presente): los cobros que cada
+    tenant hace a SUS clientes, en services/stripe_connect.py. Se
+    distinguen por ese campo, no por la URL — llegan a este mismo endpoint,
+    pero son otro webhook endpoint EN STRIPE (scope "Connected accounts",
+    fijado al crearlo) con su propio secreto, STRIPE_CONNECT_WEBHOOK_SECRET
+    — por eso la firma se valida contra los dos secretos, no solo uno.
 """
 
 import json
@@ -29,6 +36,7 @@ from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request, 
 from config import settings
 from services.notificaciones_gerencia import notificar_evento_suscripcion
 from services.pagos import procesar_pago_aprobado
+from services.stripe_connect import PROCESADORES as PROCESADORES_CONNECT
 from services.stripe_pagos import firma_valida
 from services.stripe_suscripciones import PROCESADORES as PROCESADORES_SUSCRIPCION
 from session import execute, fetch_one
@@ -84,7 +92,16 @@ async def webhook(
     # bytes tal cual llegaron y volver a serializarlos rompe la firma.
     cuerpo_crudo = await request.body()
 
-    if not firma_valida(stripe_signature, cuerpo_crudo):
+    # El webhook de Connect es, en Stripe, OTRO endpoint con su propio
+    # secreto aunque apunte a esta misma URL (el parámetro `connect` de un
+    # webhook endpoint se fija al crearlo, no se le agrega a uno ya
+    # existente) — así que un evento puede llegar firmado con cualquiera de
+    # los dos y hay que probar ambos antes de rechazarlo.
+    firma_ok = firma_valida(stripe_signature, cuerpo_crudo) or (
+        bool(settings.STRIPE_CONNECT_WEBHOOK_SECRET)
+        and firma_valida(stripe_signature, cuerpo_crudo, settings.STRIPE_CONNECT_WEBHOOK_SECRET)
+    )
+    if not firma_ok:
         log.warning("Evento de Stripe con firma inválida")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -95,6 +112,23 @@ async def webhook(
         evento = json.loads(cuerpo_crudo)
     except json.JSONDecodeError:
         log.warning("Evento de Stripe con cuerpo ilegible")
+        return {"recibido": True}
+
+    cuenta_conectada = evento.get("account")
+    if cuenta_conectada:
+        # Evento de una cuenta CONECTADA (Stripe Connect): nunca es de la
+        # cuenta de plataforma, así que se despacha aparte y no entra al
+        # resto de este archivo (que asume siempre la cuenta de plataforma:
+        # checkout de crear-pago/suscripción, reembolsos de esos cobros).
+        tipo_connect = str(evento.get("type", ""))
+        objeto_connect = (evento.get("data") or {}).get("object") or {}
+        if tipo_connect in PROCESADORES_CONNECT:
+            await PROCESADORES_CONNECT[tipo_connect](objeto_connect)
+        else:
+            log.info(
+                "Evento de Connect ignorado (type=%s, account=%s)",
+                tipo_connect, cuenta_conectada,
+            )
         return {"recibido": True}
 
     tipo = str(evento.get("type", ""))

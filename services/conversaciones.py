@@ -26,7 +26,7 @@ from uuid import UUID
 from fastapi import HTTPException, status
 
 from config import settings
-from services import adjuntos, meta, whatsapp
+from services import adjuntos, mensajeria, meta, whatsapp
 from session import execute, fetch_all, fetch_one, transaccion
 
 # n8n arma el INSERT de `users` con expresiones de plantilla que, cuando el
@@ -57,6 +57,18 @@ _MINUTOS_VENTANA = (
     f"ELSE (1440 - EXTRACT(EPOCH FROM (NOW() - {_ULTIMO_CLIENTE})) / 60)::int END"
 )
 
+# Instagram por NeuroAPI: la respuesta de una persona sale con la etiqueta
+# HUMAN_AGENT (services/mensajeria.py), que Meta acepta hasta 7 días después
+# del último mensaje del cliente. Solo si el canal del negocio está vinculado
+# por NeuroAPI: por Graph directo no se manda la etiqueta y siguen las 24 h.
+_MINUTOS_VENTANA_HUMANA = (
+    "CASE WHEN c.channel_type = 'instagram' AND EXISTS ("
+    "SELECT 1 FROM channel_credentials cc WHERE cc.tenant_id = c.tenant_id "
+    "AND cc.channel_type = 'instagram' AND cc.is_active AND cc.bsp_provider = 'neuroapi') "
+    f"AND {_ULTIMO_CLIENTE} IS NOT NULL "
+    f"THEN (10080 - EXTRACT(EPOCH FROM (NOW() - {_ULTIMO_CLIENTE})) / 60)::int END"
+)
+
 # De qué proveedor del calendario es una conversación: del de la cita MÁS
 # RECIENTE (por fecha de alta, cancelada incluida) de ese cliente. Una sola
 # respuesta a propósito: si el cliente reservó con dos barberos, la
@@ -67,6 +79,23 @@ _PROVEEDOR_DEL_CLIENTE = (
     "WHERE r.tenant_id = c.tenant_id AND r.user_id = c.user_id "
     "ORDER BY r.creado_en DESC LIMIT 1)"
 )
+
+# Qué número/agente de WhatsApp es dueño de la conversación (spec 005a,
+# `conversations.agente_canal_id`). NULL para Instagram/Facebook/widget: esos
+# canales usan un único agente compartido (`tenant_agent_config`), sin
+# ambigüedad posible. `tiene_varios_numeros` le dice al portal si vale la
+# pena mostrar de cuál se trata (un negocio con un solo número no la necesita).
+_NUMERO_JOIN = "LEFT JOIN agentes_canal ac ON ac.id = c.agente_canal_id"
+_NUMERO_CAMPOS = """
+            c.agente_canal_id,
+            ac.telefono_visible AS numero_telefono_visible,
+            ac.phone_number_id AS numero_phone_number_id,
+            ac.agent_name AS numero_agent_name,
+            COALESCE(ac.es_linea_avisos, false) AS numero_es_linea_avisos,
+            (SELECT COUNT(*) FROM agentes_canal ac2
+             WHERE ac2.tenant_id = c.tenant_id AND ac2.estado IN ('activo', 'pausado')) > 1
+                AS tiene_varios_numeros
+"""
 
 
 @dataclass(frozen=True)
@@ -231,10 +260,12 @@ async def listar(
              WHERE m.conversation_id = c.id
              ORDER BY m.created_at DESC LIMIT 1) AS ultimo_mensaje,
             {_ULTIMO_CLIENTE} AS ultimo_mensaje_cliente_at,
-            {_MINUTOS_VENTANA} AS minutos_restantes_ventana
+            {_MINUTOS_VENTANA} AS minutos_restantes_ventana,
+            {_NUMERO_CAMPOS}
         FROM conversations c
         JOIN users u ON u.id = c.user_id
         LEFT JOIN portal_users pa ON pa.id = c.asignado_a
+        {_NUMERO_JOIN}
         WHERE c.tenant_id = $1
           AND NOT EXISTS (SELECT 1 FROM agentes_canal ac_oc
                           WHERE ac_oc.id = c.agente_canal_id AND ac_oc.estado = 'desvinculado')
@@ -318,10 +349,13 @@ async def detalle(tenant_id: UUID, conversacion_id: UUID):
             {_HANDLE} AS usuario_handle,
             {_USERNAME} AS usuario_username,
             {_ULTIMO_CLIENTE} AS ultimo_mensaje_cliente_at,
-            {_MINUTOS_VENTANA} AS minutos_restantes_ventana
+            {_MINUTOS_VENTANA} AS minutos_restantes_ventana,
+            {_MINUTOS_VENTANA_HUMANA} AS minutos_restantes_ventana_humana,
+            {_NUMERO_CAMPOS}
         FROM conversations c
         JOIN users u ON u.id = c.user_id
         LEFT JOIN portal_users pa ON pa.id = c.asignado_a
+        {_NUMERO_JOIN}
         WHERE c.id = $1 AND c.tenant_id = $2
           AND NOT EXISTS (SELECT 1 FROM agentes_canal ac_oc
                           WHERE ac_oc.id = c.agente_canal_id AND ac_oc.estado = 'desvinculado')
@@ -552,6 +586,20 @@ async def enviar_mensaje_humano(
             wamid = enviado.id_mensaje or None
         except whatsapp.ProveedorWhatsAppError as e:
             raise whatsapp.a_http(e)
+    elif mensajeria.es_instagram_neuroapi(canal, cred):
+        # Respuesta de una persona: con HUMAN_AGENT, que en Instagram deja
+        # contestar hasta 7 días después del último mensaje del cliente.
+        try:
+            await mensajeria.enviar(
+                mensajeria.peticion_instagram(cred, destinatario, texto, humano=True)
+            )
+        except mensajeria.SinCredenciales:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"El canal {canal} no está conectado",
+            )
+        except meta.MetaError as e:
+            raise meta.a_http(e)
     else:
         url, body = _url_y_body(canal, cred, destinatario, texto)
         try:

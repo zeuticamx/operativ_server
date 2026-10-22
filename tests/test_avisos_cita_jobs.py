@@ -21,7 +21,8 @@ import pytest
 from config import settings
 from jobs import alertas_background, recordatorios_cita_background as job
 from services import avisos_cita as ac
-from services import contexto_agente, cuenta_global_wa, plantillas_whatsapp
+from services import avisos_cita_envio, contexto_agente
+from services.avisos_cita_envio import ResultadoEnvioTenant
 
 TENANT = uuid4()
 
@@ -40,7 +41,9 @@ class _Mundo:
         self.eventos: list[dict[str, Any]] = []
         self.gerencia: list[tuple[UUID, str]] = []
         self.conversacion: UUID | None = uuid4()
-        self.plantilla_aprobada = True
+        self.plantilla_estado: str | None = "APPROVED"  # caché de la plantilla del tenant
+        self.habilitado = True  # calendario activo y función encendida
+        self.emisor_ok = True  # número principal activo coincidente (D6)
         self.fallar_envio = False
         self.fallar_candidatos_de: set[UUID] = set()
         self.ejecuciones: list[UUID] = []
@@ -98,6 +101,8 @@ def mundo(monkeypatch: pytest.MonkeyPatch) -> _Mundo:
         con_aviso = {
             (a["reserva_id"], a["tipo"], a["hora_inicio"]) for a in m.avisos.values()
         }
+        if not settings.AVISOS_CITA_WHATSAPP_ACTIVOS or not m.habilitado:
+            return []  # el filtro SQL real (D7) deja fuera negocios sin función activa
         return [
             dict(r) for r in m.reservas.values()
             if r["estado"] == "confirmada"
@@ -135,10 +140,13 @@ def mundo(monkeypatch: pytest.MonkeyPatch) -> _Mundo:
                  telefono_destino=telefono_destino if estado == "enviado" else None)
         return True
 
-    async def enviar_plantilla(destinatario: str, plantilla: str, parametros: list[str]) -> None:
+    async def enviar_plantilla(tenant_id: UUID, destinatario: str, plantilla: str,
+                               parametros: list[dict[str, Any]], **kw: Any) -> ResultadoEnvioTenant:
         if m.fallar_envio:
             raise RuntimeError("proveedor caído")
-        m.envios.append((destinatario, plantilla, parametros))
+        valores = [p["text"] for p in parametros[0]["parameters"]]  # solo cuerpo
+        m.envios.append((destinatario, plantilla, valores))
+        return ResultadoEnvioTenant(True, None, "wamid.1")
 
     async def registrar_evento(**kw: Any) -> bool:
         if kw["conversation_id"] is None:
@@ -152,8 +160,9 @@ def mundo(monkeypatch: pytest.MonkeyPatch) -> _Mundo:
     async def conversacion(tenant_id: UUID, user_id: UUID | None):
         return m.conversacion
 
-    async def esta_aprobada(nombre: str) -> bool:
-        return m.plantilla_aprobada
+    async def estado_aviso(tenant_id: UUID, tipo: str, **kw: Any) -> ac.EstadoAviso:
+        nombre = "recordatorio_cita" if tipo == "recordatorio" else "notificacion_cancelacion"
+        return ac.EstadoAviso(m.habilitado, nombre, m.plantilla_estado, m.emisor_ok)
 
     async def servicios(tenant_id: UUID):
         return SimpleNamespace(zona_horaria="America/Mexico_City")
@@ -170,8 +179,8 @@ def mundo(monkeypatch: pytest.MonkeyPatch) -> _Mundo:
     monkeypatch.setattr(ac, "get_tenant_servicios", servicios)
     monkeypatch.setattr(contexto_agente, "conversacion_whatsapp_del_cliente", conversacion)
     monkeypatch.setattr(contexto_agente, "registrar_evento", registrar_evento)
-    monkeypatch.setattr(plantillas_whatsapp, "esta_aprobada", esta_aprobada)
-    monkeypatch.setattr(cuenta_global_wa, "enviar_plantilla", enviar_plantilla)
+    monkeypatch.setattr(ac, "_estado_aviso", estado_aviso)
+    monkeypatch.setattr(avisos_cita_envio, "enviar_plantilla_tenant", enviar_plantilla)
     return m
 
 
@@ -289,37 +298,101 @@ async def test_cliente_sin_conversacion_recibe_aviso_sin_evento(mundo):
 # ------------------------------------------------------------
 # Bandera y plantilla (A17, RF-17, RF-19)
 # ------------------------------------------------------------
-async def test_bandera_apagada_omite_y_al_activarla_no_hay_envio_tardio(
+async def test_bandera_apagada_no_hay_candidatos_ni_registro_y_al_activarla_la_cita_en_ventana_si_recibe(
     mundo, monkeypatch: pytest.MonkeyPatch
 ):
+    # D7: sin AVISOS_CITA_WHATSAPP_ACTIVOS ni se consulta ni se registra `omitido`.
     monkeypatch.setattr(settings, "AVISOS_CITA_WHATSAPP_ACTIVOS", False)
     reserva_id = mundo.reserva()
     await ac.procesar_recordatorios()
-    aviso = mundo.de(reserva_id)
-    assert (aviso["estado"], aviso["motivo"]) == ("omitido", "desactivado_por_configuracion")
-    assert mundo.envios == []
+    assert mundo.avisos == {} and mundo.envios == []
 
     monkeypatch.setattr(settings, "AVISOS_CITA_WHATSAPP_ACTIVOS", True)
     await ac.procesar_recordatorios()
-    assert mundo.envios == [] and mundo.de(reserva_id)["motivo"] == "desactivado_por_configuracion"
+    assert mundo.de(reserva_id)["estado"] == "enviado" and len(mundo.envios) == 1  # RF-10
 
-    # Una cita nueva cuya ventana se abre después sí lo recibe.
-    nueva = mundo.reserva()
-    await ac.procesar_recordatorios()
-    assert mundo.de(nueva)["estado"] == "enviado" and len(mundo.envios) == 1
+
+async def test_candidatos_reales_con_bandera_apagada_no_consultan_la_bd(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(settings, "AVISOS_CITA_WHATSAPP_ACTIVOS", False)
+
+    async def no_debe_llamarse(*a: Any, **k: Any):
+        raise AssertionError("no debe consultar la BD")
+
+    monkeypatch.setattr(ac, "fetch_all", no_debe_llamarse)
+    assert await ac._candidatos_recordatorio(_ahora()) == []
+
+
+async def test_consulta_de_candidatos_filtra_en_sql_por_config_y_calendario(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(settings, "AVISOS_CITA_WHATSAPP_ACTIVOS", True)
+    capturado: dict[str, Any] = {}
+
+    async def falso(sql: str, *args: Any):
+        capturado["sql"] = sql
+        return []
+
+    monkeypatch.setattr(ac, "fetch_all", falso)
+    await ac._candidatos_recordatorio(_ahora())
+    sql = " ".join(capturado["sql"].split())
+    assert "JOIN avisos_cita_config cfg ON cfg.tenant_id = r.tenant_id AND cfg.recordatorio_activo" in sql
+    assert "JOIN tenant_servicios ts ON ts.tenant_id = r.tenant_id AND ts.calendario_activo" in sql
 
 
 async def test_plantilla_no_aprobada_es_final_sin_espera_ni_aviso(mundo):
-    mundo.plantilla_aprobada = False
+    mundo.plantilla_estado = "REJECTED"
     reserva_id = mundo.reserva()
     await ac.procesar_recordatorios()
     aviso = mundo.de(reserva_id)
     assert (aviso["estado"], aviso["motivo"]) == ("omitido", "plantilla_no_aprobada")
     assert mundo.envios == [] and mundo.gerencia == []
 
-    mundo.plantilla_aprobada = True
+    mundo.plantilla_estado = "APPROVED"
     await ac.procesar_recordatorios()
     assert mundo.envios == []  # sin reintento al aprobarse
+
+
+async def test_recordatorio_sin_numero_emisor_queda_omitido_sin_alerta(mundo):
+    mundo.emisor_ok = False
+    reserva_id = mundo.reserva()
+    await ac.procesar_recordatorios()
+    aviso = mundo.de(reserva_id)
+    assert (aviso["estado"], aviso["motivo"]) == ("omitido", "sin_numero_emisor")
+    assert mundo.envios == [] and mundo.gerencia == []
+
+
+async def test_plantilla_ausente_en_recordatorio_queda_omitida_sin_alerta(mundo):
+    mundo.plantilla_estado = None
+    reserva_id = mundo.reserva()
+    await ac.procesar_recordatorios()
+    aviso = mundo.de(reserva_id)
+    assert (aviso["estado"], aviso["motivo"]) == ("omitido", "plantilla_no_aprobada")
+    assert mundo.gerencia == []
+
+
+async def test_funcion_apagada_no_envia_ni_registra(mundo):
+    mundo.habilitado = False
+    mundo.reserva()
+    await ac.procesar_recordatorios()
+    assert mundo.avisos == {} and mundo.envios == []
+
+    assert mundo.ejecuciones  # la pasada sí corre; solo no hay candidatos
+    mundo.habilitado = True  # al activarla, la cita que sigue en ventana sí lo recibe (RF-10)
+    await ac.procesar_recordatorios()
+    assert len(mundo.envios) == 1
+
+
+async def test_plantilla_pending_espera_sin_registro_y_se_envia_al_aprobarse(mundo):
+    mundo.plantilla_estado = "PENDING"
+    mundo.reserva()
+    await ac.procesar_recordatorios()
+    assert mundo.avisos == {} and mundo.envios == [] and mundo.gerencia == []
+
+    mundo.plantilla_estado = "APPROVED"
+    await ac.procesar_recordatorios()
+    assert len(mundo.envios) == 1
 
 
 # ------------------------------------------------------------

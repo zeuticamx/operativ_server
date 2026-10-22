@@ -24,8 +24,10 @@ from schemas import (
     LimitesAgenteOut,
     NumeroAgenteIn,
     NumeroAgenteOut,
+    ProbarAgenteIn,
+    ProbarAgenteOut,
 )
-from services import herramientas_plan
+from services import agente_tester, herramientas_plan
 from services import numeros_whatsapp as numeros
 from services.numeros_bitacora import Autor
 from services.numeros_reglas import configuracion_incompleta
@@ -43,6 +45,9 @@ router = APIRouter(
 # services/limites_agente.py; además el PLAN puede dejar menos modelos
 # (402, ver exigir_dentro_del_plan).
 MODELOS_PERMITIDOS = set(MODELOS_AGENTE)
+
+# Mismo valor que usa el agente cuando la config no trae modelo (prompt.config_*).
+MODELO_POR_DEFECTO = "claude-sonnet-5"
 
 
 def _limites_out(limites: LimitesAgente) -> LimitesAgenteOut:
@@ -185,3 +190,83 @@ async def actualizar_numero(
             conn, tenant_id, numero_id, cambios, Autor.gerencia(usuario.id, usuario.email)
         )
         return await _numero_out(conn, tenant_id, fila)
+
+
+# ============================================================
+# Probar el agente (borrador, sin mandar nada a clientes)
+# ============================================================
+@router.post("/probar", response_model=ProbarAgenteOut)
+async def probar(
+    datos: ProbarAgenteIn,
+    numero_id: UUID | None = None,
+    tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(gerencia_actual),
+):
+    """
+    Responde como lo haría el agente con la configuración del formulario, sin
+    guardarla ni escribirle a nadie. Solo owner/superadmin; `/api/agente/probar`
+    está en `RUTAS_SENSIBLES`, así que "ver como" lo tiene cerrado. Cada mensaje
+    cuenta contra el cupo diario del negocio (429 `cupo_pruebas_agente`).
+    """
+    if datos.model and datos.model not in MODELOS_PERMITIDOS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Modelo no permitido. Opciones: {', '.join(sorted(MODELOS_PERMITIDOS))}",
+        )
+    if not datos.agent_name.strip() or not datos.system_prompt.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Completa el nombre y las instrucciones del agente para probarlo.",
+        )
+
+    limites = await limites_de_tenant(tenant_id)
+    modelo = datos.model or limites.modelo_por_defecto or MODELO_POR_DEFECTO
+    exigir_dentro_del_plan(limites, modelo, datos.history_window)
+
+    if numero_id is not None:
+        async with conexion() as conn:
+            fila = await numeros.numero_del_negocio(conn, tenant_id, numero_id)
+        if fila["es_linea_avisos"]:
+            raise numeros.error_http(409, "linea_avisos_gestionada_por_plataforma")
+
+    turnos = [t.model_dump() for t in datos.mensajes]
+    try:
+        # Se valida antes de gastar cupo: un mensaje mal armado no cuesta nada.
+        agente_tester.preparar_turnos(turnos, datos.history_window)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+
+    try:
+        restantes = await agente_tester.consumir_cupo(tenant_id)
+    except agente_tester.CupoAgotado:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "codigo": "cupo_pruebas_agente",
+                "mensaje": (
+                    f"Llegaste al límite de {agente_tester.LIMITE_DIARIO} mensajes de prueba "
+                    "de hoy. Mañana se renueva."
+                ),
+            },
+        )
+
+    config = {
+        "agent_name": datos.agent_name.strip(),
+        "system_prompt": datos.system_prompt,
+        "model": modelo,
+        "temperature": datos.temperature,
+        "history_window": datos.history_window,
+    }
+    try:
+        resultado = await agente_tester.probar(
+            tenant_id=tenant_id,
+            config=config,
+            turnos=turnos,
+            agente_canal_id=numero_id,
+            restantes_hoy=restantes,
+        )
+    except agente_tester.PruebaNoDisponible as e:
+        await agente_tester.devolver_cupo(tenant_id)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=e.mensaje)
+
+    return ProbarAgenteOut(**resultado.__dict__)

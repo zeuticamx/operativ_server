@@ -235,6 +235,9 @@ class UsuarioOut(BaseModel):
     # bienvenida (services/onboarding.py). Solo para owner/superadmin, y
     # nunca en "ver como". El portal lo manda a /bienvenida al entrar.
     onboarding_pendiente: bool = False
+    # Dueño con el calendario activo que aún no decidió la oferta de avisos de cita
+    # (spec 007). Solo owner/superadmin y nunca en "ver como".
+    oferta_avisos_cita_pendiente: bool = False
 
 
 # ============================================================
@@ -268,6 +271,42 @@ class AgenteConfigIn(BaseModel):
     temperature: float = Field(default=0.7, ge=0.0, le=1.0)
     history_window: int = Field(default=30, ge=HISTORIAL_MIN, le=HISTORIAL_MAX)
     is_active: bool = True
+
+
+class TurnoPruebaIn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(max_length=4000)
+
+
+class ProbarAgenteIn(BaseModel):
+    """
+    Modo "Probar agente": el borrador del formulario (aunque no esté guardado)
+    más la conversación de prueba, que vive en el navegador. Los rangos se
+    validan en el router con los mismos límites del plan que el PUT.
+    """
+
+    agent_name: str = Field(min_length=1, max_length=100)
+    system_prompt: str = Field(min_length=1, max_length=20000)
+    model: str | None = None
+    temperature: float = Field(default=0.7, ge=0.0, le=1.0)
+    history_window: int = Field(default=30, ge=HISTORIAL_MIN, le=HISTORIAL_MAX)
+    mensajes: list[TurnoPruebaIn] = Field(min_length=1, max_length=40)
+
+
+class HerramientaPruebaOut(BaseModel):
+    tool_key: str
+    parametros: dict[str, Any] = {}
+
+
+class ProbarAgenteOut(BaseModel):
+    texto: str
+    modelo: str
+    # El agente habría pasado la conversación a una persona (no se transfirió nada).
+    transferida: bool
+    herramientas: list[HerramientaPruebaOut]
+    tokens_entrada: int
+    tokens_salida: int
+    restantes_hoy: int
 
 
 # ============================================================
@@ -341,6 +380,22 @@ class EstadoNeuroApiConnectOut(BaseModel):
     # Código RF-2 cuando no se vinculó (p. ej. numero_no_encontrado).
     codigo: str | None = None
     phone_number_id: str | None = None
+
+
+class EstadoInstagramNeuroApiOut(BaseModel):
+    """
+    GET /api/canales/instagram/neuroapi/estado — la última sesión de Instagram
+    del negocio. El portal lo consulta al volver de Meta: la vinculación la
+    decide el webhook, no el `?status=success` del retorno.
+    """
+
+    session_id: str
+    estado: str  # pendiente | completado | fallido
+    # vinculado | propio | ajeno | rechazado (None mientras está pendiente).
+    resultado: str | None = None
+    # cuenta_instagram_ya_vinculada | cuenta_instagram_no_encontrada | demasiados_intentos…
+    codigo: str | None = None
+    username: str | None = None
 
 
 # ============================================================
@@ -582,6 +637,16 @@ class ConversacionOut(AsignacionConversacionOut):
     # nunca escribió. Negativo si ya se cerró.
     ultimo_mensaje_cliente_at: datetime | None = None
     minutos_restantes_ventana: int | None = None
+    # De qué número/agente de WhatsApp es la conversación (spec 005a). None
+    # para Instagram/Facebook/widget: un solo agente compartido, sin ambigüedad.
+    agente_canal_id: UUID | None = None
+    numero_telefono_visible: str | None = None
+    numero_phone_number_id: str | None = None
+    numero_agent_name: str | None = None
+    numero_es_linea_avisos: bool = False
+    # Si el negocio tiene más de un número vinculado: le dice al portal si
+    # vale la pena mostrar de cuál es cada conversación.
+    tiene_varios_numeros: bool = False
 
 
 class AdjuntoOut(BaseModel):
@@ -651,6 +716,16 @@ class ConversacionDetalleOut(AsignacionConversacionOut):
     usuario_username: str | None = None
     ultimo_mensaje_cliente_at: datetime | None = None
     minutos_restantes_ventana: int | None = None
+    # Instagram vinculado por NeuroAPI: una persona del equipo puede contestar
+    # hasta 7 días después del último mensaje del cliente (etiqueta HUMAN_AGENT).
+    # None en el resto de canales.
+    minutos_restantes_ventana_humana: int | None = None
+    agente_canal_id: UUID | None = None
+    numero_telefono_visible: str | None = None
+    numero_phone_number_id: str | None = None
+    numero_agent_name: str | None = None
+    numero_es_linea_avisos: bool = False
+    tiene_varios_numeros: bool = False
     contexto_limpiado_en: datetime | None = None
     puede_limpiar_contexto: bool = False
     mensajes: list[MensajeOut]
@@ -1344,6 +1419,9 @@ class TipoAlerta(str, Enum):
     numeros_pausados = "numeros_pausados"
     numeros_recortados = "numeros_recortados"
     numero_configuracion_incompleta = "numero_configuracion_incompleta"
+    # Spec 007: avisos de cita con plantillas del negocio (sql/65).
+    avisos_cita_oferta_rechazada = "avisos_cita_oferta_rechazada"
+    avisos_cita_plantilla_inutilizable = "avisos_cita_plantilla_inutilizable"
 
 class AlertaOut(BaseModel):
     id: UUID
@@ -1553,6 +1631,87 @@ class AccesoPlanOut(BaseModel):
     # Planes contratables, cada uno con lo que incluye: con esto la vista
     # de bloqueo dice "está en el plan Pro" y enlaza a ese plan.
     planes: list[PlanHerramientasOut]
+
+
+# ============================================================
+# STRIPE CONNECT — cobros propios de cada negocio
+# ============================================================
+# Separado de la facturación de la plataforma (arriba): esto es la cuenta
+# de Stripe que CADA tenant conecta para cobrarle a SUS clientes.
+
+EstadoCobroConnect = Literal["activo", "pagado", "desactivado"]
+
+
+class ConnectEstadoOut(BaseModel):
+    """
+    Estado de la cuenta Connect del tenant. Todo en false/vacío si nunca
+    conectó — no es un error, es el estado inicial (igual criterio que
+    SuscripcionOut con un tenant que nunca pagó).
+    """
+
+    conectado: bool
+    charges_habilitado: bool
+    payouts_habilitado: bool
+    detalles_enviados: bool
+    requisitos_pendientes: list[str] = Field(default_factory=list)
+
+
+class ConnectOnboardingOut(BaseModel):
+    """URL del Account Link hospedado por Stripe. De un solo uso."""
+
+    url: str
+
+
+class CrearCobroConnectIn(BaseModel):
+    descripcion: str = Field(min_length=2, max_length=255)
+    monto: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+
+
+class CobroConnectOut(BaseModel):
+    id: UUID
+    descripcion: str
+    monto: Decimal
+    moneda: str
+    url_cobro: str | None
+    estado: EstadoCobroConnect
+    application_fee_monto: Decimal | None
+    generado_por_agente: bool
+    creado_en: datetime
+    pagado_en: datetime | None
+
+
+class CrearCobroConnectEventoIn(BaseModel):
+    """
+    Cuerpo de la tool del agente `generar_cobro_connect`
+    (routers/eventos.py). A diferencia de `historial_citas_cliente` esta
+    tool no necesita deducir QUIÉN es el cliente — solo de qué tenant es
+    la conversación — así que `conversation_id` viaja como UUID normal (lo
+    arma el propio backend en services/agente/herramientas.py, nunca el
+    modelo) y no hace falta el truco de `Any` + interpretar_conversation_id.
+    """
+
+    tenant_id: UUID
+    conversation_id: UUID
+    descripcion: str = Field(min_length=2, max_length=255)
+    monto: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    # Determinista, armada por el servidor: sha256(tenant:conversation:mensaje).
+    # Un reintento del mismo mensaje entrante devuelve el mismo link.
+    idempotency_key: str | None = Field(default=None, max_length=120)
+
+
+class CrearCobroConnectEventoOut(BaseModel):
+    """
+    Nunca es un 404/409 por "cuenta no conectada": es un estado de negocio
+    real que el agente debe poder explicarle al cliente en texto, no un
+    error sin información.
+    """
+
+    ok: bool
+    razon: Literal["connect_inactivo", "cuenta_no_conectada"] | None = None
+    url_cobro: str | None = None
+    monto: Decimal | None = None
+    moneda: str | None = None
+    duplicado: bool = False
 
 
 # ============================================================
@@ -3150,3 +3309,59 @@ class PlantillaPruebaIn(BaseModel):
         if not re.fullmatch(r"\d{8,15}", limpio):
             raise ValueError("Teléfono en formato internacional, ej. 593999999999")
         return limpio
+
+
+# ============================================================
+# AVISOS DE CITA POR NEGOCIO (spec 007, routers/avisos_cita_config.py)
+# ============================================================
+EstadoPlantillaAviso = Literal["NO_CREADA", "PENDING", "APPROVED", "REJECTED", "PAUSED", "DISABLED"]
+
+
+class FuncionAvisoOut(BaseModel):
+    tipo: Literal["recordatorio", "cancelacion"]
+    nombre: str
+    texto: str
+    activa: bool
+    estado_plantilla: EstadoPlantillaAviso
+    motivo_rechazo: str | None = None
+
+
+class ConfigAvisosOut(BaseModel):
+    oferta: Literal["pendiente", "aceptada", "rechazada"]
+    calendario_activo: bool
+    numero_emisor_ok: bool
+    # Siempre [recordatorio, cancelación].
+    funciones: list[FuncionAvisoOut]
+    # Confirmación tras POST /oferta; en GET va None.
+    mensaje: str | None = None
+
+
+class OfertaAvisosIn(BaseModel):
+    accion: Literal["aceptar", "rechazar"]
+
+
+class ConfigAvisosPatchIn(BaseModel):
+    recordatorio_activo: bool | None = None
+    cancelacion_activo: bool | None = None
+
+    @model_validator(mode="after")
+    def _al_menos_uno(self) -> "ConfigAvisosPatchIn":
+        if self.recordatorio_activo is None and self.cancelacion_activo is None:
+            raise ValueError("Indica recordatorio_activo o cancelacion_activo")
+        return self
+
+
+class NumeroGerenciaOut(BaseModel):
+    """Número de WhatsApp cuyas conversaciones abre gerencia (GET /gerencia/numero-conversaciones)."""
+
+    tenant_id: UUID
+    tenant_nombre: str
+    agente_canal_id: UUID
+
+
+class VistaGerenciaOut(BaseModel):
+    """Estado de la vista de gerencia para el dueño (GET /vista-gerencia)."""
+
+    # False = este negocio no es el del número configurado: el portal no muestra nada.
+    aplica: bool
+    revocada: bool

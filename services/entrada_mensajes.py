@@ -1,6 +1,6 @@
 """
-Proxy de mensajes entrantes de WhatsApp (NeuroAPI) hacia n8n o hacia el
-agente en código, según `AGENTE_EN_CODIGO`.
+Proxy de mensajes entrantes de WhatsApp e Instagram (NeuroAPI) hacia n8n o
+hacia el agente en código, según `AGENTE_EN_CODIGO`.
 
 NeuroAPI manda a la misma `webhook_url` de la Connect Session tanto el alta
 de la cuenta como los mensajes posteriores. El backend valida la firma una
@@ -24,6 +24,7 @@ from uuid import UUID
 import httpx
 
 from config import settings
+from services.agente.normalizar import aplanar_entradas
 from session import fetch_one
 
 log = logging.getLogger("operativai.canales.entrada_mensajes")
@@ -76,6 +77,33 @@ def extraer_phone_number_id(evento: dict[str, Any]) -> str | None:
     return None
 
 
+def extraer_ig_account_id(evento: dict[str, Any]) -> str | None:
+    """
+    Id de la cuenta de Instagram del negocio que recibió el DM: `entry[].id`
+    o, si falta, el `recipient.id` del mensaje. Es el `instagramAccountId`
+    que se guardó como `ig_user_id` al vincular (sql/69).
+
+    `entry[].id` va primero porque en un eco (lo que manda el propio negocio)
+    el `recipient` es el cliente, no la cuenta.
+    """
+    for entrada in aplanar_entradas(evento):
+        if entrada.get("id") not in (None, ""):
+            return str(entrada["id"])
+        for mensaje in entrada.get("messaging") or []:
+            receptor = (mensaje or {}).get("recipient") if isinstance(mensaje, dict) else None
+            if isinstance(receptor, dict) and receptor.get("id") not in (None, ""):
+                return str(receptor["id"])
+    return None
+
+
+async def tenant_por_cuenta_instagram(ig_account_id: str) -> UUID | None:
+    """Tenant con esa cuenta de Instagram activa (`resuelve_tenant`, sql/58)."""
+    fila = await fetch_one(
+        "SELECT resuelve_tenant('instagram', $1) AS tenant_id", ig_account_id
+    )
+    return fila["tenant_id"] if fila else None
+
+
 async def tenant_por_numero(phone_number_id: str) -> UUID | None:
     """
     Tenant dueño de la línea (spec 005a RF-16, T6): el número vinculado
@@ -110,7 +138,9 @@ def destino_para(tenant_id: UUID) -> str:
     return settings.N8N_WEBHOOK_ENTRADA_URL
 
 
-async def reenviar(cuerpo_crudo: bytes, tenant_id: UUID, destino: str) -> None:
+async def reenviar(
+    cuerpo_crudo: bytes, tenant_id: UUID, destino: str, *, canal: str = "whatsapp"
+) -> None:
     """
     POST del cuerpo tal cual llegó de NeuroAPI. Lanza ReenvioError si el
     destino no contesta o responde algo que no es 2xx (incluido el 404 de un
@@ -120,7 +150,7 @@ async def reenviar(cuerpo_crudo: bytes, tenant_id: UUID, destino: str) -> None:
     cabeceras = {
         "Content-Type": "application/json",
         "X-Tenant-Id": str(tenant_id),
-        "X-Canal": "whatsapp",
+        "X-Canal": canal,
         "X-Proveedor": "neuroapi",
     }
     if settings.N8N_INTERNAL_TOKEN:

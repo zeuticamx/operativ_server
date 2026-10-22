@@ -36,6 +36,7 @@ from schemas import (
     ImpersonarIn,
     ImpersonarOut,
     MensajeOut,
+    NumeroGerenciaOut,
     ProblemaSaludOut,
     SaludOut,
 )
@@ -44,6 +45,7 @@ from services import adjuntos
 from services import avisos_conversacion as avisos
 from services import calendario as calendario_svc
 from services import conversaciones as conversaciones_svc
+from services import vista_gerencia as vista_svc
 from services.cancelacion_citas import Granularidad, validar_rango_reporte
 from services.gerencia import registrar_auditoria
 from services.gerencia_salud import problemas_de_salud
@@ -478,12 +480,40 @@ async def impersonar(
 # ============================================================
 # Conversaciones de un tenant (handoff humano)
 # ============================================================
+async def vista_no_revocada(tenant_id: UUID) -> None:
+    """El dueño puede cerrarle a gerencia las conversaciones de su negocio (sql/67)."""
+    if await vista_svc.vista_revocada(tenant_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "codigo": "vista_revocada_por_dueno",
+                "mensaje": "El dueño del negocio revocó el acceso de gerencia a sus conversaciones.",
+            },
+        )
+
+
+@router.get("/numero-conversaciones", response_model=NumeroGerenciaOut)
+async def numero_conversaciones():
+    """
+    El número cuyas conversaciones abre /gerencia/conversaciones (config
+    GERENCIA_NUMERO_PHONE_NUMBER_ID). 404 si la función está apagada o el número no
+    existe; 403 si el dueño revocó la vista. Después, la lista y el detalle usan las rutas
+    por tenant de abajo, con `numero_id` para filtrar.
+    """
+    fila = await vista_svc.resolver_numero()
+    if fila is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Número no configurado")
+    await vista_no_revocada(fila["tenant_id"])
+    return NumeroGerenciaOut(**dict(fila))
+
+
 # Mismo servicio que routers/conversaciones.py, pero con el tenant_id
 # explícito en la ruta en vez de tomarlo de tenant_actual — es lo que le
 # permite a gerencia de plataforma "filtrar por tenant_id" sin pasar por la
 # impersonación de solo lectura (que además bloquea cualquier POST).
 @router.get(
     "/tenants/{tenant_id}/conversaciones",
+    dependencies=[Depends(vista_no_revocada)],
     response_model=list[ConversacionOut],
 )
 async def listar_conversaciones_tenant(
@@ -493,13 +523,17 @@ async def listar_conversaciones_tenant(
     buscar: str | None = Query(None, max_length=100),
     limite: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    numero_id: UUID | None = Query(None),
 ):
-    filas = await conversaciones_svc.listar(tenant_id, canal, estado, buscar, limite, offset)
+    filas = await conversaciones_svc.listar(
+        tenant_id, canal, estado, buscar, limite, offset, numero_id=numero_id
+    )
     return [ConversacionOut(**dict(f)) for f in filas]
 
 
 @router.get(
     "/tenants/{tenant_id}/conversaciones/{conversacion_id}",
+    dependencies=[Depends(vista_no_revocada)],
     response_model=ConversacionDetalleOut,
 )
 async def detalle_conversacion_tenant(tenant_id: UUID, conversacion_id: UUID):
@@ -517,6 +551,7 @@ async def detalle_conversacion_tenant(tenant_id: UUID, conversacion_id: UUID):
 
 @router.post(
     "/tenants/{tenant_id}/conversaciones/{conversacion_id}/mensajes",
+    dependencies=[Depends(vista_no_revocada)],
     response_model=MensajeOut,
     status_code=status.HTTP_201_CREATED,
 )
@@ -549,6 +584,7 @@ async def enviar_mensaje_conversacion_tenant(
 
 @router.post(
     "/tenants/{tenant_id}/conversaciones/{conversacion_id}/adjuntos",
+    dependencies=[Depends(vista_no_revocada)],
     response_model=MensajeOut,
     status_code=status.HTTP_201_CREATED,
 )
@@ -580,7 +616,10 @@ async def enviar_adjunto_conversacion_tenant(
     return mensaje
 
 
-@router.get("/tenants/{tenant_id}/conversaciones/{conversacion_id}/adjuntos/{adjunto_id}")
+@router.get(
+    "/tenants/{tenant_id}/conversaciones/{conversacion_id}/adjuntos/{adjunto_id}",
+    dependencies=[Depends(vista_no_revocada)],
+)
 async def descargar_adjunto_conversacion_tenant(
     tenant_id: UUID,
     conversacion_id: UUID,
@@ -599,6 +638,7 @@ async def descargar_adjunto_conversacion_tenant(
 
 @router.post(
     "/tenants/{tenant_id}/conversaciones/{conversacion_id}/tomar",
+    dependencies=[Depends(vista_no_revocada)],
     response_model=ConversacionEstadoOut,
 )
 async def tomar_conversacion_tenant(
@@ -622,6 +662,7 @@ async def tomar_conversacion_tenant(
 
 @router.post(
     "/tenants/{tenant_id}/conversaciones/{conversacion_id}/volver-a-ia",
+    dependencies=[Depends(vista_no_revocada)],
     response_model=ConversacionEstadoOut,
 )
 async def volver_a_ia_conversacion_tenant(

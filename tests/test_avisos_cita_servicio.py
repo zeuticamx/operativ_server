@@ -2,7 +2,7 @@
 Registro, envío con registro, huérfanos y eventos de contexto (spec 004, T4).
 
 Sin BD ni red. `_BD` es un almacén en memoria que reconoce las consultas de
-`services/avisos_cita`, `contexto_agente` y `plantillas_whatsapp` por su texto y
+`services/avisos_cita` y `contexto_agente` por su texto y
 simula `ON CONFLICT DO NOTHING` de forma atómica (sin `await` entre comprobar la
 clave e insertar), igual que lo garantiza el UNIQUE de la BD. La unicidad real
 en Postgres queda cubierta por `test_avisos_sql.py` y por la prueba manual (T10).
@@ -19,7 +19,8 @@ import pytest
 
 from config import settings
 from services import avisos_cita as ac
-from services import contexto_agente, plantillas_whatsapp
+from services import avisos_cita_reglas, contexto_agente, plantillas_whatsapp
+from services.avisos_cita_envio import ResultadoEnvioTenant, motivo_de_error
 from services.whatsapp import ProveedorWhatsAppError
 
 TENANT = uuid4()
@@ -34,11 +35,7 @@ class _BD:
         self.ejecuciones: dict[UUID, dict[str, Any]] = {}
         self.avisos: dict[UUID, dict[str, Any]] = {}
         self.eventos: list[dict[str, Any]] = []
-        self.plantillas: dict[str, str] = {
-            "notificacion_cancelacion": "aprobada",
-            "recordatorio_cita": "aprobada",
-        }
-        self.auditoria: list[tuple[Any, ...]] = []
+        self.marcadas: list[tuple[UUID, str, str]] = []  # plantillas del tenant marcadas por error de envío
         self.conversaciones: list[dict[str, Any]] = []
         self.consultas: list[str] = []
         self.fallar_evento = False
@@ -118,9 +115,6 @@ class _BD:
 
     async def fetch_one(self, sql: str, *args: Any) -> dict[str, Any] | None:
         self.consultas.append(sql)
-        if "FROM plantillas_whatsapp_globales" in sql:
-            estado = self.plantillas.get(args[0])
-            return {"estado": estado} if estado else None
         if "FROM conversations" in sql:
             tenant_id, user_id = args
             for c in self.conversaciones:
@@ -141,10 +135,6 @@ class _BD:
                     "reserva_id": reserva_id, "aviso_id": aviso_id, "tipo": tipo,
                     "hora_cita": hora_cita, "servicio": servicio,
                 })
-        elif "UPDATE plantillas_whatsapp_globales" in sql:
-            self.plantillas[args[0]] = args[1]
-        elif "INSERT INTO gerencia_auditoria" in sql:
-            self.auditoria.append(args)
         elif "UPDATE avisos_cita_ejecuciones" in sql:
             self.ejecuciones[args[0]]["latido_en"] = datetime.now(timezone.utc)
             if "terminada_en" in sql:
@@ -155,16 +145,18 @@ class _BD:
 
 
 class _Proveedor:
-    """Fake de `cuenta_global_wa.enviar_plantilla`: cuenta llamadas y puede fallar."""
+    """Fake de `avisos_cita_envio.enviar_plantilla_tenant`: cuenta llamadas y puede fallar."""
 
     def __init__(self, bd: _BD) -> None:
         self.bd = bd
-        self.llamadas: list[tuple[str, str, list[str]]] = []
+        self.llamadas: list[tuple[str, str, list[dict[str, Any]]]] = []
         self.registros_al_llamar: list[list[str]] = []
         self.errores: list[Exception | None] = []  # uno por llamada; vacío = éxito
         self.durante: Any = None
 
-    async def __call__(self, destinatario: str, plantilla: str, parametros: list[str]):
+    async def __call__(
+        self, tenant_id: UUID, destinatario: str, plantilla: str, parametros: list[dict[str, Any]], **kw: Any
+    ):
         self.llamadas.append((destinatario, plantilla, parametros))
         # D1: en este punto el registro tiene que existir y estar en_curso.
         self.registros_al_llamar.append([a["estado"] for a in self.bd.avisos.values()])
@@ -172,15 +164,19 @@ class _Proveedor:
         if self.durante is not None:
             await self.durante()
         error = self.errores.pop(0) if self.errores else None
+        if isinstance(error, ProveedorWhatsAppError):  # igual que el servicio real: no lanza
+            return ResultadoEnvioTenant(
+                False, motivo_de_error(error.status_code), None, error.status_code, error.cuerpo
+            )
         if error is not None:
             raise error
-        return types.SimpleNamespace(id_mensaje="wamid.1")
+        return ResultadoEnvioTenant(True, None, "wamid.1")
 
 
 @pytest.fixture
 def bd(monkeypatch: pytest.MonkeyPatch) -> _BD:
     almacen = _BD()
-    for modulo in (ac, contexto_agente, plantillas_whatsapp):
+    for modulo in (ac, contexto_agente):
         for nombre in ("fetch_value", "fetch_all", "fetch_one", "execute"):
             if hasattr(modulo, nombre):
                 monkeypatch.setattr(modulo, nombre, getattr(almacen, nombre))
@@ -191,7 +187,12 @@ def bd(monkeypatch: pytest.MonkeyPatch) -> _BD:
 @pytest.fixture
 def proveedor(bd: _BD, monkeypatch: pytest.MonkeyPatch) -> _Proveedor:
     falso = _Proveedor(bd)
-    monkeypatch.setattr(ac.cuenta_global_wa, "enviar_plantilla", falso)
+    monkeypatch.setattr(ac.avisos_cita_envio, "enviar_plantilla_tenant", falso)
+
+    async def _marcar(tenant_id: UUID, nombre: str, estado: str = "DISABLED", **kw: Any) -> None:
+        bd.marcadas.append((tenant_id, nombre, estado))
+
+    monkeypatch.setattr(ac.plantillas_tenant, "marcar_estado_por_error", _marcar)
     return falso
 
 
@@ -209,13 +210,19 @@ def gerencia(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
     return llamadas
 
 
+PARAMETROS_CANCELACION = avisos_cita_reglas.parametros_de_envio("cancelacion", "", "Corte", "15-10-2026")
+PARAMETROS_RECORDATORIO = avisos_cita_reglas.parametros_de_envio("recordatorio", "Mi negocio", None, "15-10-2026")
+NOMBRE_POR_TIPO = {"cancelacion": "notificacion_cancelacion", "recordatorio": "recordatorio_cita"}
+
+
 def _envio(**extra: Any) -> dict[str, Any]:
     base: dict[str, Any] = dict(
         tenant_id=TENANT, reserva_id=uuid4(), tipo="cancelacion", hora_inicio=INICIO,
         ejecucion_id=None, destinatario_e164="+525512345678",
-        parametros=["Corte", "15-10-2026"], conversation_id=uuid4(), servicio="Corte",
+        parametros=PARAMETROS_CANCELACION, conversation_id=uuid4(), servicio="Corte",
     )
     base.update(extra)
+    base.setdefault("nombre_plantilla", NOMBRE_POR_TIPO[base["tipo"]])
     return base
 
 
@@ -269,7 +276,7 @@ async def test_enviado_guarda_telefono_cierre_y_crea_un_evento(bd, proveedor):
     assert aviso["telefono_destino"] == "+525512345678"
     assert aviso["cerrado_en"] is not None
     assert aviso["sin_conversacion"] is False
-    assert proveedor.llamadas == [("+525512345678", "notificacion_cancelacion", ["Corte", "15-10-2026"])]
+    assert proveedor.llamadas == [("+525512345678", "notificacion_cancelacion", PARAMETROS_CANCELACION)]
     assert len(bd.eventos) == 1
     evento = bd.eventos[0]
     assert evento["tipo"] == "cita_cancelada_por_negocio"
@@ -279,7 +286,7 @@ async def test_enviado_guarda_telefono_cierre_y_crea_un_evento(bd, proveedor):
 
 
 async def test_el_recordatorio_usa_su_plantilla_y_su_evento(bd, proveedor):
-    await ac.enviar_con_registro(**_envio(tipo="recordatorio", parametros=["Mi negocio", "15-10-2026"]))
+    await ac.enviar_con_registro(**_envio(tipo="recordatorio", parametros=PARAMETROS_RECORDATORIO))
 
     assert proveedor.llamadas[0][1] == "recordatorio_cita"
     assert bd.eventos[0]["tipo"] == "recordatorio_cita_enviado"
@@ -367,29 +374,27 @@ async def test_400_y_500_dejan_plantilla_no_disponible_sin_frenar_los_demas(bd, 
     assert bd.avisos[primero.aviso_id]["motivo"] == "plantilla_no_disponible"
     assert bd.avisos[primero.aviso_id]["estado"] == "fallido"
     assert segundo.enviado  # el siguiente envío de la pasada no se ve afectado
-    assert bd.plantillas["notificacion_cancelacion"] == "aprobada"
+    assert bd.marcadas == []  # sin código de Meta no se toca la plantilla
     assert len(gerencia) == 1
 
 
-async def test_132015_deja_la_plantilla_pausada(bd, proveedor, gerencia):
+async def test_132015_marca_la_plantilla_del_tenant_como_pausada(bd, proveedor, gerencia):
     proveedor.errores = [ProveedorWhatsAppError(
         "x", status_code=500, cuerpo='{"error": {"details": {"code": 132015}}}')]
 
-    resultado = await ac.enviar_con_registro(**_envio())
+    resultado = await ac.enviar_con_registro(**_envio(nombre_plantilla="notificacion_cancelacion_v2"))
 
     assert bd.avisos[resultado.aviso_id]["motivo"] == "plantilla_no_disponible"
-    assert bd.plantillas["notificacion_cancelacion"] == "pausada"
-    assert bd.plantillas["recordatorio_cita"] == "aprobada"  # la otra no se toca
-    assert len(bd.auditoria) == 1
+    assert bd.marcadas == [(TENANT, "notificacion_cancelacion_v2", "PAUSED")]  # solo la usada
 
 
-async def test_132016_deja_la_plantilla_rechazada(bd, proveedor, gerencia):
+async def test_132016_marca_la_plantilla_del_tenant_como_deshabilitada(bd, proveedor, gerencia):
     proveedor.errores = [ProveedorWhatsAppError(
         "x", status_code=400, cuerpo='{"code": 132016}')]
 
     await ac.enviar_con_registro(**_envio(tipo="recordatorio"))
 
-    assert bd.plantillas["recordatorio_cita"] == "rechazada"
+    assert bd.marcadas == [(TENANT, "recordatorio_cita", "DISABLED")]
 
 
 @pytest.mark.parametrize(
@@ -401,15 +406,14 @@ async def test_un_500_sin_codigo_o_con_132001_no_cambia_el_estado(bd, proveedor,
     resultado = await ac.enviar_con_registro(**_envio())
 
     assert bd.avisos[resultado.aviso_id]["motivo"] == "plantilla_no_disponible"
-    assert bd.plantillas["notificacion_cancelacion"] == "aprobada"
-    assert bd.auditoria == []
+    assert bd.marcadas == []
 
 
-async def test_un_fallo_al_cambiar_el_estado_no_impide_cerrar_el_registro(bd, proveedor, gerencia, monkeypatch):
+async def test_un_fallo_al_marcar_la_plantilla_no_impide_cerrar_el_registro(bd, proveedor, gerencia, monkeypatch):
     async def _roto(*args: Any, **kwargs: Any):
         raise RuntimeError("BD caída")
 
-    monkeypatch.setattr(ac.plantillas_whatsapp, "aplicar_error_envio", _roto)
+    monkeypatch.setattr(ac.plantillas_tenant, "marcar_estado_por_error", _roto)
     proveedor.errores = [ProveedorWhatsAppError("x", status_code=500, cuerpo='{"code": 132015}')]
 
     resultado = await ac.enviar_con_registro(**_envio())
@@ -451,6 +455,7 @@ async def test_omitido_y_fallido_sin_envio_no_llaman_al_proveedor_ni_crean_event
         ("sin_telefono", True),
         ("telefono_invalido", True),
         ("plantilla_no_aprobada", True),
+        ("sin_numero_emisor", True),
         ("canal_no_soportado", False),
         ("desactivado_por_configuracion", False),
     ],

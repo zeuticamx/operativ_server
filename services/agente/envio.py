@@ -35,6 +35,7 @@ from uuid import UUID
 import httpx
 
 from config import settings
+from services import mensajeria
 from services.agente import bajas
 from services.agente.modelos import Destino
 from session import execute, fetch_one, fetch_value
@@ -172,6 +173,15 @@ def _peticion_texto(
             "type": "text",
             "text": {"preview_url": False, "body": texto},
         })
+
+    if mensajeria.es_instagram_neuroapi(canal, cred):
+        # Sin página: NeuroAPI envía por el IGSID del cliente. La respuesta es
+        # del agente, así que sin HUMAN_AGENT (vale solo para personas).
+        try:
+            p = mensajeria.peticion_instagram(cred, destino.usuario_id, texto)
+        except mensajeria.SinCredenciales as e:
+            raise SinCredenciales(f"Tenant {destino.tenant_id}: {e}") from e
+        return p.url, p.cabeceras, p.cuerpo
 
     cabeceras = {"Authorization": f"Bearer {cred['access_token']}"}
 

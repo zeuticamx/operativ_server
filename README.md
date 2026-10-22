@@ -536,6 +536,8 @@ POST   /api/canales/meta/conectar    code → user token de larga duración
 GET    /api/canales/meta/paginas     Páginas que el usuario autorizó
 POST   /api/canales/meta/activar     Guarda tokens + suscribe webhooks
 POST   /api/canales/whatsapp/conectar  Registra la línea de Kontesta del tenant (un número más; sujeto al cupo del plan)
+POST   /api/canales/instagram/neuroapi/iniciar  Abre la Connect Session de Instagram Direct (ver "Instagram Direct vía NeuroAPI")
+GET    /api/canales/instagram/neuroapi/estado   Resultado de la última sesión de Instagram del negocio
 DELETE /api/canales/{tipo}           Desconecta (Meta). Para WhatsApp, `DELETE /api/canales/whatsapp` responde 409 `usar_numeros`:
                                      se desvincula número a número (ver "Varios números de WhatsApp por negocio")
 ```
@@ -1408,6 +1410,11 @@ servicio con BD, precedencia de códigos del endpoint y campos del detalle).
 
 ### Avisos de cita y notificaciones por correo (spec 004, `sql/48` a `sql/51`)
 
+> **Reemplazo parcial (spec 007).** El envío de avisos de cita ya **no sale por la cuenta global**: cada negocio usa
+> sus propias plantillas desde su número principal activo (ver "Avisos de cita por tenant"). De este apartado siguen
+> vigentes el correo espejo, el registro `avisos_cita`, las reglas de teléfono y el contexto del agente. Las plantillas
+> globales y la respuesta fija de la cuenta global quedan como código sin uso para avisos (spec 007, A4).
+
 Tres cosas independientes, todas con la bandera apagada o inocuas por defecto.
 
 **Correo espejo.** Cada alerta que `realtime.py` emite por Socket.IO sale también por
@@ -1418,7 +1425,7 @@ Lo cubren también `sin_actividad` y `nuevo_lead`; solo quedan fuera `cuota_exce
 recibe la transferida y la asignada de una conversación, llega un solo correo
 (`excluir_correo_a`). Un SMTP caído no lanza ni quita la alerta del panel.
 
-**Plantillas globales.** `notificacion_cancelacion` y `recordatorio_cita` (idioma
+**Plantillas globales (sin uso para avisos desde spec 007).** `notificacion_cancelacion` y `recordatorio_cita` (idioma
 `es_MX`) son plantillas de Meta únicas para todos los negocios, creadas **a mano** en
 Meta Business Manager (NeuroAPI no tiene API de plantillas). Su estado vive en
 `plantillas_whatsapp_globales` (`no_solicitada`, `pendiente_aprobacion`, `aprobada`,
@@ -1430,15 +1437,14 @@ webhook de canales (`APPROVED`, `REJECTED`/`DISABLED`, `PAUSED`, `PENDING`) o po
 error de envío con código de Meta 132015 (`pausada`) o 132016 (`rechazada`).
 
 **Avisos al cliente por WhatsApp** (`services/avisos_cita.py`, reglas puras en
-`services/avisos_cita_reglas.py`). Salen siempre por la **cuenta global**: la línea del
-tenant `AVISOS_CUENTA_GLOBAL_TENANT_ID` (`services/cuenta_global_wa.py`, que reutiliza
-su `channel_credentials`; nunca se consulta el tenant de la reserva).
+`services/avisos_cita_reglas.py`). Desde spec 007 salen por el **número principal activo del
+propio negocio** con sus plantillas (`services/avisos_cita_envio.py`), no por la cuenta global.
 - *Cancelación*: al cancelar una cita el owner, el superadmin o el proveedor (no el
   agente ni una reagenda), tarea en segundo plano tras el `commit`; plantilla
   `notificacion_cancelacion` con servicio y fecha `dd-mm-aaaa` en la zona del negocio.
 - *Recordatorio*: `jobs/recordatorios_cita_background.py`, cada 5 min
   (`max_instances=1`, `coalesce=True`); avisa a las citas `confirmada` que entran en la
-  ventana de 5 h antes del inicio, con `recordatorio_cita` (negocio y fecha). Una cita
+  ventana de 5 h antes del inicio, con la plantilla de recordatorio del negocio (negocio y fecha). Una cita
   creada ya dentro de la ventana recibe el aviso en la siguiente pasada.
 - *Teléfono*: el de la reserva, normalizado a E.164 (10 dígitos = México `+52`, `00` =
   `+`, E.164 válido tal cual; vacío = `sin_telefono`, otro = `telefono_invalido`). El
@@ -1452,17 +1458,18 @@ su `channel_credentials`; nunca se consulta el tenant de la reserva).
 - *Contexto del agente*: un aviso `enviado` con conversación deja una fila en
   `contexto_agente_eventos` (`cita_cancelada_por_negocio` / `recordatorio_cita_enviado`)
   aunque el agente esté apagado.
-- **Regla fija: los avisos NUNCA usan texto libre**, solo plantilla aprobada
-  (`cuenta_global_wa.enviar_plantilla`). `enviar_texto_global` existe solo para la
+- **Regla fija: los avisos NUNCA usan texto libre**, solo plantilla aprobada del negocio
+  (`avisos_cita_envio.enviar_plantilla_tenant`). `enviar_texto_global` existe solo para la
   respuesta fija de abajo.
 
 **Banderas** (`config.py`, todas apagadas o vacías por defecto):
 
 | Variable | Efecto |
 |---|---|
-| `AVISOS_CITA_WHATSAPP_ACTIVOS` | `false`: cada cita que entra en su ventana queda `omitido desactivado_por_configuracion` y **no** recibe un recordatorio tardío al encenderla. `validate()` avisa si está activa sin tenant. |
-| `AVISOS_CUENTA_GLOBAL_TENANT_ID` | Tenant de la línea (`a383f05c-7028-4d5f-8c5d-30232a80faf3`). |
-| `AVISOS_CUENTA_GLOBAL_RESPUESTA_ACTIVA` | Enciende la respuesta fija (siguiente apartado). |
+| `AVISOS_CITA_WHATSAPP_ACTIVOS` | Interruptor maestro de plataforma (spec 007). `false`: no se envía ningún aviso. Al encenderla, las citas que **ya están** en ventana SÍ reciben su recordatorio (RF-10). Ya **no** exige `AVISOS_CUENTA_GLOBAL_TENANT_ID`. |
+| `AVISOS_CUENTA_GLOBAL_TENANT_ID` | Tenant de la línea global (`a383f05c-7028-4d5f-8c5d-30232a80faf3`). Solo la respuesta fija y la línea de avisos de conversación lo usan. |
+| `AVISOS_CUENTA_GLOBAL_WABA_ID` | WABA de Meta de la cuenta global (spec 007). El handler global de `message_template_status_update` **solo aplica** los eventos de ese WABA (o de un `meta_template_id` global) a `plantillas_whatsapp_globales`; **si está vacía no aplica ningún evento** a las globales, para que una plantilla de un negocio con el mismo nombre no cambie su estado. |
+| `AVISOS_CUENTA_GLOBAL_RESPUESTA_ACTIVA` | Enciende la respuesta fija (siguiente apartado). Sigue exigiendo `AVISOS_CUENTA_GLOBAL_TENANT_ID`. |
 | `AVISOS_CITA_REVISION_MINUTOS`, `AVISOS_EJECUCION_VIVA_MINUTOS` | 5 y 5. |
 
 **Respuesta fija de la cuenta global** (`services/respuesta_cuenta_global.py`, gancho en
@@ -1487,13 +1494,11 @@ una cita ya cancelada; el correo espejo no tiene métrica ni límite diario; un 
 escribe a la línea cae en el agente del tenant (como hoy); la respuesta fija no se da a
 quien nunca recibió un aviso. Lo más limpio sería una línea dedicada sin agente.
 
-**Activación (en este orden).**
-1. Aplicar `sql/48` a `sql/51` (`python aplicar_sql.py --revisar`).
-2. Configurar `AVISOS_CUENTA_GLOBAL_TENANT_ID` con la línea del tenant activa.
-3. Crear y aprobar en Meta (`es_MX`) las dos plantillas; comprobar su estado en
-   `GET /api/gerencia/plantillas-whatsapp`.
-4. Con `AVISOS_CITA_WHATSAPP_ACTIVOS=false`, comprobar que una cita en ventana queda
-   `omitido desactivado_por_configuracion`; después encenderla.
+**Activación (en este orden).** (Desde spec 007 los pasos 2 y 3 ya no aplican a los avisos de cita; ver "Avisos de cita por tenant".)
+1. Aplicar `sql/48` a `sql/51` y `sql/65` (`python aplicar_sql.py --revisar`).
+2. `AVISOS_CUENTA_GLOBAL_TENANT_ID` solo hace falta para la respuesta fija.
+3. Cada negocio crea y aprueba sus plantillas desde Calendario (reemplaza las plantillas globales a mano).
+4. Con `AVISOS_CITA_WHATSAPP_ACTIVOS=false` no se envía ni se registra nada; al encenderla, las citas ya en ventana reciben su recordatorio.
 5. Probar cancelar una cita con teléfono válido y comprobar el correo espejo y el aviso a
    gerencia (owner sí, member no).
 6. Con `AVISOS_CUENTA_GLOBAL_RESPUESTA_ACTIVA=true`, responder a un aviso desde el teléfono
@@ -1509,11 +1514,60 @@ quien nunca recibió un aviso. Lo más limpio sería una línea dedicada sin age
 - `[PENDIENTE usuario: ¿la línea del tenant a383... atiende también a clientes propios?]`
 - Publicar el cambio de lectura en n8n (lee `contexto_agente_eventos` por
   `conversation_id`, tolerante a fallo) para que el agente vea los avisos.
-- Crear y aprobar las dos plantillas en Meta Business Manager.
+- (Reemplazado por spec 007: ya no se crean plantillas globales a mano; las crea cada negocio.)
 
 Tests: `test_correo_espejo.py`, `test_cuenta_global.py`, `test_avisos_cita_reglas.py`,
 `test_avisos_cita_servicio.py`, `test_avisos_cita_api.py`, `test_avisos_cita_jobs.py`,
 `test_plantillas_whatsapp*.py`, `test_avisos_sql.py`.
+
+### Avisos de cita por tenant (spec 007, `sql/65`)
+
+Cada negocio usa **sus propias plantillas** de WhatsApp (UTILITY, `es_MX`, solo cuerpo) para el recordatorio y la
+cancelación de citas, enviadas desde su **número principal activo**. La cuenta global se retiró de los avisos de cita
+y no hay fallback: sin plantilla propia `APPROVED` no se envía. Specs: `specs/007-plantillas-avisos-cita-tenant/`.
+
+- **Modelo.** `avisos_cita_config` (una fila por tenant; fila ausente = oferta `pendiente`, ambas funciones apagadas,
+  nombres base): `oferta` (`pendiente|aceptada|rechazada`), `recordatorio_activo`, `cancelacion_activo`,
+  `nombre_plantilla_recordatorio` / `nombre_plantilla_cancelacion` (nombre **vigente**), `decidido_en/por`. Las plantillas
+  viven en `plantillas_whatsapp_tenant` y se enlazan por nombre, sin FK. Textos y variables en
+  `services/avisos_cita_plantillas.py` (única fuente; el front los recibe en `GET /config`). Si una plantilla cae se recrea
+  con sufijo: `siguiente_nombre(base, usados)` da `base`, `base_v2`, `base_v3`... (hasta `_v9`).
+- **Emisor (D6).** El principal activo (`agentes_canal.es_principal`, `estado='activo'`, config completa, nunca la línea de
+  avisos) **y** la credencial del canal (`get_channel_credentials`) con el mismo `phone_number_id`. Si no coinciden:
+  409 `sin_numero_emisor` al aceptar/activar, y `omitido sin_numero_emisor` al enviar. `numero_emisor_ok` lo refleja.
+- **Oferta.** El owner/superadmin con `tenant_servicios.calendario_activo` y oferta `pendiente` ve un modal (nunca en sesión
+  "ver como"; `/auth/yo` devuelve `oferta_avisos_cita_pendiente`, un solo JOIN). `aceptar` crea/adopta las 2 plantillas (con
+  `pg_advisory_xact_lock`) y activa ambas; `rechazar` apaga ambas (no borra plantillas), devuelve `mensaje` y deja alerta.
+  Reabrir una rechazada es `aceptar`. Adopción: una plantilla existente `es_MX`, UTILITY/MARKETING, con el nº de variables
+  correcto y `APPROVED`/`PENDING` se reutiliza; si no, se crea con sufijo.
+- **Endpoints** (`routers/avisos_cita_config.py`; `/api/avisos-cita` está en `RUTAS_SENSIBLES`): `GET /config` (owner,
+  superadmin, member; sincroniza con NeuroAPI antes de responder y, si falla la red, responde con caché),
+  `POST /oferta {accion}` y `PATCH /config {recordatorio_activo?, cancelacion_activo?}` (`gerencia_actual`; `{}` -> 422).
+  `vendedor`/`proveedor` 403. Errores: 409 `calendario_inactivo`, `sin_numero_emisor`, `plantilla_existente_no_utilizable`
+  (solo si se agota el sufijo); los de NeuroAPI pasan por `a_http`.
+- **Reacción al estado de Meta** (`plantillas_tenant.reaccion_estado`, único punto para webhook, sincronización y DELETE):
+  plantilla `REJECTED/PAUSED/DISABLED` o fila quitada con la función activa -> `activa=false` + **una** alerta
+  `avisos_cita_plantilla_inutilizable` (si la función ya estaba apagada, sin alerta). `PENDING` ("esperando aprobación")
+  nunca alerta ni registra. `marcar_estado_por_error` aplica lo mismo cuando un envío devuelve `plantilla_no_disponible`.
+- **D7: función apagada, sin registro.** El job de recordatorios filtra en SQL por función activa y `calendario_activo`; lo
+  apagado ni es candidato ni deja fila `omitido`. Al activar después, las citas ya en ventana SÍ reciben recordatorio
+  (RF-10). Las cancelaciones con la función apagada u oferta pendiente no se avisan ni se registran (sin reenvío retroactivo).
+  Sin emisor: `omitido sin_numero_emisor`; plantilla ausente/no aprobada: `omitido plantilla_no_aprobada`.
+- **Alertas nuevas** (personales al owner, con correo espejo automático): `avisos_cita_oferta_rechazada`,
+  `avisos_cita_plantilla_inutilizable`, y `aviso_cita_no_enviado` reescrito para el tenant (una variante por motivo:
+  `plantilla_no_aprobada`, `plantilla_no_disponible`, `sin_numero_emisor`, `error_proveedor`; solo en cancelaciones).
+  `sql/65` ensancha `alertas.tipo` a `VARCHAR(60)` y rehace `alertas_tipo_check` desde la lista de `sql/60`; también amplía
+  el CHECK de `avisos_cita.motivo` con `sin_numero_emisor`.
+- **Handler global de Meta.** `canales_neuroapi_webhook` ya no aplica a las plantillas globales un evento de un negocio con
+  el mismo nombre: `plantillas_whatsapp.evento_es_de_cuenta_global` exige el WABA de `AVISOS_CUENTA_GLOBAL_WABA_ID` (vacía =
+  no aplica ninguno).
+- **Aislamiento bidireccional (T10, RF-11/D9).** El handler de negocio (`plantillas_tenant.aplicar_evento_meta`) ignora las `entry` del WABA de `AVISOS_CUENTA_GLOBAL_WABA_ID` (`entradas_de_negocio`, por `entry`) y `elegir_candidata` ya no da por dueña a la candidata única si su `waba_id`/`meta_template_id` guardados contradicen al evento (se descarta con `warning`; NULL no contradice). Con `AVISOS_CUENTA_GLOBAL_WABA_ID` vacío no se descarta nada por «ser global», rige solo la contradicción y cada evento aplicado deja un `warning`. **Riesgo residual de D9:** con `AVISOS_CUENTA_GLOBAL_WABA_ID` vacío, una plantilla de negocio cuyo `meta_template_id` y `waba_id` aún no se han aprendido puede aceptar un evento global homónimo si es la única candidata, y entonces los ids del evento global quedan aprendidos en esa fila. El WABA solo se aprende por eventos, y el `meta_template_id` solo si Meta lo devolvió al crear la plantilla. Mitigación: configura `AVISOS_CUENTA_GLOBAL_WABA_ID` en producción.
+- **Calendario y roles.** Si el negocio sale de calendario las plantillas y la config se conservan; `GET /config` da 200 con
+  `calendario_activo=false` y las escrituras 409. Frontend: `components/modal-oferta-avisos-cita.tsx` (una vez por pestaña) y
+  `components/avisos-cita-panel.tsx` en `/calendario` (`member` solo lectura).
+
+Tests: `test_avisos_cita_tenant.py`, `test_avisos_cita_cancelacion_tenant.py`, `test_avisos_cita_estado_meta.py`,
+`test_avisos_cita_jobs.py`, `test_plantillas_whatsapp_webhook.py`.
 
 ### Control de acceso por plan
 
@@ -1636,6 +1690,32 @@ Aplicar la migración **recorta de una vez** a los negocios existentes con
 
 Tests: `tests/test_limites_agente.py` y el portal en
 `app/(privado)/agente/__tests__/limites-plan.test.tsx`.
+
+### Probar el agente (`sql/68_agente_pruebas_uso.sql`)
+
+`POST /api/agente/probar[?numero_id=<uuid>]` deja al dueño chatear con su agente desde `/agente` sin escribirle a un
+cliente real. El body lleva el **borrador** del formulario (`agent_name`, `system_prompt`, `model`, `temperature`,
+`history_window`) y la conversación de prueba (`mensajes`, máx. 40 turnos de 4000 caracteres; el último debe ser del
+usuario). Responde `{texto, modelo, transferida, herramientas, tokens_*, restantes_hoy}`.
+
+- **Mismo agente, modo simulación.** `services/agente_tester.py` arma un `ContextoMensaje` sintético y llama a
+  `loop_agente.responder(simulacion=True, historial_previo=...)`: mismo prompt, mismas herramientas del número
+  (`numero_id`; sin él, las de Instagram/Facebook/widget) y mismos parámetros que en producción. Sin `numero_id` ajeno:
+  404 `numero_no_encontrado`; la línea de avisos de plataforma no se prueba (409).
+- **Sin huella.** No lee ni escribe `messages`, no registra consumo ni `usage_events`, no cobra créditos, no transfiere.
+  La conversación vive en el navegador. El `conversation_id` es un uuid que nunca existió, así que ninguna herramienta
+  puede alcanzar datos de un cliente real.
+- **Herramientas.** Corren de verdad solo `sql_lectura`, `google_sheets`, `google_docs` y `http_generico` con GET
+  (`herramientas.se_ejecuta_en_prueba`, lista cerrada: un tipo nuevo se simula por defecto). Todo lo demás —el calendario
+  entero, también sus consultas, que necesitan una conversación real—, `http_post_json` y `escalar_humano` devuelve un texto
+  `[SIMULADO]`. La respuesta incluye qué herramientas pidió el modelo.
+- **Cupo.** 20 mensajes por negocio y día (`LIMITE_DIARIO`, tabla `agente_pruebas_uso`, día en America/Mexico_City,
+  UPSERT atómico). Los tokens los absorbe la plataforma. Agotado: 429 `cupo_pruebas_agente`. Si el modelo no responde
+  (sin `ANTHROPIC_API_KEY`, API caída) es 503 y el mensaje se reintegra.
+- **Quién.** Solo owner/superadmin (`gerencia_actual`). `/api/agente/probar` está en `RUTAS_SENSIBLES`: "ver como" no
+  puede usarlo ni con concesión de escritura. Límites del plan: 400 modelo desconocido, 402 modelo/historial fuera del plan.
+
+Tests: `tests/test_agente_tester.py`.
 
 ### Varios números de WhatsApp por negocio (spec 005a, `sql/56` a `sql/59`)
 
@@ -1769,6 +1849,25 @@ escritura queda en `gerencia_auditoria` (`impersonacion_escritura`, más las acc
 Entra como el `owner` (si no hay, `superadmin` o `member`), nunca como
 `vendedor`. En el portal el token va a `sessionStorage`: solo afecta a esa
 pestaña y la sesión del gerente en `localStorage` no se toca.
+
+### Vista de gerencia a las conversaciones de un número
+
+Todo `gerencia_users` abre en `/gerencia/conversaciones` (sin `tenant_id`) las
+conversaciones del número de WhatsApp cuyo `phone_number_id` de Meta está en
+`GERENCIA_NUMERO_PHONE_NUMBER_ID` (vacío = función apagada). Es un atajo sobre las
+rutas por tenant que ya existían: `GET /gerencia/numero-conversaciones` resuelve el
+número (`services/vista_gerencia.py`, `agentes_canal` activo o pausado) y el portal
+llama después a `/gerencia/tenants/{id}/conversaciones?numero_id=...`, así que ver,
+tomar, responder y devolver a la IA funcionan igual que allí.
+
+El dueño (owner/superadmin, nunca una sesión de «ver como»; `/api/vista-gerencia` está
+en `RUTAS_SENSIBLES`) puede **revocar** esa vista desde Canales
+(`GET /vista-gerencia`, `POST /vista-gerencia/revocar|restablecer`,
+`sql/67_vista_gerencia_conversaciones.sql`). Con la vista revocada, todas las rutas
+`/gerencia/tenants/{id}/conversaciones*` de ese negocio y `numero-conversaciones`
+responden 403 `vista_revocada_por_dueno`. Revocar y restablecer quedan en
+`gerencia_auditoria`. El panel solo aparece en el negocio dueño del número
+(`aplica`). Tests: `tests/test_vista_gerencia.py`.
 
 ### Salud y alertas de plataforma
 
@@ -2104,12 +2203,72 @@ Se puede desarrollar y probar todo hoy con las páginas propias.
   acceso de la app en su Meta Business Manager, que es lo que la desvincula
   del todo.
 
+## Instagram Direct vía NeuroAPI (`sql/69_instagram_neuroapi.sql`)
+
+NeuroAPI es el proveedor principal de Instagram mientras Meta no lo reemplace
+(junto con Kontesta y NeuroAPI para WhatsApp). El OAuth de Meta de "Flujo de
+conexión con Meta" sigue en el código, pero el portal ya no lo ofrece para
+Instagram: la fila de Instagram en Canales muestra "Vincular Instagram Direct".
+
+```
+POST /api/canales/instagram/neuroapi/iniciar   gerencia_actual: abre la Connect Session (service_type instagram_messaging)
+GET  /api/canales/instagram/neuroapi/estado    La última sesión de Instagram del negocio (404 si no hay)
+```
+
+- **Key propia, webhook compartido.** La sesión se abre con `NEUROAPI_INSTA_KEY`
+  (scope `instagram_api`), pero su `webhook_url` es la misma de WhatsApp
+  (`/api/canales/whatsapp/neuroapi/webhook`) y la firma el mismo
+  `NEUROAPI_CONNECT_WEBHOOK_SECRET`. `neuroapi_connect_sessions.canal` dice de qué
+  canal es cada sesión: un `instagram.connected` sobre una sesión de WhatsApp no
+  activa nada. Sin `NEUROAPI_INSTA_KEY` (o sin el secreto) `iniciar` responde 503.
+- **Alta** (`services/instagram_neuroapi.py`). `instagram.connected` trae
+  `data.accounts[].instagramAccountId` (y `username`). Mismas reglas que un número
+  (`numeros_reglas.evaluar_alta`), **sin cupo por plan**:
+  cuenta activa de otro negocio → `ajeno`, `cuenta_instagram_no_encontrada`, no se
+  revela y cuenta para el bloqueo de cinco altas ajenas en 24 h, que es **del negocio**
+  (comparte `intentos_alta_ajena` con WhatsApp; `iniciar` responde 429
+  `demasiados_intentos`); la propia ya vinculada por NeuroAPI → `propio`,
+  `cuenta_instagram_ya_vinculada`, sin tocar nada; libre → `set_instagram_neuroapi`:
+  `bsp_provider='neuroapi'`, `ig_user_id`, `NEUROAPI_INSTA_KEY` cifrada como
+  `access_token` y **`page_id` en NULL**. Un negocio tiene una sola cuenta: vincular
+  otra la reemplaza, y una que antes se conectó por OAuth de Meta se migra (sin
+  `page_id` deja de resolverse por el webhook de Meta, así que no hay respuestas
+  dobles; "Obtener nombre" en esas conversaciones responde 409 porque usa la página).
+  El resultado queda en `neuroapi_connect_sessions.detalle`.
+- **Retorno.** `return_url` = `/canales?instagram_neuroapi=retorno` (NeuroAPI agrega
+  `status`). El portal no confía en `status=success`: consulta `.../estado` hasta que
+  la sesión deja de estar pendiente (90 s). Solo un `status` distinto de `success`
+  se muestra enseguida como cancelado.
+- **Entrantes.** El webhook enruta por `object`: `instagram` → la cuenta receptora
+  es `entry[].id` (o `messaging[].recipient.id`), se resuelve con
+  `resuelve_tenant('instagram', …)` y el cuerpo se reenvía intacto con
+  `X-Canal: instagram`. La forma anidada `entry[].entry[].messaging[]` se aplana
+  (`normalizar.aplanar_entradas`). Los ecos (`is_echo`) los descarta `normalizar`.
+- **Envío** (`services/mensajeria.py`, el adaptador por proveedor):
+  `POST /neuroapi/instagram/send` con `x-api-key` y
+  `{recipient_id: <sender.id>, type: "text", text: {body}}`. La respuesta de una
+  persona desde el portal lleva `tag: "HUMAN_AGENT"` (Meta deja contestar hasta
+  7 días tras el último mensaje del cliente; el detalle de conversación lo expone
+  en `minutos_restantes_ventana_humana`); la del agente no la lleva. Solo el
+  **agente en código** contesta estas cuentas: n8n envía Instagram por Graph con
+  `page_id`, que aquí es NULL (aviso de arranque si `AGENTE_EN_CODIGO` está apagada).
+- **Media entrante.** El `media_id` del adjunto (en el adjunto o en su `payload`;
+  NeuroAPI no lo documenta) se baja por `GET /neuroapi/instagram/media/{id}` con
+  `NEUROAPI_INSTA_KEY` (`adjuntos.descargar_media_instagram`: id de ruta validado,
+  sin redirecciones, con tope de tamaño) y se guarda en `message_attachments` si
+  es JPG/PNG/PDF/DOCX. La URL de CDN de Meta del webhook nunca se descarga. Un
+  fallo deja el mensaje solo con su texto.
+- **Fuera de alcance**: enviar imágenes o archivos por Instagram, y mover WhatsApp
+  y Facebook al adaptador de `mensajeria.py`.
+
+Ver `tests/test_instagram_neuroapi.py`.
+
 ## Plantillas de WhatsApp del negocio
 
 Cada negocio crea, consulta y elimina sus plantillas por la API de plantillas de NeuroAPI
 (`/messaging/templates`, scope `whatsapp_cloud_api`), con la `x-api-key` de su línea activa
 (`bsp_provider='neuroapi'`; cae a `NEUROAPI_API_KEY`). No confundir con las dos plantillas **globales** de
-avisos de cita (`/api/gerencia/plantillas-whatsapp`, spec 004), que no se tocan.
+avisos de cita (`/api/gerencia/plantillas-whatsapp`, spec 004), que no se tocan. Las plantillas de los avisos de cita de cada negocio (spec 007) viven en esta misma caché pero se gestionan desde Calendario ("Avisos de cita por tenant").
 
 | Endpoint | Rol | Notas |
 |---|---|---|
@@ -2125,7 +2284,7 @@ avisos de cita (`/api/gerencia/plantillas-whatsapp`, spec 004), que no se tocan.
   404 → 404; 429 → 429; el resto → 502.
 - Webhook: `message_template_status_update` se aplica también a esta caché
   (`plantillas_tenant.aplicar_evento_meta`). El evento no trae tenant: se resuelve por `meta_template_id`,
-  luego `waba_id` y, si no, solo cuando el nombre es de un único negocio; con homónimos se ignora.
+  luego `waba_id` y, si no, solo cuando el nombre es de un único negocio; con homónimos se ignora. Cuando la resolución cae en la rama por `waba_id` o en la de candidata única, se descarta el evento si el `waba_id` o el `meta_template_id` ya guardados de la candidata contradicen los del evento (un dato guardado vacío o ausente en el evento no contradice); la rama por `meta_template_id` no pasa por esa comprobación (si el id coincide, la candidata es la dueña aunque el `waba_id` difiera). Los eventos del WABA global (`AVISOS_CUENTA_GLOBAL_WABA_ID`) se ignoran en este handler de negocio (`entradas_de_negocio`, por `entry`); con esa variable vacía no se descarta ninguno por «ser global».
 - Código: `services/neuroapi_plantillas.py`, `services/plantillas_reglas.py` (puras),
   `services/plantillas_tenant.py`, `routers/plantillas_whatsapp_tenant.py`; tests en
   `tests/test_plantillas_tenant.py`. Frontend: `/plantillas` y `/plantillas/nueva`.

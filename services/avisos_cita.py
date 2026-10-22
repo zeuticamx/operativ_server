@@ -26,21 +26,25 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from config import settings
-from services import contexto_agente, cuenta_global_wa, plantillas_whatsapp
+from services import avisos_cita_config, avisos_cita_envio, contexto_agente, plantillas_tenant
 from services.avisos_cita_reglas import (
     CITA_NO_CONFIRMADA,
+    DESACTIVADO,
+    ESPERANDO_APROBACION,
     HORAS_VENTANA,
+    PLANTILLA_NO_APROBADA,
+    SIN_NUMERO_EMISOR,
     TELEFONO_INVALIDO,
     canal_soportado,
     clasificar_telefono,
     ejecucion_viva,
+    fecha_mostrada,
     motivo_cancelacion,
     motivo_recordatorio,
-    variables_cancelacion,
-    variables_recordatorio,
+    parametros_de_envio,
+    se_registra,
 )
 from services.pipeline import get_tenant_servicios
-from services.whatsapp import ProveedorWhatsAppError
 from session import execute, fetch_all, fetch_one, fetch_value
 
 log = logging.getLogger("operativai.avisos_cita")
@@ -53,31 +57,26 @@ ESTADO_ENVIADO = "enviado"
 ESTADO_OMITIDO = "omitido"
 ESTADO_FALLIDO = "fallido"
 
-# Motivos que solo aparecen al llamar al proveedor o al recuperar huérfanos.
-ERROR_PROVEEDOR = "error_proveedor"
-PLANTILLA_NO_DISPONIBLE = "plantilla_no_disponible"
+# Motivos que solo aparecen al llamar al proveedor o al recuperar huérfanos (los de envío
+# viven en `avisos_cita_envio`, que no importa este módulo).
+ERROR_PROVEEDOR = avisos_cita_envio.ERROR_PROVEEDOR
+PLANTILLA_NO_DISPONIBLE = avisos_cita_envio.PLANTILLA_NO_DISPONIBLE
 RESULTADO_DESCONOCIDO = "resultado_desconocido"
-
-# Errores de NeuroAPI que significan "la plantilla no se pudo usar" (plan 2.9).
-STATUS_PLANTILLA_NO_DISPONIBLE = (400, 500)
-
-_PLANTILLA_POR_TIPO = {
-    TIPO_CANCELACION: plantillas_whatsapp.PLANTILLA_CANCELACION,
-    TIPO_RECORDATORIO: plantillas_whatsapp.PLANTILLA_RECORDATORIO,
-}
 
 TIPO_ALERTA_GERENCIA = "aviso_cita_no_enviado"
 
-# Motivos de una cancelación que se avisan a gerencia (RF-7, RF-8). Quedan fuera
-# `canal_no_soportado` y `desactivado_por_configuracion` (sin aviso por spec).
+# Motivos de una cancelación que se avisan al owner (RF-7, RF-8; spec 007: texto del negocio,
+# una variante por motivo). Quedan fuera `canal_no_soportado` y `desactivado_por_configuracion`
+# (sin aviso por spec).
 _MENSAJE_GERENCIA = {
     "sin_telefono": "la cita no tiene teléfono del cliente.",
     "telefono_invalido": "el teléfono de la cita no es válido.",
-    "plantilla_no_aprobada": (
-        "la plantilla de cancelación no está aprobada en la cuenta de avisos de OperativAI."
+    PLANTILLA_NO_APROBADA: "la plantilla de cancelación de tu negocio no está aprobada.",
+    SIN_NUMERO_EMISOR: (
+        "tu negocio no tiene un número principal de WhatsApp activo con el que enviar el aviso."
     ),
     ERROR_PROVEEDOR: "el envío por WhatsApp falló.",
-    PLANTILLA_NO_DISPONIBLE: "WhatsApp no pudo usar la plantilla de cancelación.",
+    PLANTILLA_NO_DISPONIBLE: "WhatsApp no pudo usar la plantilla de cancelación de tu negocio.",
     RESULTADO_DESCONOCIDO: (
         "no se pudo confirmar si el mensaje salió (el proceso se reinició durante el envío)."
     ),
@@ -99,6 +98,40 @@ class ResultadoAviso:
     @property
     def enviado(self) -> bool:
         return self.estado == ESTADO_ENVIADO
+
+
+@dataclass(frozen=True)
+class EstadoAviso:
+    """
+    Lo que decide un aviso de cita del negocio (spec 007): `habilitado` = calendario
+    activo y función del tipo encendida (D7: si no, ni se envía ni se registra);
+    nombre vigente de la plantilla, su estado en la caché local (None = ausente) y si
+    hay número emisor coincidente (D6).
+    """
+
+    habilitado: bool
+    nombre_plantilla: str
+    plantilla_estado: str | None
+    emisor_ok: bool
+
+
+async def _estado_aviso(
+    tenant_id: UUID, tipo: str, *, acceso: avisos_cita_config.Acceso | None = None
+) -> EstadoAviso:
+    """
+    Lee la configuración del negocio, la caché de su plantilla y el emisor. Sin función
+    activa o con calendario apagado no consulta plantilla ni emisor (no hacen falta).
+    Fila de config ausente = oferta pendiente = función apagada.
+    """
+    a = acceso or avisos_cita_config.AccesoBD()
+    config = avisos_cita_config.config_efectiva(await a.leer_config(tenant_id))
+    nombre = config[avisos_cita_config.columna_nombre(tipo)]
+    activa = bool(config[avisos_cita_config.columna_activo(tipo)])
+    if not activa or not await a.calendario_activo(tenant_id):
+        return EstadoAviso(False, nombre, None, False)
+    fila = await a.plantilla(tenant_id, nombre)
+    estado = str(fila["estado"]) if fila else None
+    return EstadoAviso(True, nombre, estado, await a.emisor_ok(tenant_id))
 
 
 # El job renueva el latido de su ejecución al menos cada minuto mientras trabaja (plan 2.3).
@@ -290,6 +323,21 @@ async def registrar_sin_envio(
 # ------------------------------------------------------------
 # Envío
 # ------------------------------------------------------------
+async def _marcar_plantilla_caida(tenant_id: UUID, nombre: str, cuerpo: str | None) -> None:
+    """
+    `plantilla_no_disponible`: si el cuerpo de Meta trae un código que lo explica (pausada
+    o deshabilitada) marca la plantilla del negocio y deja que `reaccion_estado` apague la
+    función y alerte una vez. Sin código reconocible no toca nada. Nunca lanza.
+    """
+    estado = plantillas_tenant.estado_por_error_de_envio(cuerpo)
+    if estado is None:
+        return
+    try:
+        await plantillas_tenant.marcar_estado_por_error(tenant_id, nombre, estado)
+    except Exception:
+        log.exception("No se pudo marcar la plantilla %r del negocio %s como %s", nombre, tenant_id, estado)
+
+
 async def enviar_registrado(
     aviso_id: UUID,
     *,
@@ -297,44 +345,46 @@ async def enviar_registrado(
     reserva_id: UUID,
     tipo: str,
     hora_inicio: datetime,
+    nombre_plantilla: str,
     destinatario_e164: str,
-    parametros: list[str],
+    parametros: list[dict[str, object]],
     conversation_id: UUID | None,
     servicio: str | None,
 ) -> ResultadoAviso:
     """
-    Llama al proveedor para un registro `en_curso` ya insertado y lo cierra.
-    Un solo intento, sin reintentos. Nunca lanza por un fallo del proveedor: lo
-    deja `fallido`. Si el proceso muere dentro, el registro queda `en_curso` y lo
-    recoge `recuperar_huerfanos`.
+    Llama al proveedor para un registro `en_curso` ya insertado y lo cierra. Envía la
+    plantilla `nombre_plantilla` del negocio desde su número principal activo
+    (`avisos_cita_envio`, nunca la cuenta global); `parametros` es
+    `template.components[]` (`avisos_cita_reglas.parametros_de_envio`).
+    Un solo intento, sin reintentos. Nunca lanza por un fallo del proveedor: lo deja
+    `fallido` (o `omitido: sin_numero_emisor` si el número dejó de servir entre la
+    decisión y el envío). Si el proceso muere dentro, el registro queda `en_curso` y
+    lo recoge `recuperar_huerfanos`.
     """
-    plantilla = _PLANTILLA_POR_TIPO[tipo]
     motivo: str | None = None
     try:
-        await cuenta_global_wa.enviar_plantilla(destinatario_e164, plantilla, parametros)
-    except ProveedorWhatsAppError as exc:
-        if exc.status_code in STATUS_PLANTILLA_NO_DISPONIBLE:
-            motivo = PLANTILLA_NO_DISPONIBLE
-            try:
-                await plantillas_whatsapp.aplicar_error_envio(
-                    plantilla, getattr(exc, "cuerpo", None)
-                )
-            except Exception:
-                log.exception("No se pudo aplicar el error de envío al estado de %s", plantilla)
-        else:
-            motivo = ERROR_PROVEEDOR
-        log.warning(
-            "Aviso %s (%s) fallido: %s [status=%s]", aviso_id, tipo, motivo, exc.status_code
+        res = await avisos_cita_envio.enviar_plantilla_tenant(
+            tenant_id, destinatario_e164, nombre_plantilla, parametros
         )
     except Exception:
         log.exception("Aviso %s (%s): error inesperado al enviar", aviso_id, tipo)
         motivo = ERROR_PROVEEDOR
+    else:
+        if not res.enviado:
+            motivo = res.motivo or ERROR_PROVEEDOR
+            log.warning(
+                "Aviso %s (%s) no enviado: %s [status=%s]", aviso_id, tipo, motivo, res.status_code
+            )
+            if motivo == PLANTILLA_NO_DISPONIBLE:
+                await _marcar_plantilla_caida(tenant_id, nombre_plantilla, res.cuerpo)
 
     if motivo is not None:
-        cerrado = await cerrar_registro(aviso_id, ESTADO_FALLIDO, motivo)
+        # Sin número emisor no se llegó a llamar al proveedor: es una omisión, no un fallo.
+        estado = ESTADO_OMITIDO if motivo == SIN_NUMERO_EMISOR else ESTADO_FALLIDO
+        cerrado = await cerrar_registro(aviso_id, estado, motivo)
         if cerrado and debe_avisar_gerencia(tipo, motivo):
             await avisar_gerencia_cancelacion(tenant_id, reserva_id, motivo)
-        return ResultadoAviso(aviso_id, ESTADO_FALLIDO if cerrado else None, motivo)
+        return ResultadoAviso(aviso_id, estado if cerrado else None, motivo)
 
     cerrado = await cerrar_registro(
         aviso_id, ESTADO_ENVIADO, telefono_destino=destinatario_e164
@@ -368,8 +418,9 @@ async def enviar_con_registro(
     tipo: str,
     hora_inicio: datetime,
     ejecucion_id: UUID | None,
+    nombre_plantilla: str,
     destinatario_e164: str,
-    parametros: list[str],
+    parametros: list[dict[str, object]],
     conversation_id: UUID | None,
     servicio: str | None,
 ) -> ResultadoAviso:
@@ -394,6 +445,7 @@ async def enviar_con_registro(
         reserva_id=reserva_id,
         tipo=tipo,
         hora_inicio=hora_inicio,
+        nombre_plantilla=nombre_plantilla,
         destinatario_e164=destinatario_e164,
         parametros=parametros,
         conversation_id=conversation_id,
@@ -475,7 +527,13 @@ async def procesar_cancelacion(tenant_id: UUID, reserva_id: UUID) -> ResultadoAv
     """
     ejecucion_id: UUID | None = None
     try:
-        ejecucion_id = await crear_ejecucion(TIPO_CANCELACION)
+        # D7: función apagada, calendario inactivo u oferta pendiente -> ni se envía ni se
+        # registra (tampoco se crea ejecución). No hay reenvío retroactivo al activarla.
+        aviso = await _estado_aviso(tenant_id, TIPO_CANCELACION)
+        if not aviso.habilitado:
+            log.info("Aviso de cancelación sin función activa (reserva %s): no se registra", reserva_id)
+            return None
+
         datos = await _datos_cancelacion(tenant_id, reserva_id)
         if datos is None or datos["estado"] != "cancelada":
             log.warning("Aviso de cancelación omitido: reserva %s no está cancelada", reserva_id)
@@ -489,10 +547,17 @@ async def procesar_cancelacion(tenant_id: UUID, reserva_id: UUID) -> ResultadoAv
             telefono=estado_telefono,
             canal_ok=canal_soportado(datos["channel_type"]),
             activo=settings.AVISOS_CITA_WHATSAPP_ACTIVOS,
-            plantilla_aprobada=await plantillas_whatsapp.esta_aprobada(
-                plantillas_whatsapp.PLANTILLA_CANCELACION
-            ),
+            plantilla_estado=aviso.plantilla_estado,
+            emisor_ok=aviso.emisor_ok,
         )
+        if motivo is not None and not se_registra(motivo):
+            # Plantilla PENDING (esperando aprobación): sin registro ni alerta (RF-9).
+            log.info("Aviso de cancelación en espera de aprobación (reserva %s)", reserva_id)
+            return None
+
+        # La ejecución se crea solo cuando va a haber registro: una cancelación en espera
+        # (PENDING) no deja fila en `avisos_cita_ejecuciones`.
+        ejecucion_id = await crear_ejecucion(TIPO_CANCELACION)
         if motivo is not None or telefono_e164 is None:
             return await registrar_sin_envio(
                 tenant_id=tenant_id,
@@ -511,8 +576,14 @@ async def procesar_cancelacion(tenant_id: UUID, reserva_id: UUID) -> ResultadoAv
             tipo=TIPO_CANCELACION,
             hora_inicio=datos["hora_inicio"],
             ejecucion_id=ejecucion_id,
+            nombre_plantilla=aviso.nombre_plantilla,
             destinatario_e164=telefono_e164,
-            parametros=variables_cancelacion(datos["servicio_nombre"], datos["hora_inicio"], zona),
+            parametros=parametros_de_envio(
+                TIPO_CANCELACION,
+                "",
+                datos["servicio_nombre"],
+                fecha_mostrada(datos["hora_inicio"], zona),
+            ),
             conversation_id=conversation_id,
             servicio=datos["servicio_nombre"],
         )
@@ -549,13 +620,20 @@ _SQL_DATOS_RECORDATORIO = """
 
 async def _candidatos_recordatorio(ahora: datetime) -> list[dict]:
     """
-    Citas `confirmada` con inicio en `(ahora, ahora + 5 h]` sin registro de
-    recordatorio para su hora actual. Cualquier cita que cumpla entra, también
-    la reservada con poca antelación (RF-9).
+    Citas `confirmada` con inicio en `(ahora, ahora + 5 h]` sin registro de recordatorio
+    para su hora actual, de negocios con el calendario activo y el recordatorio encendido
+    (D7: sin función activa no hay candidato ni registro; fila de config ausente = oferta
+    pendiente = apagado). Sin AVISOS_CITA_WHATSAPP_ACTIVOS tampoco hay candidatos.
+    Se evalúa por ventana, sin "desde cuándo": una cita ya dentro de las 5 h cuando se
+    activa la función sí lo recibe (RF-10); solo la frena un registro previo (idempotencia).
     """
+    if not settings.AVISOS_CITA_WHATSAPP_ACTIVOS:
+        return []
     filas = await fetch_all(
         _SQL_DATOS_RECORDATORIO
         + """
+        JOIN tenant_servicios ts ON ts.tenant_id = r.tenant_id AND ts.calendario_activo
+        JOIN avisos_cita_config cfg ON cfg.tenant_id = r.tenant_id AND cfg.recordatorio_activo
         WHERE r.estado = 'confirmada'
           AND r.hora_inicio > $1
           AND r.hora_inicio <= $1 + make_interval(hours => $2)
@@ -599,7 +677,11 @@ async def _procesar_recordatorio(
     conversation_id = await contexto_agente.conversacion_whatsapp_del_cliente(
         tenant_id, cand["user_id"]
     )
-    plantilla_ok = await plantillas_whatsapp.esta_aprobada(plantillas_whatsapp.PLANTILLA_RECORDATORIO)
+    # El filtro SQL de candidatos ya exige función activa; esto solo cubre que la apaguen
+    # entre la consulta y este punto (D7: ni envío ni registro).
+    aviso = await _estado_aviso(tenant_id, TIPO_RECORDATORIO)
+    if not aviso.habilitado:
+        return
     motivo = motivo_recordatorio(
         telefono=estado_tel,
         canal_ok=canal_soportado(cand["channel_type"]),
@@ -607,8 +689,11 @@ async def _procesar_recordatorio(
         hora_coincide=True,
         inicio_llegado=hora_inicio <= ahora,
         activo=settings.AVISOS_CITA_WHATSAPP_ACTIVOS,
-        plantilla_aprobada=plantilla_ok,
+        plantilla_estado=aviso.plantilla_estado,
+        emisor_ok=aviso.emisor_ok,
     )
+    if motivo is not None and not se_registra(motivo):
+        return  # plantilla PENDING: sin registro (RF-9); la siguiente pasada lo reintenta
     if motivo is not None:
         # Estado final desde el principio; sin aviso a gerencia (los recordatorios no avisan).
         await registrar_sin_envio(
@@ -641,6 +726,7 @@ async def _procesar_recordatorio(
             await cerrar_sin_envio(aviso_id, CITA_NO_CONFIRMADA)
             return
         estado_tel, telefono_e164 = clasificar_telefono(fresca["cliente_telefono"])
+        fresco = await _estado_aviso(tenant_id, TIPO_RECORDATORIO)
         motivo = motivo_recordatorio(
             telefono=estado_tel,
             canal_ok=canal_soportado(fresca["channel_type"]),
@@ -648,17 +734,25 @@ async def _procesar_recordatorio(
             hora_coincide=fresca["hora_inicio"] == hora_inicio,
             inicio_llegado=fresca["hora_inicio"] <= ahora_envio,
             activo=settings.AVISOS_CITA_WHATSAPP_ACTIVOS,
-            plantilla_aprobada=await plantillas_whatsapp.esta_aprobada(
-                plantillas_whatsapp.PLANTILLA_RECORDATORIO
-            ),
+            plantilla_estado=fresco.plantilla_estado,
+            emisor_ok=fresco.emisor_ok,
         )
+        if motivo is None and not fresco.habilitado:
+            motivo = DESACTIVADO  # la apagaron entre medias; el registro ya existe, se cierra
+        if motivo == ESPERANDO_APROBACION:
+            motivo = PLANTILLA_NO_APROBADA  # el CHECK no admite la espera; el registro ya existe
         if motivo is not None or telefono_e164 is None:
             await cerrar_sin_envio(aviso_id, motivo or TELEFONO_INVALIDO)
             return
 
         if tenant_id not in zonas:
             zonas[tenant_id] = (await get_tenant_servicios(tenant_id)).zona_horaria
-        parametros = variables_recordatorio(fresca["nombre_negocio"], hora_inicio, zonas[tenant_id])
+        parametros = parametros_de_envio(
+            TIPO_RECORDATORIO,
+            fresca["nombre_negocio"],
+            None,
+            fecha_mostrada(hora_inicio, zonas[tenant_id]),
+        )
     except Exception:
         # El registro ya está `en_curso`: se cierra aquí para no dejarlo hasta la recuperación de huérfanos.
         log.exception("Recordatorio %s: falló antes de enviar", aviso_id)
@@ -671,6 +765,7 @@ async def _procesar_recordatorio(
         reserva_id=reserva_id,
         tipo=TIPO_RECORDATORIO,
         hora_inicio=hora_inicio,
+        nombre_plantilla=fresco.nombre_plantilla,
         destinatario_e164=telefono_e164,
         parametros=parametros,
         conversation_id=conversation_id,

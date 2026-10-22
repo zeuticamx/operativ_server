@@ -25,6 +25,9 @@ PLANTILLA_NO_APROBADA = "plantilla_no_aprobada"
 CITA_NO_CONFIRMADA = "cita_no_confirmada"
 HORA_CAMBIADA = "hora_cambiada"
 CITA_YA_INICIADA = "cita_ya_iniciada"
+SIN_NUMERO_EMISOR = "sin_numero_emisor"  # spec 007; también en el CHECK de sql/65
+# Solo señal interna (plantilla PENDING): NO está en el CHECK porque nunca se registra.
+ESPERANDO_APROBACION = "esperando_aprobacion"
 
 ESTADO_CONFIRMADA = "confirmada"
 SERVICIO_RESPALDO = "servicio agendado"
@@ -87,14 +90,51 @@ def canal_soportado(channel_type: str | None) -> bool:
     return es_canal_de_cliente(channel_type)
 
 
+def se_registra(motivo: str | None) -> bool:
+    """Un motivo se anota en `avisos_cita` salvo la espera de aprobación (spec 007, RF-9)."""
+    return motivo is not None and motivo != ESPERANDO_APROBACION
+
+
+def alerta_gerencia_cancelacion(motivo: str | None) -> bool:
+    """
+    Motivos que, en una CANCELACIÓN con la función activa, avisan al owner (spec 007).
+    La espera de aprobación (PENDING) nunca alerta; el recordatorio nunca alerta
+    (el llamador solo consulta esto en la cancelación).
+    """
+    return motivo in (PLANTILLA_NO_APROBADA, SIN_NUMERO_EMISOR)
+
+
+def _motivo_plantilla_y_emisor(plantilla_estado: str | None, emisor_ok: bool) -> str | None:
+    """
+    Cola común: sin número emisor (D6) pesa más que el estado de la plantilla;
+    PENDING espera sin registrar; cualquier otro estado que no sea APPROVED
+    (rechazada, pausada, ausente, desconocida) es `plantilla_no_aprobada`.
+    """
+    if not emisor_ok:
+        return SIN_NUMERO_EMISOR
+    if plantilla_estado is None:  # sin fila de plantilla: ausente
+        return PLANTILLA_NO_APROBADA
+    estado = plantilla_estado.strip().upper()
+    if estado == "PENDING":
+        return ESPERANDO_APROBACION
+    if estado != "APPROVED":
+        return PLANTILLA_NO_APROBADA
+    return None
+
+
 def motivo_cancelacion(
     *,
     telefono: EstadoTelefono,
     canal_ok: bool,
     activo: bool,
-    plantilla_aprobada: bool,
+    plantilla_estado: str | None = None,
+    emisor_ok: bool = True,
 ) -> str | None:
-    """Orden exacto de RF-7: el primer motivo que aplique decide; None = se intenta el envío."""
+    """
+    Orden de RF-7 más spec 007: teléfono, canal, función activa, número emisor,
+    plantilla. El primer motivo que aplique decide; None = se intenta el envío.
+    `ESPERANDO_APROBACION` no se registra ni alerta (ver `se_registra`).
+    """
     if telefono == EstadoTelefono.VACIO:
         return SIN_TELEFONO
     if telefono == EstadoTelefono.NO_NORMALIZABLE:
@@ -103,9 +143,7 @@ def motivo_cancelacion(
         return CANAL_NO_SOPORTADO
     if not activo:
         return DESACTIVADO
-    if not plantilla_aprobada:
-        return PLANTILLA_NO_APROBADA
-    return None
+    return _motivo_plantilla_y_emisor(plantilla_estado, emisor_ok)
 
 
 def motivo_recordatorio(
@@ -116,11 +154,13 @@ def motivo_recordatorio(
     hora_coincide: bool,
     inicio_llegado: bool,
     activo: bool,
-    plantilla_aprobada: bool,
+    plantilla_estado: str | None = None,
+    emisor_ok: bool = True,
 ) -> str | None:
     """
     Orden de RF-11 con `canal_no_soportado` tras `telefono_invalido` (plan 2.2,
-    igual que RF-7). None = se inserta `en_curso` y se llama al proveedor.
+    igual que RF-7); tras `activo` van el número emisor y la plantilla (spec 007).
+    None = se inserta `en_curso` y se llama al proveedor.
     """
     if telefono == EstadoTelefono.VACIO:
         return SIN_TELEFONO
@@ -136,9 +176,7 @@ def motivo_recordatorio(
         return CITA_YA_INICIADA
     if not activo:
         return DESACTIVADO
-    if not plantilla_aprobada:
-        return PLANTILLA_NO_APROBADA
-    return None
+    return _motivo_plantilla_y_emisor(plantilla_estado, emisor_ok)
 
 
 def en_ventana(inicio: datetime, ahora: datetime, horas: int = HORAS_VENTANA) -> bool:
@@ -166,6 +204,29 @@ def variables_recordatorio(nombre_negocio: str, inicio: datetime, zona: str) -> 
     if not nombre:
         raise ValueError("el nombre del negocio no puede ir vacío en la plantilla")
     return [nombre, fecha_mostrada(inicio, zona)]
+
+
+def parametros_de_envio(
+    tipo: str, nombre_negocio: str, servicio: str | None, fecha_mostrada: str
+) -> list[dict[str, object]]:
+    """
+    `template.components[]` del aviso (solo cuerpo), ya con los valores resueltos
+    por el llamador: cancelación [servicio, fecha], recordatorio [negocio, fecha].
+    Puro: la fecha llega formateada (ver `fecha_mostrada`). Nunca valores vacíos.
+    """
+    fecha = (fecha_mostrada or "").strip()
+    if not fecha:
+        raise ValueError("la fecha mostrada no puede ir vacía en la plantilla")
+    if tipo == "cancelacion":
+        valores = [(servicio or "").strip() or SERVICIO_RESPALDO, fecha]
+    elif tipo == "recordatorio":
+        negocio = (nombre_negocio or "").strip()
+        if not negocio:
+            raise ValueError("el nombre del negocio no puede ir vacío en la plantilla")
+        valores = [negocio, fecha]
+    else:
+        raise ValueError(f"tipo de aviso desconocido: {tipo!r}")
+    return [{"type": "body", "parameters": [{"type": "text", "text": v} for v in valores]}]
 
 
 def ejecucion_viva(

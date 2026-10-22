@@ -202,13 +202,21 @@ async def _post_checkout(transaccion_id: UUID, payload: dict[str, str]) -> dict[
         )
 
 
-def firma_valida(cabecera: str | None, cuerpo_crudo: bytes) -> bool:
+def firma_valida(cabecera: str | None, cuerpo_crudo: bytes, secreto: str | None = None) -> bool:
     """
     Valida el HMAC que manda Stripe en `Stripe-Signature`.
 
     La cabecera viene como "t=1704908010,v1=abc123...". Lo que se firma es
-    exactamente `{t}.{cuerpo crudo}` con STRIPE_WEBHOOK_SECRET (whsec_...),
+    exactamente `{t}.{cuerpo crudo}` con el secreto del webhook (whsec_...),
     que no es la secret key de la API.
+
+    `secreto` es opcional: por defecto STRIPE_WEBHOOK_SECRET (el endpoint de
+    la cuenta de plataforma), pero el webhook de Stripe Connect es, en
+    Stripe, un *endpoint distinto* con su propio secreto aunque apunte a la
+    misma URL (el parámetro `connect` de `POST /v1/webhook_endpoints` fija el
+    scope al crearlo; no se le puede agregar después a uno que ya existe).
+    `routers/pagos_stripe.py` prueba STRIPE_WEBHOOK_SECRET y, si no valida,
+    STRIPE_CONNECT_WEBHOOK_SECRET antes de rechazar con 401.
 
     El cuerpo tiene que ser el de la petición **tal cual llegó**: volver a
     serializar el JSON cambia espacios y orden, y el HMAC deja de dar.
@@ -217,6 +225,10 @@ def firma_valida(cabecera: str | None, cuerpo_crudo: bytes) -> bool:
     checkout.session.completed inventado y regalarse créditos.
     """
     if not cabecera:
+        return False
+
+    secreto = secreto if secreto is not None else settings.STRIPE_WEBHOOK_SECRET
+    if not secreto:
         return False
 
     ts = ""
@@ -244,7 +256,7 @@ def firma_valida(cabecera: str | None, cuerpo_crudo: bytes) -> bool:
         return False
 
     esperado = hmac.new(
-        settings.STRIPE_WEBHOOK_SECRET.encode(),
+        secreto.encode(),
         b"%s.%s" % (ts.encode(), cuerpo_crudo),
         hashlib.sha256,
     ).hexdigest()

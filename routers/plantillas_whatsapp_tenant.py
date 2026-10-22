@@ -157,7 +157,8 @@ async def eliminar_plantilla(
         # Si Meta ya no la tiene, solo falta limpiar la caché.
         if e.status_code != 404:
             raise a_http(e)
-    await cache.borrar_local(tenant_id, nombre)
+    # Spec 007 RF-6: si era la plantilla vigente de un aviso de cita activo, la función se apaga y se alerta.
+    await cache.quitar(tenant_id, nombre)
 
 
 @router.post("/{nombre}/prueba", status_code=status.HTTP_202_ACCEPTED)

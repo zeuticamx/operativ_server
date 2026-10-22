@@ -67,7 +67,7 @@ def test_canal_soportado(canal: str | None) -> None:
 
 def _canc(**cambios: object) -> str | None:
     base: dict[str, object] = dict(
-        telefono=EstadoTelefono.VALIDO, canal_ok=True, activo=True, plantilla_aprobada=True
+        telefono=EstadoTelefono.VALIDO, canal_ok=True, activo=True, plantilla_estado="APPROVED"
     )
     base.update(cambios)
     return motivo_cancelacion(**base)  # type: ignore[arg-type]
@@ -79,7 +79,7 @@ def test_cancelacion_sin_motivo_si_todo_ok() -> None:
 
 def test_cancelacion_orden_de_motivos() -> None:
     todo_mal = dict(
-        telefono=EstadoTelefono.VACIO, canal_ok=False, activo=False, plantilla_aprobada=False
+        telefono=EstadoTelefono.VACIO, canal_ok=False, activo=False, plantilla_estado="REJECTED"
     )
     assert _canc(**todo_mal) == "sin_telefono"
     todo_mal["telefono"] = EstadoTelefono.NO_NORMALIZABLE
@@ -102,7 +102,7 @@ def _rec(**cambios: object) -> str | None:
         hora_coincide=True,
         inicio_llegado=False,
         activo=True,
-        plantilla_aprobada=True,
+        plantilla_estado="APPROVED",
     )
     base.update(cambios)
     return motivo_recordatorio(**base)  # type: ignore[arg-type]
@@ -120,7 +120,7 @@ def test_recordatorio_orden_de_motivos() -> None:
         hora_coincide=False,
         inicio_llegado=True,
         activo=False,
-        plantilla_aprobada=False,
+        plantilla_estado="REJECTED",
     )
     esperado = [
         ("telefono", EstadoTelefono.VACIO, "sin_telefono"),

@@ -8,6 +8,12 @@ Facebook / Instagram (OAuth con Meta):
   4. GET  /canales/meta/paginas   → lista lo que el usuario autorizó
   5. POST /canales/meta/activar   → guarda page tokens y suscribe webhooks
 
+Instagram Direct (vía NeuroAPI Connect Sessions, el alta visible en el portal):
+  POST /canales/instagram/neuroapi/iniciar abre la sesión; el webhook de
+  routers/canales_neuroapi_webhook.py la cierra; GET .../estado lo consulta
+  el portal al volver. El OAuth de Meta de arriba queda para el día que Meta
+  sea el proveedor directo.
+
 WhatsApp (hoy vía Kontesta, ver services/whatsapp.py):
   No hay OAuth. La cuenta de Kontesta es la de OperativAI y el número del
   negocio se da de alta como una línea dentro de ella, fuera del portal;
@@ -35,6 +41,7 @@ from schemas import (
     ConectarMetaIn,
     ConectarWhatsAppIn,
     ElegirPrincipalIn,
+    EstadoInstagramNeuroApiOut,
     EstadoNeuroApiConnectOut,
     IniciarNeuroApiConnectIn,
     IniciarNeuroApiConnectOut,
@@ -43,7 +50,7 @@ from schemas import (
     PaginaDisponible,
     PausarNumeroOut,
 )
-from services import meta, neuroapi_connect
+from services import instagram_neuroapi, meta, neuroapi_connect
 from services import herramientas_plan
 from services import numeros_whatsapp as numeros
 from services.numeros_bitacora import Autor
@@ -477,6 +484,89 @@ async def estado_neuroapi_connect(
         resultado=resultado,
         codigo=codigo,
         phone_number_id=phone_number_id,
+    )
+
+
+# ============================================================
+# Instagram Direct (vía NeuroAPI Connect Sessions)
+# ============================================================
+@router.post("/instagram/neuroapi/iniciar", response_model=IniciarNeuroApiConnectOut)
+async def iniciar_instagram_neuroapi(
+    tenant_id: UUID = Depends(tenant_actual),
+    _: UsuarioActual = Depends(gerencia_actual),
+):
+    """
+    Abre una Connect Session de Instagram Direct y devuelve la URL a la que
+    el portal redirige para que el negocio autorice su cuenta profesional en
+    Meta. Igual que WhatsApp: el resultado llega después por el webhook.
+
+    Sin cupo por plan. 429 `demasiados_intentos` si el negocio acumula cinco
+    altas de cuentas o números ajenos en 24 h (el bloqueo es compartido).
+    """
+    if not settings.instagram_neuroapi_configurado:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="La vinculación de Instagram no está configurada",
+        )
+
+    async with conexion() as conn:
+        await instagram_neuroapi.comprobar_alta_previa(conn, tenant_id)
+
+    datos = await neuroapi_connect.crear_connect_session(tenant_id, canal="instagram")
+    connect_url = datos.get("url") or datos.get("connect_url")
+    session_id = datos.get("session_id") or datos.get("id")
+    if not connect_url or not session_id:
+        log.error(
+            "Respuesta de NeuroAPI sin los campos esperados (tenant=%s, instagram): %s",
+            tenant_id, datos,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="NeuroAPI no devolvió una sesión válida",
+        )
+
+    await execute(
+        "INSERT INTO neuroapi_connect_sessions (tenant_id, session_id, canal) "
+        "VALUES ($1, $2, 'instagram')",
+        tenant_id,
+        session_id,
+    )
+    return IniciarNeuroApiConnectOut(connect_url=connect_url)
+
+
+@router.get("/instagram/neuroapi/estado", response_model=EstadoInstagramNeuroApiOut)
+async def estado_instagram_neuroapi(tenant_id: UUID = Depends(tenant_actual)):
+    """
+    La última sesión de Instagram del negocio. El portal la consulta al
+    volver de Meta (no conoce el session_id: NeuroAPI no lo devuelve en el
+    retorno). 404 si el negocio nunca abrió una.
+    """
+    fila = await fetch_one(
+        """
+        SELECT session_id, status, detalle FROM neuroapi_connect_sessions
+         WHERE tenant_id = $1 AND canal = 'instagram'
+         ORDER BY created_at DESC
+         LIMIT 1
+        """,
+        tenant_id,
+    )
+    if fila is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Sesión no encontrada",
+        )
+    try:
+        datos = json.loads(fila["detalle"]) if fila["detalle"] else None
+    except (ValueError, TypeError):
+        datos = None
+    if not isinstance(datos, dict):
+        datos = {}
+    return EstadoInstagramNeuroApiOut(
+        session_id=fila["session_id"],
+        estado=fila["status"],
+        resultado=datos.get("resultado"),
+        codigo=datos.get("codigo"),
+        username=datos.get("username"),
     )
 
 

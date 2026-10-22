@@ -34,7 +34,7 @@ from typing import Any, Optional
 from uuid import UUID
 
 from config import settings
-from services import conversaciones_ocultas, numeros_whatsapp
+from services import conversaciones_ocultas, instagram_neuroapi, numeros_whatsapp
 from services.agente import bajas
 from services.agente import normalizar as normalizar_mod
 from services.agente import prompt
@@ -185,6 +185,14 @@ async def procesar(peticion: PeticionVerificada) -> ResultadoIngreso:
         "UPDATE conversations SET esperando_reapertura = false, last_message_at = NOW() WHERE id = $1",
         conversacion["id"],
     )
+
+    # Adjunto de un DM de Instagram por NeuroAPI: se baja por su proxy y queda
+    # asociado al mensaje para el portal. Si falla, el mensaje sigue con su
+    # texto ("[image]"); no frena la respuesta.
+    if mensaje.canal == "instagram" and mensaje.media_id and peticion.proveedor == "neuroapi":
+        await instagram_neuroapi.guardar_adjunto_entrante(
+            tenant_id, guardado["id"], mensaje.media_id
+        )
 
     contexto = ContextoMensaje(
         tenant_id=tenant_id,

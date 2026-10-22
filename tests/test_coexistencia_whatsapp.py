@@ -302,7 +302,7 @@ def sin_reenvio(monkeypatch):
     """Si un eco llegara a reenviarse al agente, el test lo ve."""
     reenviados: list[bytes] = []
 
-    async def _reenviar(cuerpo, tenant_id, destino):
+    async def _reenviar(cuerpo, tenant_id, destino, **_):
         reenviados.append(cuerpo)
 
     monkeypatch.setattr(entrada_mensajes_modulo(), "reenviar", _reenviar)

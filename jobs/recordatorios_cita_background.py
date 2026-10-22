@@ -2,8 +2,9 @@
 Job de background: recordatorio de cita por WhatsApp 5 h antes (spec 004, T7).
 
 Cada AVISOS_CITA_REVISION_MINUTOS (5) minutos revisa las citas confirmadas que
-entran en la ventana y manda la plantilla `recordatorio_cita` desde la cuenta
-global (services/avisos_cita.procesar_recordatorios). Que no se duplique entre
+entran en la ventana y manda la plantilla propia del negocio desde su número
+principal activo, solo para negocios con la función activa (spec 007;
+services/avisos_cita.procesar_recordatorios). Que no se duplique entre
 procesos lo garantiza la unicidad (reserva, tipo, hora_inicio) en BD, no el
 scheduler.
 

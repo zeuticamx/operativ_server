@@ -428,3 +428,61 @@ async def test_vendedor_y_proveedor_no_ven_numeros_pero_conservan_lo_suyo(
         assert (
             await http_client.get("/api/conversaciones", headers=headers)
         ).status_code == 200
+
+
+# ============================================================
+# Avisos de cita por negocio (spec 007 T3)
+# ============================================================
+@pytest.mark.asyncio
+async def test_avisos_cita_owner_y_member_leen_vendedor_y_proveedor_403(http_client, negocio, monkeypatch):
+    from services import avisos_cita_config
+
+    async def sin_red(tenant_id, **_):
+        return None
+
+    monkeypatch.setattr(avisos_cita_config, "sincronizar", sin_red)
+
+    ruta = "/api/avisos-cita/config"
+    assert (await http_client.get(ruta, headers=_h(negocio["owner"]))).status_code == 200
+    assert (await http_client.get(ruta, headers=_h(negocio["member"]))).status_code == 200
+
+    uid_prov = uuid4()
+    await execute(
+        """
+        INSERT INTO portal_users (id, tenant_id, email, password_hash, role, is_active)
+        VALUES ($1, $2, $3, $4, 'proveedor', true)
+        """,
+        uid_prov,
+        negocio["tid"],
+        f"proveedor-{uid_prov}@ejemplo.com",
+        hash_password("test_password"),
+    )
+    await execute(
+        "INSERT INTO proveedores (tenant_id, portal_user_id, nombre) VALUES ($1, $2, 'Alex')",
+        negocio["tid"],
+        uid_prov,
+    )
+    tokens_acotados = [
+        negocio["vendedor"],
+        crear_access_token(uid_prov, negocio["tid"], "proveedor"),
+    ]
+    for token in tokens_acotados:
+        h = _h(token)
+        assert (await http_client.get(ruta, headers=h)).status_code == 403
+        assert (
+            await http_client.post("/api/avisos-cita/oferta", json={"accion": "rechazar"}, headers=h)
+        ).status_code == 403
+        assert (
+            await http_client.patch(ruta, json={"cancelacion_activo": False}, headers=h)
+        ).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_avisos_cita_member_no_decide_ni_edita(http_client, negocio):
+    h = _h(negocio["member"])
+    assert (
+        await http_client.post("/api/avisos-cita/oferta", json={"accion": "rechazar"}, headers=h)
+    ).status_code == 403
+    assert (
+        await http_client.patch("/api/avisos-cita/config", json={"recordatorio_activo": False}, headers=h)
+    ).status_code == 403

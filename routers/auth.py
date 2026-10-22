@@ -20,7 +20,7 @@ from fastapi import (
 from config import settings
 from services.correo import ErrorEnvioCorreo, enviar_codigo_verificacion
 from services.google_login import TokenGoogleInvalido, verificar_credential
-from services import invitaciones, limite_login, onboarding, recuperacion_password
+from services import avisos_cita_config, invitaciones, limite_login, onboarding, recuperacion_password
 from services.onboarding import PROMPT_INICIAL
 from routers.perfil import version_foto
 from deps import ROLES_GERENCIA, UsuarioActual, usuario_actual
@@ -1022,6 +1022,14 @@ async def yo(usuario: UsuarioActual = Depends(usuario_actual)):
         and await onboarding.pendiente(usuario.tenant_id)
     )
 
+    # Oferta de avisos de cita (spec 007): mismas reglas que el cuestionario.
+    oferta_avisos_cita_pendiente = bool(
+        usuario.tenant_id
+        and usuario.role in ROLES_GERENCIA
+        and usuario.impersonado_por is None
+        and await avisos_cita_config.oferta_pendiente_yo(usuario.tenant_id)
+    )
+
     return UsuarioOut(
         id=usuario.id,
         email=usuario.email,
@@ -1038,4 +1046,5 @@ async def yo(usuario: UsuarioActual = Depends(usuario_actual)):
         perfil_completo=bool(perfil and perfil["perfil_completado_en"]),
         foto_version=version_foto(perfil["foto_actualizada_en"]) if perfil else None,
         onboarding_pendiente=onboarding_pendiente,
+        oferta_avisos_cita_pendiente=oferta_avisos_cita_pendiente,
     )

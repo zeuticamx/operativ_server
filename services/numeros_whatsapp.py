@@ -600,19 +600,28 @@ async def _insertar_numero(
     return nuevo
 
 
-async def _registrar_intento_ajeno(
+async def registrar_intento_ajeno(
     conn: asyncpg.Connection,
     tenant_id: UUID,
     phone_number_id: str,
     autor: Autor,
     ahora: datetime,
     intentos_previos: int,
+    *,
+    canal: str = "whatsapp",
 ) -> None:
-    """RF-2 paso 4, P9: cuenta el intento y lo deja en la bitácora de la plataforma (4 últimos dígitos)."""
+    """
+    RF-2 paso 4, P9: cuenta el intento y lo deja en la bitácora de la plataforma (4 últimos dígitos).
+
+    Las altas ajenas de Instagram (services/instagram_neuroapi.py) cuentan en
+    la misma tabla: el bloqueo de cinco en 24 h es del negocio, no del canal.
+    """
     await conn.execute(
         "INSERT INTO intentos_alta_ajena (tenant_id, creado_en) VALUES ($1, $2)", tenant_id, ahora
     )
-    detalle = {"ultimos_digitos": ultimos_digitos(phone_number_id)}
+    detalle: dict[str, Any] = {"ultimos_digitos": ultimos_digitos(phone_number_id)}
+    if canal != "whatsapp":
+        detalle["canal"] = canal
     actor = dict(
         actor_email=autor.email or "desconocido",
         actor_portal_user_id=autor.portal_user_id,
@@ -837,7 +846,7 @@ async def vincular(
         if not decision.permitido:
             rechazo = decision
             if decision.cuenta_como_intento:
-                await _registrar_intento_ajeno(conn, tenant_id, identificador, autor, ahora, len(intentos))
+                await registrar_intento_ajeno(conn, tenant_id, identificador, autor, ahora, len(intentos))
         else:
             assert nuevo is not None
             await registrar(

@@ -124,6 +124,11 @@ class Respuesta:
     # El agente transfirió la conversación: a partir de acá el bot calla y no
     # hay que mandar su texto como si fuera una respuesta normal.
     transferida: bool = False
+    # Herramientas que pidió el modelo, en orden: solo clave y parámetros,
+    # nunca el resultado (el modo prueba se las muestra al dueño).
+    herramientas: list[dict[str, Any]] = field(default_factory=list)
+    # La API falló y `texto` es el mensaje genérico, no una respuesta del modelo.
+    fallo: bool = False
 
 
 @lru_cache
@@ -139,13 +144,24 @@ def _cliente() -> anthropic.AsyncAnthropic:
     return anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
 
 
-async def responder(contexto: ContextoMensaje) -> Respuesta:
+async def responder(
+    contexto: ContextoMensaje,
+    *,
+    simulacion: bool = False,
+    historial_previo: Optional[list[dict[str, Any]]] = None,
+) -> Respuesta:
     """
     Genera la respuesta del agente para el mensaje ya persistido.
 
     Solo devuelve el texto: guardarlo y entregarlo por el canal es de quien
     llama. El consumo de tokens sí se registra acá, porque es lo único que
     conoce el detalle de cada vuelta.
+
+    `simulacion` es el modo "Probar agente" del portal (services/agente_tester.py):
+    mismo prompt, mismo modelo y mismo bucle que en producción, pero sin tocar
+    nada de un cliente: no lee mensajes (el historial llega en
+    `historial_previo`), no registra consumo, no cobra créditos, no transfiere
+    y las herramientas con efectos se simulan.
     """
     config = contexto.config
     if config is None:
@@ -157,7 +173,7 @@ async def responder(contexto: ContextoMensaje) -> Respuesta:
         contexto.tenant_id, contexto.agente_canal_id
     )
     claves = {f["tool_key"] for f in filas}
-    eventos = await prompt.eventos_de_contexto(contexto.conversation_id)
+    eventos = [] if simulacion else await prompt.eventos_de_contexto(contexto.conversation_id)
 
     nombre_modelo = config["model"]
 
@@ -167,9 +183,10 @@ async def responder(contexto: ContextoMensaje) -> Respuesta:
         contexto, config, catalogo, claves, cacheable=True, eventos=eventos
     )
 
-    mensajes: list[dict[str, Any]] = await prompt.historial(
-        contexto, int(config["history_window"])
-    )
+    if historial_previo is not None:
+        mensajes: list[dict[str, Any]] = [dict(m) for m in historial_previo]
+    else:
+        mensajes = await prompt.historial(contexto, int(config["history_window"]))
     mensajes.append({"role": "user", "content": contexto.contenido})
 
     herramientas_disponibles = [
@@ -190,6 +207,7 @@ async def responder(contexto: ContextoMensaje) -> Respuesta:
             nombre_modelo=nombre_modelo,
             temperature=config.get("temperature"),
             agente_canal_id=contexto.agente_canal_id,
+            simulacion=simulacion,
         )
     except anthropic.APIStatusError as e:
         log.error(
@@ -205,11 +223,14 @@ async def responder(contexto: ContextoMensaje) -> Respuesta:
                 e.status_code,
             )
         respuesta.texto = RESPUESTA_VACIA
+        respuesta.fallo = True
     except anthropic.APIConnectionError:
         log.error("Sin conexión con la API para la conversación %s", contexto.conversation_id)
         respuesta.texto = RESPUESTA_VACIA
+        respuesta.fallo = True
 
-    await _registrar_consumo(contexto, respuesta)
+    if not simulacion:
+        await _registrar_consumo(contexto, respuesta)
 
     if not respuesta.texto.strip():
         respuesta.texto = RESPUESTA_VACIA
@@ -271,6 +292,7 @@ async def _vueltas(
     nombre_modelo: str,
     temperature: float | None,
     agente_canal_id: Optional[UUID] = None,
+    simulacion: bool = False,
 ) -> None:
     """El ciclo pedir → ejecutar → devolver, hasta que el modelo deja de pedir."""
     cliente = _cliente()
@@ -312,7 +334,8 @@ async def _vueltas(
         mensajes.append({"role": "assistant", "content": mensaje.content})
 
         resultados = await _ejecutar_llamadas(
-            contexto, llamadas, vuelta, agente_canal_id=agente_canal_id
+            contexto, llamadas, vuelta, agente_canal_id=agente_canal_id,
+            simulacion=simulacion, trazas=respuesta.herramientas,
         )
 
         # Todos los resultados en UN solo mensaje de usuario. Repartirlos en
@@ -344,6 +367,8 @@ async def _ejecutar_llamadas(
     llamadas: list[Any],
     vuelta: int,
     agente_canal_id: Optional[UUID] = None,
+    simulacion: bool = False,
+    trazas: Optional[list[dict[str, Any]]] = None,
 ) -> list[tuple[dict[str, Any], bool]]:
     """
     Ejecuta las herramientas que pidió el modelo, en paralelo si son varias.
@@ -361,7 +386,28 @@ async def _ejecutar_llamadas(
     async def una(llamada: Any) -> tuple[dict[str, Any], bool]:
         entrada = llamada.input or {}
 
-        if llamada.name == "escalar_humano":
+        if trazas is not None:
+            if llamada.name == "escalar_humano":
+                trazas.append(
+                    {
+                        "tool_key": "escalar_humano",
+                        "parametros": {"motivo": entrada.get("motivo"), "area": entrada.get("area")},
+                    }
+                )
+            else:
+                trazas.append(
+                    {
+                        "tool_key": str(entrada.get("tool_key") or llamada.name),
+                        "parametros": entrada.get("parametros") or {},
+                    }
+                )
+
+        if llamada.name == "escalar_humano" and simulacion:
+            # No se transfiere nada, pero se corta igual que en producción
+            # para que el dueño vea que el agente habría pasado la conversación.
+            texto = "[SIMULADO] Modo prueba: la conversación no se transfirió de verdad."
+            transferida = True
+        elif llamada.name == "escalar_humano":
             texto = await escalar.escalar(
                 tenant_id=contexto.tenant_id,
                 conversation_id=contexto.conversation_id,
@@ -384,6 +430,7 @@ async def _ejecutar_llamadas(
                 # llamada. Un reintento de la misma respuesta no cobra dos veces.
                 referencia_cobro=f"tool:{llamada.id}",
                 agente_canal_id=agente_canal_id,
+                cobrar=not simulacion,
             )
             transferida = False
         else:
