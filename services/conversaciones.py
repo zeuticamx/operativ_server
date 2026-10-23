@@ -85,9 +85,19 @@ _PROVEEDOR_DEL_CLIENTE = (
 # canales usan un único agente compartido (`tenant_agent_config`), sin
 # ambigüedad posible. `tiene_varios_numeros` le dice al portal si vale la
 # pena mostrar de cuál se trata (un negocio con un solo número no la necesita).
-_NUMERO_JOIN = "LEFT JOIN agentes_canal ac ON ac.id = c.agente_canal_id"
-_NUMERO_CAMPOS = """
+#
+# Una conversación de WhatsApp anterior a la spec 005a (o creada por el flujo
+# viejo de n8n) puede tener `agente_canal_id` en NULL: para MOSTRARLA se
+# atribuye al número principal del negocio. Solo es presentación: los filtros
+# y la respuesta siguen leyendo `c.agente_canal_id`.
+_NUMERO_JOIN = """LEFT JOIN agentes_canal ac ON ac.id = COALESCE(
             c.agente_canal_id,
+            (SELECT p.id FROM agentes_canal p
+              WHERE p.tenant_id = c.tenant_id AND c.channel_type = 'whatsapp'
+                AND p.es_principal AND p.estado IN ('activo', 'pausado')
+              LIMIT 1))"""
+_NUMERO_CAMPOS = """
+            ac.id AS agente_canal_id,
             ac.telefono_visible AS numero_telefono_visible,
             ac.phone_number_id AS numero_phone_number_id,
             ac.agent_name AS numero_agent_name,

@@ -42,6 +42,8 @@ log = logging.getLogger("operativai.canales.instagram_neuroapi")
 
 SERVICE_TYPE = "instagram_messaging"
 
+_IDS_NO_VALIDOS = {"undefined", "null", "none", "nan"}
+
 # Códigos de numeros_reglas (pensados para números) -> los de una cuenta de Instagram.
 _CODIGOS = {
     "numero_ya_vinculado": "cuenta_instagram_ya_vinculada",
@@ -107,7 +109,9 @@ async def vincular_desde_proveedor(
     """
     identificador = (ig_user_id or "").strip()
     ahora = _ahora(ahora)
-    if not identificador:
+    # NeuroAPI puede mandar el texto "undefined"/"null" cuando no pudo leer el perfil:
+    # vincularlo dejaría una cuenta que jamás recibe mensajes.
+    if not identificador or identificador.lower() in _IDS_NO_VALIDOS or not identificador.isdigit():
         return ResultadoAltaInstagram("rechazado", "cuenta_instagram_no_valida", ig_user_id or "", username)
 
     async with conn.transaction():

@@ -32,6 +32,7 @@ URL tras la vinculación, ni para migrar de uno al otro.
 
 import json
 import logging
+import re
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -433,6 +434,20 @@ async def _completar_instagram(tenant_id: Any, session_id: str, evento: dict[str
         cuenta.get("instagramAccountId") or cuenta.get("instagram_account_id") or ""
     ).strip()
     username = cuenta.get("username") or None
+    if not ig_user_id.isdigit():
+        # Formato observado 2026-10-23: `instagramAccountId` puede llegar como
+        # "undefined" mientras el id real viaja en otro campo con prefijo
+        # `ig_direct_<id>` (el panel de NeuroAPI lo muestra como "Página FB").
+        for valor in cuenta.values():
+            m = re.fullmatch(r"ig_direct_(\d+)", str(valor).strip())
+            if m:
+                ig_user_id = m.group(1)
+                break
+    if not ig_user_id.isdigit():
+        log.warning(
+            "NeuroAPI Connect mandó un instagramAccountId no válido (%r) para la sesión %s; %s",
+            ig_user_id, session_id, _estructura(evento),
+        )
 
     async with conexion() as conn:
         resultado = await instagram_neuroapi.vincular_desde_proveedor(
