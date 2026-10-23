@@ -444,9 +444,15 @@ async def _completar_instagram(tenant_id: Any, session_id: str, evento: dict[str
                 ig_user_id = m.group(1)
                 break
     if not ig_user_id.isdigit():
+        # Campos de la cuenta con el valor recortado (4 caracteres + largo): sirve
+        # para ver dónde viaja el id real sin escribir tokens en el log.
+        forma = {
+            k: f"{str(v)[:4]}…({len(str(v))})" if not isinstance(v, (dict, list)) else type(v).__name__
+            for k, v in cuenta.items()
+        }
         log.warning(
-            "NeuroAPI Connect mandó un instagramAccountId no válido (%r) para la sesión %s; %s",
-            ig_user_id, session_id, _estructura(evento),
+            "NeuroAPI Connect mandó un instagramAccountId no válido (%r) para la sesión %s; %s; cuentas=%d cuenta[0]=%s",
+            ig_user_id, session_id, _estructura(evento), len(cuentas), forma,
         )
 
     async with conexion() as conn:
