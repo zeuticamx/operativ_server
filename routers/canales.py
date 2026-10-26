@@ -34,7 +34,7 @@ from deps import (
     requiere_herramienta,
     tenant_actual,
 )
-from session import conexion, execute, fetch_all, fetch_one
+from session import conexion, execute, fetch_all, fetch_one, fetch_value
 from schemas import (
     ActivarCanalesIn,
     CanalOut,
@@ -188,6 +188,13 @@ async def activar_canales(
     except meta.MetaError as e:
         raise meta.a_http(e)
 
+    # Para que obtiene_app_secret (sql/53) pueda validar la firma HMAC de los
+    # webhooks de Facebook/Instagram: sin esto channel_credentials.meta_app_id
+    # queda NULL y Meta reenviando mensajes reales se rechaza con 403.
+    meta_app_id = await fetch_value(
+        "SELECT resolver_meta_app($1, $2)", settings.META_APP_ID, settings.META_APP_SECRET
+    )
+
     por_id = {p["id"]: p for p in paginas}
     resultados = []
 
@@ -212,10 +219,11 @@ async def activar_canales(
 
         # Facebook Messenger
         await fetch_one(
-            "SELECT set_channel_credentials($1, 'facebook', $2, NULL, $3, NULL)",
+            "SELECT set_channel_credentials($1, 'facebook', $2, NULL, $3, NULL, $4)",
             tenant_id,
             page_token,
             page_id,
+            meta_app_id,
         )
         await execute(
             """
@@ -231,11 +239,12 @@ async def activar_canales(
         # Instagram, solo si la página tiene cuenta vinculada
         if ig.get("id"):
             await fetch_one(
-                "SELECT set_channel_credentials($1, 'instagram', $2, NULL, $3, $4)",
+                "SELECT set_channel_credentials($1, 'instagram', $2, NULL, $3, $4, $5)",
                 tenant_id,
                 page_token,
                 page_id,
                 ig["id"],
+                meta_app_id,
             )
             await execute(
                 """

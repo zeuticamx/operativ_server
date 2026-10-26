@@ -69,11 +69,11 @@
 -- aborta y no se cambia nada. O se migran todas, o ninguna.
 UPDATE meta_apps
    SET app_secret_cifrado = pgp_sym_encrypt(
-           pgp_sym_decrypt(app_secret_cifrado, 'Ktalac8DikBCYqoNPDOtN4tiGY59zj6VM-Sz-4bQvWV6SJnW99X2AwTbRM5xhoM9'),
+           pgp_sym_decrypt(app_secret_cifrado, ''),
            current_setting('app.cred_key')
        )
  WHERE app_secret_cifrado IS NOT NULL
-   AND pgp_sym_decrypt(app_secret_cifrado, 'Ktalac8DikBCYqoNPDOtN4tiGY59zj6VM-Sz-4bQvWV6SJnW99X2AwTbRM5xhoM9') IS NOT NULL;
+   AND pgp_sym_decrypt(app_secret_cifrado, '') IS NOT NULL;
 
 
 -- ------------------------------------------------------------
