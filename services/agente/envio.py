@@ -292,7 +292,7 @@ async def _enviar_texto(
                 await _registrar_error(destino, None, motivo)
                 return Resultado(entregado=False, partes=numero - 1, motivo=motivo)
 
-        if respuesta.status_code >= 400:
+        if respuesta.status_code >= 400 or _rechazo_en_cuerpo(respuesta):
             codigo, diagnostico = _diagnosticar(respuesta.text)
             log.warning(
                 "Envío fallido tenant=%s canal=%s parte=%s/%s code=%s :: %s",
@@ -316,6 +316,19 @@ async def _enviar_texto(
     return Resultado(entregado=True, partes=len(fragmentos))
 
 
+def _rechazo_en_cuerpo(respuesta: httpx.Response) -> bool:
+    """
+    NeuroAPI puede contestar 200 con `success: false` o un `error` en el
+    cuerpo (igual que mensajeria.enviar). Sin esto el rechazo pasaba por
+    entregado y no quedaba rastro en delivery_errors.
+    """
+    try:
+        datos = respuesta.json()
+    except (ValueError, AttributeError):
+        return False
+    return isinstance(datos, dict) and (datos.get("success") is False or "error" in datos)
+
+
 def _diagnosticar(cuerpo: str) -> tuple[int | None, str]:
     """
     Saca el código de error de Meta del cuerpo de la respuesta.
@@ -333,7 +346,9 @@ def _diagnosticar(cuerpo: str) -> tuple[int | None, str]:
         return codigo, DIAGNOSTICOS[codigo]
 
     mensaje = _MENSAJE.search(cuerpo or "")
-    return codigo, (mensaje.group(1) if mensaje else "Error desconocido")[:500]
+    if mensaje:
+        return codigo, mensaje.group(1)[:500]
+    return codigo, f"Error desconocido: {(cuerpo or '')[:300]}"
 
 
 async def _registrar_error(
