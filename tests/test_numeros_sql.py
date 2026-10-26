@@ -147,11 +147,14 @@ def test_RF22_56_es_la_siguiente_migracion_libre_y_no_hay_duplicadas() -> None:
     assert 69 in anteriores
     # La 70 es el cambio de la línea de avisos (motivo nuevo de la bitácora).
     assert 70 in anteriores
+    # La 71 vincula channel_credentials.meta_app_id con meta_apps (resolver_meta_app)
+    # y la 72 hace que set_channel_credentials fije bsp_provider='meta', ajenas a esta.
+    assert {71, 72} <= anteriores
     # Desde la 54 (las anteriores tienen números repetidos históricos) no hay duplicados ni huecos.
     recientes = [int(p.name.split("_")[0]) for p in DIR_SQL.glob("[0-9][0-9]_*.sql") if int(p.name.split("_")[0]) >= 54]
     assert len(recientes) == len(set(recientes))
     assert set(recientes) == set(range(54, max(recientes) + 1))
-    assert max(anteriores) == 70
+    assert max(anteriores) == 72
 
 
 @pytest.mark.parametrize("numero", sorted(ARCHIVOS))

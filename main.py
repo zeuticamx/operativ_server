@@ -8,11 +8,23 @@ Arranque local:
 encima de la app de FastAPI, y uvicorn tiene que arrancar esa capa de afuera
 para que /socket.io/* llegue a python-socketio en vez de a FastAPI.
 """
+import logging
 from contextlib import asynccontextmanager
 
 import socketio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+# Sin esto, los logger.info(...) de todo services/ y routers/ (logger.name
+# empieza con "operativai.") no tienen handler propio ni root configurado:
+# Python los descarta en silencio, solo WARNING+ llega a la consola por el
+# "last resort handler" por defecto. Deja ver, por ejemplo, "Mensaje no
+# atendido: %s" en services/agente/ingreso.py -- sin esto, un mensaje
+# descartado no deja ningún rastro, ni error ni éxito.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
+)
 
 from routers import (
     agenda,
