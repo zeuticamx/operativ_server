@@ -1,7 +1,10 @@
 """
 Plantillas de WhatsApp de cada negocio, administradas contra la API de
-plantillas de NeuroAPI (Meta Graph). Distinto de `/gerencia/plantillas-whatsapp`
-(las dos plantillas globales de los avisos de cita, solo plataforma).
+plantillas de NeuroAPI (Meta Graph) o, si el negocio se conectó por el
+Embedded Signup de Meta, contra Graph directo (`_servicio`/`_proveedor_envio`
+eligen según `channel_credentials.bsp_provider`). Distinto de
+`/gerencia/plantillas-whatsapp` (las dos plantillas globales de los avisos de
+cita, solo plataforma).
 
 Leer (listar, detalle) es de `negocio_actual`: owner, superadmin y member.
 Crear, eliminar y enviar pruebas es de `gerencia_actual`. vendedor y proveedor
@@ -12,6 +15,8 @@ La tabla local es una caché del catálogo de Meta: `GET ?sincronizar=true` la
 refresca desde NeuroAPI y el webhook (`message_template_status_update`) mueve
 el estado sin polling. Una plantilla de otro negocio responde 404.
 """
+
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
@@ -25,9 +30,11 @@ from schemas import (
 )
 from services import plantillas_reglas as reglas
 from services import plantillas_tenant as cache
+from services.meta_plantillas import MetaTemplateService
 from services.neuroapi_plantillas import NeuroApiTemplateService, PlantillaApiError, a_http
 from services.whatsapp import ProveedorWhatsAppError
 from services.whatsapp import a_http as a_http_envio
+from session import fetch_value
 
 router = APIRouter(prefix="/plantillas-whatsapp", tags=["plantillas-whatsapp"])
 
@@ -51,6 +58,33 @@ def _tenant(usuario: UsuarioActual):
     return usuario.tenant_id
 
 
+async def _es_meta(tenant_id: UUID) -> bool:
+    proveedor = await fetch_value(
+        "SELECT bsp_provider FROM channel_credentials "
+        "WHERE tenant_id = $1 AND channel_type = 'whatsapp' AND is_active = true",
+        tenant_id,
+    )
+    return proveedor == "meta"
+
+
+async def _servicio(tenant_id: UUID) -> NeuroApiTemplateService | MetaTemplateService:
+    """
+    Cada negocio administra sus plantillas contra la API del proveedor que
+    tenga activo en su canal de WhatsApp (bsp_provider): NeuroAPI para la
+    inmensa mayoría hoy, o Meta directo para quien ya se conectó por el
+    Embedded Signup de /canales/whatsapp/meta/activar.
+    """
+    if await _es_meta(tenant_id):
+        return await MetaTemplateService.desde_tenant(tenant_id)
+    return await NeuroApiTemplateService.desde_tenant(tenant_id)
+
+
+async def _proveedor_envio(tenant_id: UUID):
+    if await _es_meta(tenant_id):
+        return await MetaTemplateService.proveedor_envio(tenant_id)
+    return await NeuroApiTemplateService.proveedor_envio(tenant_id)
+
+
 @router.get("", response_model=list[PlantillaTenantOut])
 async def listar_plantillas(
     categoria: CategoriaPlantilla | None = None,
@@ -61,7 +95,7 @@ async def listar_plantillas(
     tenant_id = _tenant(usuario)
     if sincronizar:
         try:
-            servicio = await NeuroApiTemplateService.desde_tenant(tenant_id)
+            servicio = await _servicio(tenant_id)
             remotas = await servicio.listar(limite=LIMITE_SINCRONIZACION)
         except PlantillaApiError as e:
             raise a_http(e)
@@ -107,7 +141,7 @@ async def crear_plantilla(
         )
 
     try:
-        servicio = await NeuroApiTemplateService.desde_tenant(tenant_id)
+        servicio = await _servicio(tenant_id)
         respuesta = await servicio.crear(
             nombre=nombre, idioma=idioma, categoria=datos.categoria, componentes=componentes
         )
@@ -151,7 +185,7 @@ async def eliminar_plantilla(
     if await cache.obtener(tenant_id, nombre) is None:
         raise _no_encontrada()
     try:
-        servicio = await NeuroApiTemplateService.desde_tenant(tenant_id)
+        servicio = await _servicio(tenant_id)
         await servicio.eliminar(nombre)
     except PlantillaApiError as e:
         # Si Meta ya no la tiene, solo falta limpiar la caché.
@@ -183,7 +217,7 @@ async def enviar_prueba(
     except reglas.PlantillaInvalida as e:
         raise _invalida(e)
     try:
-        proveedor = await NeuroApiTemplateService.proveedor_envio(tenant_id)
+        proveedor = await _proveedor_envio(tenant_id)
         resultado = await proveedor.enviar_plantilla_con_componentes(
             datos.telefono, nombre, fila["idioma"], componentes
         )

@@ -318,6 +318,13 @@ def api(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(cache, "listar", listar)
     monkeypatch.setattr("routers.plantillas_whatsapp_tenant.NeuroApiTemplateService", _Servicio)
 
+    # _servicio() mira bsp_provider antes de elegir entre NeuroAPI y Meta: sin
+    # BD real en estos tests, se fija en 'neuroapi' (ver test_plantillas_tenant.py).
+    async def _bsp_provider(*args: Any, **kwargs: Any) -> str:
+        return "neuroapi"
+
+    monkeypatch.setattr("routers.plantillas_whatsapp_tenant.fetch_value", _bsp_provider)
+
     async def _u() -> UsuarioActual:
         return UsuarioActual(id=uuid4(), tenant_id=T, email="o@n.com", role="owner")
 

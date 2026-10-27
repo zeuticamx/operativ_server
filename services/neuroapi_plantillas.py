@@ -91,12 +91,14 @@ def a_http(e: PlantillaApiError) -> HTTPException:
     if e.status_code == 404:
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plantilla no encontrada")
     if e.status_code == 403:
-        # La clave del negocio no tiene el scope whatsapp_cloud_api: no es algo que el cliente arregle.
+        # La credencial del negocio (clave de NeuroAPI o token de Meta, según
+        # bsp_provider) no tiene permiso para administrar plantillas: no es
+        # algo que el cliente arregle.
         return HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={
                 "codigo": "scope_whatsapp_cloud_api_faltante",
-                "mensaje": "La clave de NeuroAPI no tiene permiso para administrar plantillas",
+                "mensaje": "La credencial de WhatsApp conectada no tiene permiso para administrar plantillas",
             },
         )
     if e.status_code == 429:

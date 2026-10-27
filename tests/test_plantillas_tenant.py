@@ -161,6 +161,38 @@ async def test_fallo_de_red_es_502(monkeypatch):
 
 
 # ------------------------------------------------------------
+# Factory de proveedor (NeuroAPI vs Meta directo, según bsp_provider)
+# ------------------------------------------------------------
+async def test_servicio_elige_segun_bsp_provider(monkeypatch):
+    import routers.plantillas_whatsapp_tenant as router_mod
+
+    class _ServicioNeuroApi:
+        @classmethod
+        async def desde_tenant(cls, tenant_id):
+            return "neuroapi-instancia"
+
+    class _ServicioMeta:
+        @classmethod
+        async def desde_tenant(cls, tenant_id):
+            return "meta-instancia"
+
+    monkeypatch.setattr(router_mod, "NeuroApiTemplateService", _ServicioNeuroApi)
+    monkeypatch.setattr(router_mod, "MetaTemplateService", _ServicioMeta)
+
+    async def _neuroapi(*args, **kwargs):
+        return "neuroapi"
+
+    async def _meta(*args, **kwargs):
+        return "meta"
+
+    monkeypatch.setattr(router_mod, "fetch_value", _neuroapi)
+    assert await router_mod._servicio(TENANT) == "neuroapi-instancia"
+
+    monkeypatch.setattr(router_mod, "fetch_value", _meta)
+    assert await router_mod._servicio(TENANT) == "meta-instancia"
+
+
+# ------------------------------------------------------------
 # Eventos de Meta
 # ------------------------------------------------------------
 def _evento(nombre="promo", event="APPROVED", **v):
@@ -304,6 +336,15 @@ def api(monkeypatch):
     _Servicio.llamadas = []
     _Servicio.fallo = None
     monkeypatch.setattr("routers.plantillas_whatsapp_tenant.NeuroApiTemplateService", _Servicio)
+
+    # _servicio()/_proveedor_envio() miran bsp_provider antes de elegir entre
+    # NeuroAPI y Meta: sin BD real en estos tests, se fija en 'neuroapi' (el
+    # valor por defecto de channel_credentials) para no romper estas pruebas,
+    # que son todas de un negocio de NeuroAPI.
+    async def _bsp_provider(*args, **kwargs):
+        return "neuroapi"
+
+    monkeypatch.setattr("routers.plantillas_whatsapp_tenant.fetch_value", _bsp_provider)
     actual = {"u": _usuario("owner")}
 
     async def _u() -> UsuarioActual:

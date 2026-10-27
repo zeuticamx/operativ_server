@@ -195,6 +195,42 @@ async def desuscribir_app_de_pagina(page_id: str, page_token: str) -> None:
         _revisar_error(data)
 
 
+async def obtener_waba_id(phone_number_id: str, token: str) -> str:
+    """
+    De qué WhatsApp Business Account es un phone_number_id -- channel_credentials
+    no la guarda (solo el phone_number_id), así que hay que resolverla para
+    hablar con la API de plantillas de esa WABA (services/meta_plantillas.py).
+    """
+    async with httpx.AsyncClient(timeout=20) as client:
+        data = await _get(
+            client,
+            f"/{phone_number_id}",
+            {"access_token": token, "fields": "whatsapp_business_account"},
+        )
+    waba_id = (data.get("whatsapp_business_account") or {}).get("id")
+    if not waba_id:
+        raise MetaError(
+            code=None,
+            mensaje="No se pudo resolver la WhatsApp Business Account de ese número",
+        )
+    return waba_id
+
+
+async def suscribir_app_a_waba(waba_id: str, token: str) -> None:
+    """
+    Igual que suscribir_app_a_pagina pero para una WhatsApp Business Account:
+    sin esto, Meta no manda los webhooks de mensajes entrantes de esa WABA.
+    A diferencia de una página, una WABA no toma `subscribed_fields` aquí.
+    """
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(
+            f"{settings.graph_url}/{waba_id}/subscribed_apps",
+            params={"access_token": token},
+        )
+        data = r.json()
+        _revisar_error(data)
+
+
 # ============================================================
 # Envío de mensajes (handoff humano)
 # ============================================================

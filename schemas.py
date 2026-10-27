@@ -347,6 +347,12 @@ class ConectarWhatsAppIn(BaseModel):
     phone_number_id: str = Field(min_length=1, max_length=100)
 
 
+class ConectarWhatsAppMetaIn(BaseModel):
+    """waba_id/phone_number_id que entrega el evento WA_EMBEDDED_SIGNUP del SDK de JS."""
+    waba_id: str = Field(min_length=1, max_length=100)
+    phone_number_id: str = Field(min_length=1, max_length=100)
+
+
 ModoConexionWhatsApp = Literal["standard", "coexistence"]
 
 

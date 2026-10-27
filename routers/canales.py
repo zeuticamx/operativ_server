@@ -17,6 +17,20 @@ Instagram Direct (vía NeuroAPI Connect Sessions, el alta visible en el portal):
 WhatsApp (vía NeuroAPI Connect Sessions, ver services/whatsapp.py):
   POST /canales/whatsapp/neuroapi/iniciar abre el Embedded Signup; el webhook
   de routers/canales_neuroapi_webhook.py vincula el número al cerrar la sesión.
+  Este sigue siendo el proveedor real y activo de todos los negocios.
+
+WhatsApp (vía Meta Cloud API directa, Embedded Signup con config_id):
+  El frontend carga el SDK de JS de Meta y abre FB.login con el config_id de
+  "whatsapp-embedded-signup" (Inicio de sesión con Facebook para empresas →
+  Configuraciones); del evento WA_EMBEDDED_SIGNUP obtiene waba_id/
+  phone_number_id y llama POST /canales/whatsapp/meta/activar. Requiere haber
+  hecho antes POST /canales/meta/conectar (mismo user token que Facebook/
+  Instagram). Queda detrás de bsp_provider='meta' por tenant -- no afecta a
+  los negocios que siguen en NeuroAPI -- y solo se activa para un tenant si
+  decide conectarse así; Meta debe aprobar primero Acceso Avanzado de
+  whatsapp_business_management/whatsapp_business_messaging para que funcione
+  con clientes reales (hasta entonces, Acceso Estándar solo permite probarlo
+  con administradores/testers de la app).
 """
 
 import json
@@ -39,6 +53,7 @@ from schemas import (
     CanalOut,
     ConectarMetaIn,
     ConectarWhatsAppIn,
+    ConectarWhatsAppMetaIn,
     ElegirPrincipalIn,
     EstadoInstagramNeuroApiOut,
     EstadoNeuroApiConnectOut,
@@ -411,6 +426,64 @@ async def conectar_whatsapp(
             datos.phone_number_id,
             Autor.gerencia(usuario.id, usuario.email),
             bsp_provider="kontesta",
+        )
+        herramientas = await herramientas_plan.herramientas_de_numero(conn, tenant_id, fila["id"])
+    return _numero_out(fila, herramientas)
+
+
+# ============================================================
+# WhatsApp (vía Meta Cloud API directa — Embedded Signup con config_id)
+# ============================================================
+@router.post(
+    "/whatsapp/meta/activar",
+    response_model=NumeroWhatsAppOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def activar_whatsapp_meta(
+    datos: ConectarWhatsAppMetaIn,
+    tenant_id: UUID = Depends(tenant_actual),
+    usuario: UsuarioActual = Depends(gerencia_actual),
+):
+    """
+    Vincula un número de WhatsApp conectado por el Embedded Signup de Meta
+    (`waba_id`/`phone_number_id` que entrega el evento WA_EMBEDDED_SIGNUP del
+    SDK de JS en el frontend). Reusa el user token de /meta/conectar -- el
+    mismo login de Facebook/Instagram -- así que no hace falta un OAuth aparte.
+    """
+    conexion_meta = await fetch_one("SELECT * FROM get_meta_connection($1)", tenant_id)
+    if conexion_meta is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Todavía no has conectado tu cuenta de Meta",
+        )
+    user_token = conexion_meta["user_token"]
+
+    try:
+        await meta.suscribir_app_a_waba(datos.waba_id, user_token)
+    except meta.MetaError as e:
+        raise meta.a_http(e)
+
+    # Mismo mecanismo que Facebook/Instagram (ver /meta/activar): sin esto
+    # channel_credentials.meta_app_id queda NULL y el webhook rechaza cada
+    # mensaje real con "Sin app_secret para el remitente" (403).
+    meta_app_id = await fetch_value(
+        "SELECT resolver_meta_app($1, $2)", settings.META_APP_ID, settings.META_APP_SECRET
+    )
+    await fetch_one(
+        "SELECT set_channel_credentials($1, 'whatsapp', $2, $3, NULL, NULL, $4)",
+        tenant_id,
+        user_token,
+        datos.phone_number_id,
+        meta_app_id,
+    )
+
+    async with conexion() as conn:
+        fila = await numeros.vincular(
+            conn,
+            tenant_id,
+            datos.phone_number_id,
+            Autor.gerencia(usuario.id, usuario.email),
+            bsp_provider="meta",
         )
         herramientas = await herramientas_plan.herramientas_de_numero(conn, tenant_id, fila["id"])
     return _numero_out(fila, herramientas)
