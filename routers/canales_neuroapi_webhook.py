@@ -24,10 +24,9 @@ phone_number_id.
 Una vez vinculada la cuenta, NeuroAPI manda a esta misma URL los mensajes
 entrantes. Para esos, el backend actúa de proxy (services/entrada_mensajes.py):
 la firma ya se validó aquí, se identifica el tenant por el número receptor y
-se reenvía el cuerpo intacto hacia n8n o hacia el propio agente en código,
-según `AGENTE_EN_CODIGO` (decide `entrada_mensajes.destino_para`). Así no
-hace falta una segunda llamada a NeuroAPI para apuntar los mensajes a otra
-URL tras la vinculación, ni para migrar de uno al otro.
+se reenvía el cuerpo intacto al propio agente en código
+(`entrada_mensajes.destino_para`). Así no hace falta una segunda llamada a
+NeuroAPI para apuntar los mensajes a otra URL tras la vinculación.
 """
 
 import json
@@ -225,19 +224,8 @@ async def _reenviar_mensaje_instagram(cuerpo_crudo: bytes, evento: dict[str, Any
 
 
 async def _entregar(cuerpo_crudo: bytes, tenant_id: Any, canal: str, identificador: str) -> None:
-    """Reenvía al destino del tenant (n8n o el agente en código)."""
+    """Reenvía al agente en código el mensaje del tenant."""
     destino = entrada_mensajes.destino_para(tenant_id)
-    if not destino:
-        # 503 y no 200: NeuroAPI reintenta y el mensaje no se pierde mientras
-        # se corrige la variable.
-        log.error(
-            "N8N_WEBHOOK_ENTRADA_URL sin configurar: mensaje del tenant %s sin reenviar",
-            tenant_id,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="El reenvío de mensajes no está configurado",
-        )
 
     try:
         await entrada_mensajes.reenviar(cuerpo_crudo, tenant_id, destino, canal=canal)

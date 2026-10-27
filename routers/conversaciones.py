@@ -20,7 +20,7 @@ from deps import (
     vendedor_actual,
 )
 from realtime import avisar_a_usuario, emit_conversacion_estado, emit_mensaje
-from session import conexion, execute, fetch_one
+from session import conexion, fetch_one
 from schemas import (
     AdjuntoOut,
     AsignableOut,
@@ -45,6 +45,7 @@ from services import asignacion_conversaciones as asig
 from services import avisos_conversacion as avisos
 from services import conversaciones as svc
 from services import meta
+from services import perfil_contacto
 
 # lectura_sin_plan: con el plan vencido el negocio sigue viendo su historial;
 # lo que se corta es contestar a mano o devolverle el control a la IA.
@@ -555,60 +556,17 @@ async def actualizar_contacto(
             detail=f"El contacto no tiene un identificador de {canal} guardado",
         )
 
-    # El page_id dice a qué página pertenece la conversación; el token de
-    # esa página se pide a Meta con el user token, igual que al conectar.
-    canal_fila = await fetch_one(
-        """
-        SELECT page_id FROM v_tenant_channels
-        WHERE tenant_id = $1 AND channel_type = $2 AND is_active
-        """,
-        tenant_id,
-        canal,
-    )
-    if canal_fila is None or not canal_fila["page_id"]:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"El canal {canal} no está conectado",
-        )
-
-    conexion = await fetch_one("SELECT * FROM get_meta_connection($1)", tenant_id)
-    if conexion is None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Todavía no has conectado tu cuenta de Meta",
-        )
-
     try:
-        paginas = await meta.listar_paginas(conexion["user_token"])
-        page_token = next(
-            (p["access_token"] for p in paginas if p["id"] == canal_fila["page_id"]),
-            None,
+        perfil = await perfil_contacto.consultar_y_guardar(
+            tenant_id, fila["user_id"], canal, contacto_id
         )
-        if page_token is None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="La página conectada ya no está autorizada en Meta",
-            )
-        perfil = await meta.perfil_contacto(canal, contacto_id, page_token)
+    except perfil_contacto.PerfilNoDisponible as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
     except meta.MetaError as e:
         raise meta.a_http(e)
 
     nombre = perfil["nombre"]
     username = perfil["username"]
-
-    # COALESCE: si Meta no devuelve algo, se conserva lo que ya hubiera
-    # en vez de borrarlo.
-    await execute(
-        """
-        UPDATE users
-        SET display_name = COALESCE($1, display_name),
-            instagram_username = COALESCE($2, instagram_username)
-        WHERE id = $3
-        """,
-        nombre,
-        username,
-        fila["user_id"],
-    )
 
     return ContactoOut(
         usuario_nombre=nombre,

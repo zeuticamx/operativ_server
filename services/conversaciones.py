@@ -95,12 +95,15 @@ _NUMERO_JOIN = """LEFT JOIN agentes_canal ac ON ac.id = COALESCE(
             (SELECT p.id FROM agentes_canal p
               WHERE p.tenant_id = c.tenant_id AND c.channel_type = 'whatsapp'
                 AND p.es_principal AND p.estado IN ('activo', 'pausado')
-              LIMIT 1))"""
+              LIMIT 1))
+        LEFT JOIN tenant_agent_config tac ON tac.tenant_id = c.tenant_id"""
 _NUMERO_CAMPOS = """
             ac.id AS agente_canal_id,
             ac.telefono_visible AS numero_telefono_visible,
             ac.phone_number_id AS numero_phone_number_id,
-            ac.agent_name AS numero_agent_name,
+            COALESCE(ac.agent_name,
+                     CASE WHEN c.channel_type IN ('instagram', 'facebook') THEN tac.agent_name END)
+                AS numero_agent_name,
             COALESCE(ac.es_linea_avisos, false) AS numero_es_linea_avisos,
             (SELECT COUNT(*) FROM agentes_canal ac2
              WHERE ac2.tenant_id = c.tenant_id AND ac2.estado IN ('activo', 'pausado')) > 1

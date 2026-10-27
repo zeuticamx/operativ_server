@@ -1,16 +1,14 @@
 """
 Envío de WhatsApp, agnóstico de proveedor (patrón Adapter/Strategy).
 
-Hoy el proveedor activo es Kontesta (`KontestaProvider`), porque la app de
-Meta todavía no tiene Acceso Avanzado aprobado en App Review. `NeuroApiProvider`
-es una alternativa lista para usar contra NeuroAPI/NeuroChat (WhatsApp Cloud
-API oficial vía BSP). `MetaProvider` es el destino final: un stub vacío,
+Hoy el proveedor activo es NeuroAPI (`NeuroApiProvider`, WhatsApp Cloud API
+oficial vía BSP). `MetaProvider` es el destino final: un stub vacío,
 listo para completarse el día que se apruebe Acceso Avanzado, sin que
 routers ni jobs tengan que cambiar una sola línea — solo `WHATSAPP_PROVIDER`
 en el entorno.
 
 Todo el código de negocio debe depender únicamente de `ProveedorWhatsApp`
-(vía `obtener_proveedor()`), nunca de `KontestaProvider`, `NeuroApiProvider`
+(vía `obtener_proveedor()`), nunca de `NeuroApiProvider`
 ni de `httpx` directamente. Eso es lo que hace que cambiar de proveedor sea
 un cambio de variable de entorno y no una migración de código.
 """
@@ -20,7 +18,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
-import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -165,153 +162,6 @@ class ProveedorWhatsApp(ABC):
 
 
 # ============================================================
-# Kontesta
-# ============================================================
-class KontestaProvider(ProveedorWhatsApp):
-    """
-    Implementación contra la API REST de Kontesta.
-
-    api_key y webhook_secret se inyectan por parámetro (normalmente desde
-    `settings`, ver `obtener_proveedor()` más abajo) y nunca se hardcodean.
-    """
-
-    def __init__(self, api_key: str, webhook_secret: str, base_url: str):
-        self._api_key = api_key
-        self._webhook_secret = webhook_secret
-        self._base_url = base_url.rstrip("/")
-
-    def _headers(self) -> dict[str, str]:
-        # X-Api-Key es lo que documenta Kontesta; se manda también
-        # Authorization: Bearer por si el endpoint lo prefiere — no hace
-        # daño mandar ambas cabeceras de auth server-to-server.
-        return {
-            "X-Api-Key": self._api_key,
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
-
-    async def _post(self, path: str, cuerpo: dict[str, Any]) -> dict[str, Any]:
-        if not self._api_key:
-            raise ProveedorWhatsAppError(
-                "KONTESTA_API_KEY sin configurar", status_code=None
-            )
-        url = f"{self._base_url}{path}"
-        async with httpx.AsyncClient(timeout=20) as cliente:
-            try:
-                r = await cliente.post(url, json=cuerpo, headers=self._headers())
-            except httpx.RequestError as e:
-                raise ProveedorWhatsAppError(f"No se pudo contactar a Kontesta: {e}") from e
-
-        if r.status_code >= 400:
-            log.warning("Kontesta %s -> %s: %s", path, r.status_code, r.text[:500])
-            raise ProveedorWhatsAppError(
-                f"Kontesta respondió {r.status_code}", status_code=r.status_code
-            )
-        try:
-            return r.json()
-        except ValueError:
-            return {}
-
-    async def enviar_mensaje(self, conversation_id: str, texto: str) -> ResultadoEnvio:
-        data = await self._post(
-            f"/conversations/{conversation_id}/messages",
-            {"kind": "text", "text": texto},
-        )
-        return ResultadoEnvio(
-            id_mensaje=str(data.get("id") or data.get("message_id") or ""),
-            estado=data.get("status"),
-            crudo=data,
-        )
-
-    async def enviar_plantilla(
-        self,
-        destinatario: str,
-        plantilla: str,
-        idioma: str = "es",
-        parametros: list[str] | None = None,
-    ) -> ResultadoEnvio:
-        # ⚠️ El cuerpo exacto de /v1/messaging/send no vino especificado
-        # (solo que "requiere una plantilla aprobada"). Se sigue la forma
-        # estándar de WhatsApp Business (name/language/components) porque
-        # es la que usan la mayoría de los BSP compatibles; hay que
-        # confirmarla contra la documentación real de Kontesta antes de
-        # mandar tráfico de producción.
-        cuerpo: dict[str, Any] = {
-            "to": destinatario,
-            "type": "template",
-            "template": {
-                "name": plantilla,
-                "language": {"code": idioma},
-            },
-        }
-        if parametros:
-            cuerpo["template"]["components"] = [
-                {
-                    "type": "body",
-                    "parameters": [{"type": "text", "text": p} for p in parametros],
-                }
-            ]
-
-        data = await self._post("/messaging/send", cuerpo)
-        return ResultadoEnvio(
-            id_mensaje=str(data.get("id") or data.get("message_id") or ""),
-            estado=data.get("status"),
-            crudo=data,
-        )
-
-    def verificar_webhook(self, cuerpo_crudo: bytes, headers: dict[str, str]) -> bool:
-        """
-        Firma esperada: cabecera `X-Kontesta-Signature` con la forma
-        "t=<timestamp>,v1=<hmac>" (mismo formato que Stripe/Mercado Pago).
-
-        ⚠️ El nombre exacto de la cabecera no vino especificado más que
-        como "las cabeceras" de las que se extraen t y v1; confirmar contra
-        la documentación real de Kontesta. Si el proveedor manda t y v1 en
-        dos cabeceras separadas en vez de una combinada, ajustar solo este
-        método — el resto del código no se entera.
-        """
-        if not self._webhook_secret:
-            log.warning("KONTESTA_WEBHOOK_SECRET sin configurar: webhook rechazado")
-            return False
-
-        firma = headers.get("x-kontesta-signature") or headers.get("X-Kontesta-Signature")
-        if not firma:
-            return False
-
-        partes: dict[str, str] = {}
-        for trozo in firma.split(","):
-            if "=" not in trozo:
-                continue
-            clave, _, valor = trozo.partition("=")
-            partes[clave.strip()] = valor.strip()
-
-        ts = partes.get("t")
-        v1 = partes.get("v1")
-        if not ts or not v1:
-            return False
-
-        # Ventana de tolerancia contra replay: un webhook con timestamp de
-        # hace horas no debería aceptarse aunque la firma sea válida.
-        try:
-            if abs(time.time() - int(ts)) > 300:
-                log.warning("Webhook de Kontesta con timestamp fuera de ventana (t=%s)", ts)
-                return False
-        except ValueError:
-            return False
-
-        # Es CRÍTICO firmar el cuerpo crudo tal cual llegó (bytes), nunca
-        # un json.dumps() propio: cualquier diferencia de espacios u orden
-        # de llaves cambia el HMAC aunque el contenido sea "el mismo".
-        mensaje_firmado = ts.encode() + b"." + cuerpo_crudo
-        esperado = hmac.new(
-            self._webhook_secret.encode(), mensaje_firmado, hashlib.sha256
-        ).hexdigest()
-
-        # compare_digest y no ==: comparación en tiempo constante.
-        return hmac.compare_digest(esperado, v1)
-
-
-# ============================================================
 # NeuroAPI (NeuroChat) — BSP sobre WhatsApp Cloud API oficial
 # ============================================================
 class NeuroApiProvider(ProveedorWhatsApp):
@@ -319,7 +169,7 @@ class NeuroApiProvider(ProveedorWhatsApp):
     Implementación contra la API REST de NeuroAPI (NeuroChat), un BSP sobre
     la WhatsApp Cloud API oficial de Meta.
 
-    A diferencia de Kontesta, NeuroAPI no expone un endpoint por
+    NeuroAPI no expone un endpoint por
     conversación: todo se manda a un único `POST /messaging/send` con el
     teléfono destino (`to`) y un `type` ("text" | "template" | ...). Por eso
     `enviar_mensaje` recibe en `conversation_id` directamente el teléfono
@@ -487,7 +337,7 @@ class NeuroApiProvider(ProveedorWhatsApp):
 class MetaProvider(ProveedorWhatsApp):
     """
     Placeholder para cuando la app de Meta tenga Acceso Avanzado aprobado
-    y se migre de Kontesta a la Cloud API de Meta directamente.
+    y se migre de NeuroAPI a la Cloud API de Meta directamente.
 
     Implementación intencionalmente vacía: existe para que el resto del
     código (routers, jobs) ya pueda depender de `ProveedorWhatsApp` sin
@@ -517,11 +367,6 @@ class MetaProvider(ProveedorWhatsApp):
 # Inyección de dependencias: qué proveedor usar
 # ============================================================
 _PROVEEDORES = {
-    "kontesta": lambda: KontestaProvider(
-        api_key=settings.KONTESTA_API_KEY,
-        webhook_secret=settings.KONTESTA_WEBHOOK_SECRET,
-        base_url=settings.KONTESTA_API_BASE_URL,
-    ),
     "neuroapi": lambda: NeuroApiProvider(
         api_key=settings.NEUROAPI_API_KEY,
         webhook_secret=settings.NEUROAPI_WEBHOOK_SECRET,

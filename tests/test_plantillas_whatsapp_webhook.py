@@ -63,7 +63,6 @@ def mundo(monkeypatch: pytest.MonkeyPatch) -> _Mundo:
     monkeypatch.setattr(settings, "NEUROAPI_CONNECT_WEBHOOK_SECRET", SECRETO)
     # T6: el handler global solo aplica eventos del WABA de la cuenta global (los de _estado()).
     monkeypatch.setattr(settings, "AVISOS_CUENTA_GLOBAL_WABA_ID", "waba-1")
-    monkeypatch.setattr(settings, "N8N_WEBHOOK_ENTRADA_URL", "http://n8n.invalid/entrada", raising=False)
 
     class _Conexion:
         async def fetchrow(self, sql: str, nombre: str):

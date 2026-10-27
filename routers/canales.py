@@ -14,10 +14,9 @@ Instagram Direct (vía NeuroAPI Connect Sessions, el alta visible en el portal):
   el portal al volver. El OAuth de Meta de arriba queda para el día que Meta
   sea el proveedor directo.
 
-WhatsApp (hoy vía Kontesta, ver services/whatsapp.py):
-  No hay OAuth. La cuenta de Kontesta es la de OperativAI y el número del
-  negocio se da de alta como una línea dentro de ella, fuera del portal;
-  POST /canales/whatsapp/conectar solo registra qué línea es de qué tenant.
+WhatsApp (vía NeuroAPI Connect Sessions, ver services/whatsapp.py):
+  POST /canales/whatsapp/neuroapi/iniciar abre el Embedded Signup; el webhook
+  de routers/canales_neuroapi_webhook.py vincula el número al cerrar la sesión.
 """
 
 import json
@@ -392,7 +391,7 @@ async def elegir_linea_avisos(
 
 
 # ============================================================
-# WhatsApp (vía Kontesta)
+# WhatsApp (alta manual por id de línea, sin proveedor Kontesta)
 # ============================================================
 @router.post("/whatsapp/conectar", status_code=status.HTTP_201_CREATED)
 async def conectar_whatsapp(

@@ -3,7 +3,7 @@ NeuroAPI Connect Sessions: alta de WhatsApp Business vía Embedded Signup y de
 Instagram Direct (cuenta profesional), con el mismo trámite.
 
 Sin SDK, con httpx directo, igual que el resto de integraciones de este
-proyecto (Meta, Stripe, Kontesta). Esto es distinto de `services/whatsapp.py`:
+proyecto (Meta, Stripe). Esto es distinto de `services/whatsapp.py`:
 `NeuroApiProvider` de ahí es el BSP para *enviar/recibir mensajes* una vez la
 cuenta ya está conectada; esto es *el alta de la cuenta*, mismo vendor y mismo
 esquema de firma pero otro endpoint y otro secreto de webhook.

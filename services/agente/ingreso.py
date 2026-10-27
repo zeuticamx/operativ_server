@@ -34,7 +34,7 @@ from typing import Any, Optional
 from uuid import UUID
 
 from config import settings
-from services import conversaciones_ocultas, instagram_neuroapi, numeros_whatsapp
+from services import conversaciones_ocultas, instagram_neuroapi, numeros_whatsapp, perfil_contacto
 from services.agente import bajas
 from services.agente import normalizar as normalizar_mod
 from services.agente import prompt
@@ -173,6 +173,7 @@ async def procesar(peticion: PeticionVerificada) -> ResultadoIngreso:
         )
 
     conversacion = await _conversacion(tenant_id, user_id, mensaje.canal)
+    await _completar_nombre(tenant_id, user_id, mensaje)
     guardado = await _guardar_mensaje(tenant_id, conversacion["id"], mensaje)
     if guardado is None:
         # El proveedor reintentó un mensaje que ya teníamos. El ON CONFLICT
@@ -365,6 +366,23 @@ async def _upsert_usuario(tenant_id: UUID, mensaje: MensajeNormalizado) -> UUID:
         mensaje.nombre,
     )
     return fila["id"]
+
+
+async def _completar_nombre(
+    tenant_id: UUID, user_id: UUID, mensaje: MensajeNormalizado
+) -> None:
+    """
+    Instagram y Facebook solo mandan un id numérico: si el cliente sigue sin
+    nombre, se le pregunta a Meta en segundo plano (sin frenar la respuesta).
+    """
+    if mensaje.canal not in ("instagram", "facebook") or not mensaje.usuario_id:
+        return
+    nombre = await fetch_value("SELECT display_name FROM users WHERE id = $1", user_id)
+    if (nombre or "").strip():
+        return
+    perfil_contacto.pedir_en_segundo_plano(
+        tenant_id, user_id, mensaje.canal, str(mensaje.usuario_id)
+    )
 
 
 async def _conversacion(

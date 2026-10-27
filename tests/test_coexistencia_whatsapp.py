@@ -471,7 +471,6 @@ async def test_un_mensaje_de_cliente_sigue_reenviandose_al_agente(
 ):
     tid = tenant_y_usuario["tenant_id"]
     pn = await _numero_coexistencia(tid)
-    monkeypatch.setattr(settings, "N8N_WEBHOOK_ENTRADA_URL", "http://n8n.test/entrada")
     evento = {
         "entry": [
             {

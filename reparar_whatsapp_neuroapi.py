@@ -29,8 +29,8 @@ import asyncpg
 
 from config import settings
 
-# Solo tenants con una Connect Session completada: una línea de Kontesta
-# también tiene access_token NULL y no hay que convertirla.
+# Solo tenants con una Connect Session completada: una línea sin Connect
+# Session tiene access_token NULL y no hay que convertirla.
 PENDIENTES = """
     SELECT c.tenant_id, c.phone_number_id, c.bsp_provider,
            c.access_token IS NULL AS sin_token

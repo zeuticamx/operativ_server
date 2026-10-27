@@ -118,14 +118,6 @@ class Settings:
     AVISOS_CITA_REVISION_MINUTOS: int = int(os.getenv("AVISOS_CITA_REVISION_MINUTOS", "5"))
     AVISOS_EJECUCION_VIVA_MINUTOS: int = int(os.getenv("AVISOS_EJECUCION_VIVA_MINUTOS", "5"))
 
-    # URL de producción del webhook `entrada-canal-universal` de n8n. El
-    # backend le reenvía los mensajes entrantes de WhatsApp que NeuroAPI
-    # manda a /api/canales/whatsapp/neuroapi/webhook, ya con la firma
-    # validada y el tenant resuelto (services/entrada_mensajes.py), y se
-    # autentica con N8N_INTERNAL_TOKEN en la cabecera X-Internal-Token.
-    # Vacío = esos mensajes se responden 503 y NeuroAPI los reintenta.
-    N8N_WEBHOOK_ENTRADA_URL: str = os.getenv("N8N_WEBHOOK_ENTRADA_URL", "")
-
     # ---- Agente de IA en código (migración desde n8n) ----
     # Interruptor del traslado. Apagada (default): el webhook propio
     # (/api/canales/entrada) responde 503 y los mensajes de NeuroAPI se
@@ -189,22 +181,10 @@ class Settings:
     META_VERIFY_TOKEN: str = os.getenv("META_VERIFY_TOKEN", "")
 
     # ---- WhatsApp (envío de mensajes, ver services/whatsapp.py) ----
-    # Proveedor activo detrás de ProveedorWhatsApp: "kontesta" | "neuroapi" |
-    # "meta". Hoy "kontesta", mientras la app de Meta no tiene Acceso
-    # Avanzado aprobado en App Review; "neuroapi" es una alternativa de BSP
-    # ya lista (NeuroApiProvider); el día que se apruebe Acceso Avanzado,
-    # pasar esto a "meta" no debería tocar ningún router.
-    WHATSAPP_PROVIDER: str = os.getenv("WHATSAPP_PROVIDER", "kontesta")
-
-    # ---- Kontesta ----
-    KONTESTA_API_KEY: str = os.getenv("KONTESTA_API_KEY", "")
-    KONTESTA_API_BASE_URL: str = os.getenv(
-        "KONTESTA_API_BASE_URL", "https://api.kontesta.app/v1"
-    ).rstrip("/")
-    # Secreto para validar la firma HMAC de los webhooks entrantes
-    # (X-Kontesta-Signature). Vacío = verificar_webhook() rechaza todo.
-    # Mismo criterio de fallar cerrado que MERCADOPAGO_WEBHOOK_SECRET.
-    KONTESTA_WEBHOOK_SECRET: str = os.getenv("KONTESTA_WEBHOOK_SECRET", "")
+    # Proveedor activo detrás de ProveedorWhatsApp: "neuroapi" | "meta".
+    # Hoy "neuroapi" (BSP); el día que la app de Meta tenga Acceso Avanzado
+    # aprobado, pasar esto a "meta" no debería tocar ningún router.
+    WHATSAPP_PROVIDER: str = os.getenv("WHATSAPP_PROVIDER", "neuroapi")
 
     # ---- NeuroAPI (NeuroChat) ----
     # API key generada en https://neurochat.com.ec/neuroapi/api-keys con el
@@ -569,11 +549,6 @@ class Settings:
         return int((porcentaje * 100).to_integral_value())
 
     @property
-    def kontesta_configurado(self) -> bool:
-        """Sin API key no se puede autenticar ninguna llamada a Kontesta."""
-        return bool(self.KONTESTA_API_KEY)
-
-    @property
     def neuroapi_configurado(self) -> bool:
         """Sin API key no se puede autenticar ninguna llamada a NeuroAPI."""
         return bool(self.NEUROAPI_API_KEY)
@@ -708,20 +683,8 @@ class Settings:
                 )
 
         # Igual criterio: un despliegue puede no mandar WhatsApp todavía.
-        # Pero si WHATSAPP_PROVIDER=kontesta y falta la API key, todo envío
+        # Pero si WHATSAPP_PROVIDER=neuroapi y falta la API key, todo envío
         # va a fallar en el primer request y conviene verlo al arrancar.
-        if self.WHATSAPP_PROVIDER == "kontesta" and not self.kontesta_configurado:
-            logging.getLogger("operativai.config").warning(
-                "KONTESTA_API_KEY sin configurar: los envíos de WhatsApp vía "
-                "Kontesta van a fallar."
-            )
-            if not self.KONTESTA_WEBHOOK_SECRET:
-                logging.getLogger("operativai.config").warning(
-                    "KONTESTA_WEBHOOK_SECRET sin configurar: "
-                    "verificar_webhook() va a rechazar todos los webhooks "
-                    "entrantes de Kontesta."
-                )
-
         if self.WHATSAPP_PROVIDER == "neuroapi" and not self.neuroapi_configurado:
             logging.getLogger("operativai.config").warning(
                 "NEUROAPI_API_KEY sin configurar: los envíos de WhatsApp vía "
@@ -756,16 +719,6 @@ class Settings:
             logging.getLogger("operativai.config").warning(
                 "AGENTE_EN_CODIGO apagada: las cuentas de Instagram vinculadas "
                 "por NeuroAPI reciben mensajes, pero n8n no puede contestarlas."
-            )
-
-        # Con el agente ya en código, n8n deja de recibir mensajes y esta
-        # variable no hace falta. Solo se avisa mientras siga siendo el
-        # destino real.
-        if not self.AGENTE_EN_CODIGO and not self.N8N_WEBHOOK_ENTRADA_URL:
-            logging.getLogger("operativai.config").warning(
-                "N8N_WEBHOOK_ENTRADA_URL sin configurar: los mensajes de "
-                "WhatsApp que lleguen por NeuroAPI se van a responder 503 y "
-                "no llegarán a n8n."
             )
 
         # El agente en código atiende el mismo tráfico que n8n: si está

@@ -1,6 +1,6 @@
 """
-Proxy de mensajes entrantes de WhatsApp e Instagram (NeuroAPI) hacia n8n o
-hacia el agente en código, según `AGENTE_EN_CODIGO`.
+Proxy de mensajes entrantes de WhatsApp e Instagram (NeuroAPI) hacia el
+agente en código.
 
 NeuroAPI manda a la misma `webhook_url` de la Connect Session tanto el alta
 de la cuenta como los mensajes posteriores. El backend valida la firma una
@@ -8,9 +8,8 @@ sola vez (routers/canales_neuroapi_webhook.py), identifica de qué tenant es
 el número receptor y reenvía el cuerpo *intacto* al flujo que le toca. El
 destino recibe exactamente el mismo JSON que mandaría NeuroAPI, más cabeceras
 con lo que el backend ya resolvió, y se autentica por X-Internal-Token en vez
-de recalcular el HMAC — n8n en `/webhook/entrada-canal-universal`, el agente
-en código en `/api/canales/entrada` (routers/agente_webhook.py), que valida
-esa misma cabecera.
+de recalcular el HMAC — el agente en código en `/api/canales/entrada`
+(routers/agente_webhook.py), que valida esa misma cabecera.
 
 Sin SDK, con httpx directo, igual que el resto de integraciones.
 """
@@ -29,9 +28,8 @@ from session import fetch_one
 
 log = logging.getLogger("operativai.canales.entrada_mensajes")
 
-# Corto a propósito: el webhook de n8n debe responder de inmediato
-# ("Respond: Immediately"), no al terminar el flujo del agente. Si tarda más,
-# NeuroAPI también corta y reintenta.
+# Corto a propósito: el webhook debe responder de inmediato, no al terminar
+# el flujo del agente. Si tarda más, NeuroAPI también corta y reintenta.
 TIMEOUT = httpx.Timeout(10.0)
 
 NOMBRES_PHONE_NUMBER_ID = ("phone_number_id", "phoneNumberId", "to_phone_number_id")
@@ -122,20 +120,15 @@ def destino_para(tenant_id: UUID) -> str:
     """
     URL a la que se reenvían los mensajes de este tenant.
 
-    Con `AGENTE_EN_CODIGO` encendida va al propio backend
-    (routers/agente_webhook.py), que es quien a partir de ahí atiende el
-    mensaje; apagada, sigue yendo al webhook `entrada-canal-universal` de
-    n8n, que es el destino real mientras dure la migración. La decisión es
-    global y no por tenant: `AGENTE_EN_CODIGO` es una bandera de proceso, no
-    de negocio — ver el docstring de `services/agente/__init__.py`.
+    Siempre el propio backend (routers/agente_webhook.py), que es quien
+    atiende el mensaje con el agente en código. Si `AGENTE_EN_CODIGO` está
+    apagada ese endpoint responde 503 y NeuroAPI reintenta.
 
     `tenant_id` no entra en la decisión hoy; queda en la firma para el día
     que haga falta enrutar por tenant (otra cola, otro agente) sin tocar el
     router ni la validación de la firma.
     """
-    if settings.AGENTE_EN_CODIGO:
-        return f"{settings.BASE_URL_BACKEND}/api/canales/entrada"
-    return settings.N8N_WEBHOOK_ENTRADA_URL
+    return f"{settings.BASE_URL_BACKEND}/api/canales/entrada"
 
 
 async def reenviar(
@@ -143,8 +136,8 @@ async def reenviar(
 ) -> None:
     """
     POST del cuerpo tal cual llegó de NeuroAPI. Lanza ReenvioError si el
-    destino no contesta o responde algo que no es 2xx (incluido el 404 de un
-    workflow de n8n desactivado): en todos esos casos un reintento puede
+    destino no contesta o responde algo que no es 2xx (incluido el 503 con el
+    agente apagado): en todos esos casos un reintento puede
     funcionar, así que el router responde 502 y NeuroAPI lo reintenta.
     """
     cabeceras = {

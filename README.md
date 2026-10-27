@@ -2175,9 +2175,9 @@ Se puede desarrollar y probar todo hoy con las páginas propias.
   Connect Session (`/api/canales/whatsapp/neuroapi/webhook`). El backend
   valida la firma con `NEUROAPI_CONNECT_WEBHOOK_SECRET`, resuelve el tenant
   por el `phone_number_id` receptor y reenvía el cuerpo intacto a
-  `N8N_WEBHOOK_ENTRADA_URL` (`services/entrada_mensajes.py`), con
-  `X-Tenant-Id`, `X-Canal`, `X-Proveedor` y `X-Internal-Token`. Si n8n no lo
-  recibe responde 502/503 para que NeuroAPI reintente. El enrutamiento por
+  `/api/canales/entrada` del propio backend (`services/entrada_mensajes.py`), con
+  `X-Tenant-Id`, `X-Canal`, `X-Proveedor` y `X-Internal-Token`. Si el destino no
+  lo recibe responde 502 para que NeuroAPI reintente. El enrutamiento por
   tenant a otro destino se agrega en `entrada_mensajes.destino_para`.
 - **Varios números (spec 005a)**: el alta y la atribución del mensaje pasan a la
   tabla `agentes_canal` (índice único parcial por `phone_number_id` vinculado, que

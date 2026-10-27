@@ -335,11 +335,10 @@ async def test_desconectar_en_bloque_ya_no_existe_usar_numeros(
 ):
     """
     Spec 005a: WhatsApp se gestiona número por número. Tras desvincular el
-    número, lo que siga mandando NeuroAPI no llega a n8n (no resuelve a
+    número, lo que siga mandando NeuroAPI no llega al agente (no resuelve a
     ningún tenant).
     """
     monkeypatch.setattr(settings, "NEUROAPI_API_KEY", "clave-de-prueba")
-    monkeypatch.setattr(settings, "N8N_WEBHOOK_ENTRADA_URL", "https://n8n.ejemplo.com/webhook/x")
     tenant_id = tenant_y_usuario["tenant_id"]
     await _sesion_pendiente(tenant_id, "sess_baja")
     await _completar(http_client, "sess_baja", "5215533330000")
@@ -385,7 +384,7 @@ async def test_desconectar_en_bloque_ya_no_existe_usar_numeros(
         headers={"x-hub-signature-256": firmar(mensaje), "content-type": "application/json"},
     )
     assert respuesta.status_code == 200
-    assert reenvios == [(tenant_id, "https://n8n.ejemplo.com/webhook/x")]
+    assert reenvios == [(tenant_id, entrada_mensajes.destino_para(tenant_id))]
 
 
 @pytest.mark.asyncio

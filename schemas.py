@@ -341,12 +341,8 @@ class ActivarCanalesIn(BaseModel):
 
 class ConectarWhatsAppIn(BaseModel):
     """
-    Alta del número de WhatsApp Business de un tenant.
-
-    Mientras el proveedor sea Kontesta (WHATSAPP_PROVIDER=kontesta) la cuenta
-    de Kontesta es una sola —la de OperativAI— y cada negocio es una línea
-    dentro de ella, así que lo único que hay por tenant es el id de esa
-    línea: no existe un secreto por tenant que cifrar.
+    Alta manual del número de WhatsApp Business de un tenant: lo único que hay
+    por tenant es el id de la línea, no existe un secreto por tenant que cifrar.
     """
     phone_number_id: str = Field(min_length=1, max_length=100)
 
